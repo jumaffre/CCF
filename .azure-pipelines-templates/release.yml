@@ -1,0 +1,18 @@
+steps:
+
+- task: GitHubRelease@0
+  displayName: 'Automated GitHub Release'
+  condition: startsWith(variables['Build.SourceBranch'], 'refs/tags/v')
+  inputs:
+    gitHubConnection: $(GITHUB_TOKEN)
+    repositoryName: microsoft/CCF
+    action: 'create'
+    target:
+    tagSource: auto
+    releaseNotesSource: input
+    isDraft: true
+
+  # TODO: Get a token just for this purpose (or setup a new connection string)
+  # TODO: Deploy artefacts from build, using the asset option and staging artifact feature
+  # TODO: Make sure that list of commit since last release are displyed
+  # TODO: Create release template markdown file

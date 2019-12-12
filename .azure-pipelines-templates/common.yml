@@ -24,3 +24,5 @@ jobs:
       - template: push_perf_data.yml
         parameters:
           consensus: ${{ parameters.consensus }}
+    - ${{ if and(eq(parameters.target, 'SGX'), eq(parameters.consensus, 'CFT')) }}:
+      - template: release.yml
