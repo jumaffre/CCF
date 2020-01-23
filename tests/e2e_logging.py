@@ -9,14 +9,13 @@ import e2e_args
 from loguru import logger as LOG
 
 
+@reqs.description("Running transactions against logging app")
 @reqs.supports_methods("LOG_record", "LOG_record_pub", "LOG_get", "LOG_get_pub")
 @reqs.at_least_n_nodes(2)
 def test(network, args, notifications_queue=None, verify=True):
-    LOG.info("Running transactions against logging app")
-
     txs = app.LoggingTxs(notifications_queue=notifications_queue)
-    txs.issue(network=network, number_msgs=1)
-    txs.issue(network=network, number_msgs=1, on_backup=True)
+    txs.issue(network=network, number_txs=1)
+    txs.issue(network=network, number_txs=1, on_backup=True)
     # TODO: Once the JS app supports both public and private tables, always verify
     if verify:
         txs.verify(network)
@@ -26,9 +25,9 @@ def test(network, args, notifications_queue=None, verify=True):
     return network
 
 
+@reqs.description("Write/Read large messages on primary")
 @reqs.supports_methods("LOG_record", "LOG_get")
 def test_large_messages(network, args):
-    LOG.info("Write/Read large messages on primary")
     primary, _ = network.find_primary()
 
     with primary.node_client(format="json") as nc:
@@ -48,10 +47,10 @@ def test_large_messages(network, args):
     return network
 
 
+@reqs.description("Testing forwarding on member and node frontends")
 @reqs.supports_methods("mkSign")
 @reqs.at_least_n_nodes(2)
 def test_forwarding_frontends(network, args):
-    LOG.info("Testing forwarding on member and node frontends")
     primary, backup = network.find_primary_and_any_backup()
 
     with primary.node_client(format="json") as nc:
@@ -64,6 +63,7 @@ def test_forwarding_frontends(network, args):
     return network
 
 
+@reqs.description("Uninstalling Lua application")
 @reqs.lua_generic_app
 def test_update_lua(network, args):
     if args.package == "libluagenericenc":

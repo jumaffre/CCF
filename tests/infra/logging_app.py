@@ -12,7 +12,7 @@ class LoggingTxs:
         self.next_priv_index = 0
         self.notifications_queue = notifications_queue
 
-    def issue(self, network, number_msgs, on_backup=False):
+    def issue(self, network, number_txs, on_backup=False):
         primary, backup = network.find_primary_and_any_backup()
         remote_node = backup if on_backup else primary
 
@@ -21,7 +21,7 @@ class LoggingTxs:
             check_commit_n = infra.checker.Checker(mc, self.notifications_queue)
 
             with remote_node.user_client(format="json") as uc:
-                for _ in range(number_msgs):
+                for _ in range(number_txs):
                     priv_msg = f"Private message at index {self.next_priv_index}"
                     pub_msg = f"Public message at index {self.next_pub_index}"
                     rep_priv = uc.rpc(
