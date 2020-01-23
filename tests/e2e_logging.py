@@ -1,124 +1,27 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 import infra.ccf
-import infra.jsonrpc
 import infra.notification
 import suite.test_requirements as reqs
+import infra.logging_app as app
 import e2e_args
 
 from loguru import logger as LOG
 
 
-@reqs.lua_generic_app
-def test_update_lua(network, args):
-    if args.package == "libluagenericenc":
-        LOG.info("Updating Lua application")
-        primary, term = network.find_primary()
-
-        check = infra.checker.Checker()
-
-        # Create a new lua application file (minimal app)
-        # TODO: Writing to file will not be required when memberclient is deprecated
-        new_app_file = "new_lua_app.lua"
-        with open(new_app_file, "w") as qfile:
-            qfile.write(
-                """
-                            return {
-                            ping = [[
-                                tables, args = ...
-                                return {result = "pong"}
-                            ]],
-                            }"""
-            )
-
-        network.consortium.set_lua_app(
-            member_id=1, remote_node=primary, app_script=new_app_file
-        )
-        with primary.user_client(format="json") as c:
-            check(c.rpc("ping", params={}), result="pong")
-
-            LOG.debug("Check that former endpoints no longer exists")
-            for endpoint in [
-                "LOG_record",
-                "LOG_record_pub",
-                "LOG_get",
-                "LOG_get_pub",
-            ]:
-                check(
-                    c.rpc(endpoint, params={}),
-                    error=lambda e: e is not None
-                    and e["code"] == infra.jsonrpc.ErrorCode.METHOD_NOT_FOUND.value,
-                )
-    else:
-        LOG.warning("Skipping Lua app update as application is not Lua")
-
-    return network
-
-
-class LoggingTxs(reqs.TxInterface):
-    def __init__(self, notifications_queue=None):
-        self.pub = {}
-        self.priv = {}
-        self.next_pub_index = 0
-        self.next_priv_index = 0
-        self.notifications_queue = notifications_queue
-
-    def issue(self, network, number_msgs, on_backup=False):
-        primary, backup = network.find_primary_and_any_backup()
-        remote_node = backup if on_backup else primary
-
-        with remote_node.node_client(format="json") as mc:
-            check_commit = infra.checker.Checker(mc)
-            check_commit_n = infra.checker.Checker(mc, self.notifications_queue)
-
-            with remote_node.user_client(format="json") as uc:
-                for _ in range(number_msgs):
-                    priv_msg = f"Private message at index {self.next_priv_index}"
-                    pub_msg = f"Public message at index {self.next_pub_index}"
-                    rep_priv = uc.rpc(
-                        "LOG_record", {"id": self.next_priv_index, "msg": priv_msg,},
-                    )
-                    rep_pub = uc.rpc(
-                        "LOG_record_pub", {"id": self.next_pub_index, "msg": pub_msg,},
-                    )
-                    check_commit_n(rep_priv, result=True)
-                    check_commit(rep_pub, result=True)
-
-                    self.priv[self.next_priv_index] = priv_msg
-                    self.pub[self.next_pub_index] = pub_msg
-                    self.next_priv_index += 1
-                    self.next_pub_index += 1
-
-    def verify(self, network):
-        primary, term = network.find_primary()
-
-        with primary.node_client(format="json") as mc:
-            check = infra.checker.Checker()
-
-            with primary.user_client(format="json") as uc:
-
-                for pub_tx_index in self.pub:
-                    check(
-                        uc.rpc("LOG_get_pub", {"id": pub_tx_index}),
-                        result={"msg": self.pub[pub_tx_index]},
-                    )
-
-                for priv_tx_index in self.priv:
-                    check(
-                        uc.rpc("LOG_get", {"id": priv_tx_index}),
-                        result={"msg": self.priv[priv_tx_index]},
-                    )
-
-
 @reqs.supports_methods("LOG_record", "LOG_record_pub", "LOG_get", "LOG_get_pub")
 @reqs.at_least_n_nodes(2)
-def test(network, args, notifications_queue=None):
+def test(network, args, notifications_queue=None, verify=True):
     LOG.info("Running transactions against logging app")
 
-    txs = LoggingTxs(notifications_queue=notifications_queue)
+    txs = app.LoggingTxs(notifications_queue=notifications_queue)
     txs.issue(network=network, number_msgs=1)
     txs.issue(network=network, number_msgs=1, on_backup=True)
-    txs.verify(network)
+    # TODO: Once the JS app supports both public and private tables, always verify
+    if verify:
+        txs.verify(network)
+    else:
+        LOG.warning("Skipping log messages verification")
 
     return network
 
@@ -147,7 +50,7 @@ def test_large_messages(network, args):
 
 @reqs.supports_methods("mkSign")
 @reqs.at_least_n_nodes(2)
-def test_forwarding_frontend(network, args):
+def test_forwarding_frontends(network, args):
     LOG.info("Testing forwarding on member and node frontends")
     primary, backup = network.find_primary_and_any_backup()
 
@@ -157,6 +60,52 @@ def test_forwarding_frontend(network, args):
             check_commit(c.do("mkSign", params={}), result=True)
         with backup.member_client(format="json") as c:
             check_commit(c.do("mkSign", params={}), result=True)
+
+    return network
+
+
+@reqs.lua_generic_app
+def test_update_lua(network, args):
+    if args.package == "libluagenericenc":
+        LOG.info("Updating Lua application")
+        primary, term = network.find_primary()
+
+        check = infra.checker.Checker()
+
+        # Create a new lua application file (minimal app)
+        # TODO: Writing to file will not be required when memberclient is deprecated
+        new_app_file = "new_lua_app.lua"
+        with open(new_app_file, "w") as qfile:
+            qfile.write(
+                """
+                    return {
+                    ping = [[
+                        tables, args = ...
+                        return {result = "pong"}
+                    ]],
+                    }"""
+            )
+
+        network.consortium.set_lua_app(
+            member_id=1, remote_node=primary, app_script=new_app_file
+        )
+        with primary.user_client(format="json") as c:
+            check(c.rpc("ping", params={}), result="pong")
+
+            LOG.debug("Check that former endpoints no longer exists")
+            for endpoint in [
+                "LOG_record",
+                "LOG_record_pub",
+                "LOG_get",
+                "LOG_get_pub",
+            ]:
+                check(
+                    c.rpc(endpoint, params={}),
+                    error=lambda e: e is not None
+                    and e["code"] == infra.jsonrpc.ErrorCode.METHOD_NOT_FOUND.value,
+                )
+    else:
+        LOG.warning("Skipping Lua app update as application is not Lua")
 
     return network
 
@@ -175,9 +124,14 @@ def run(args):
             hosts, args.build_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb,
         ) as network:
             network.start_and_join(args)
-            network = test(network, args, notifications_queue)
+            network = test(
+                network,
+                args,
+                notifications_queue,
+                verify=args.package is not "libjsgenericenc",
+            )
             network = test_large_messages(network, args)
-            network = test_forwarding_frontend(network, args)
+            network = test_forwarding_frontends(network, args)
             network = test_update_lua(network, args)
 
 
