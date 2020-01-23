@@ -56,36 +56,32 @@ def test_update_lua(network, args):
 
 
 class LoggingTxs(reqs.TxInterface):
-    def __init__(self):
+    def __init__(self, notifications_queue=None):
         self.pub = {}
         self.priv = {}
         self.next_pub_index = 0
         self.next_priv_index = 0
+        self.notifications_queue = notifications_queue
 
-    def issue(self, network, number_transactions):
-        primary, term = network.find_primary()
+    def issue(self, network, number_msgs, on_backup=False):
+        primary, backup = network.find_primary_and_any_backup()
+        remote_node = backup if on_backup else primary
 
-        with primary.node_client(format="json") as mc:
+        with remote_node.node_client(format="json") as mc:
             check_commit = infra.checker.Checker(mc)
+            check_commit_n = infra.checker.Checker(mc, self.notifications_queue)
 
-            LOG.info("Record on primary")
-            with primary.user_client(format="json") as uc:
-
-                for _ in range(number_transactions):
-                    # TODO: Can we do this cheaper, i.e. only verify global commit for the latest transaction.
-                    priv_msg = f"Private message at index {self.next_priv_index}, recorded in term {term}"
-                    pub_msg = f"Public message at index {self.next_pub_index}, recorded in term {term}"
+            with remote_node.user_client(format="json") as uc:
+                for _ in range(number_msgs):
+                    priv_msg = f"Private message at index {self.next_priv_index}"
+                    pub_msg = f"Public message at index {self.next_pub_index}"
                     rep_priv = uc.rpc(
                         "LOG_record", {"id": self.next_priv_index, "msg": priv_msg,},
                     )
                     rep_pub = uc.rpc(
                         "LOG_record_pub", {"id": self.next_pub_index, "msg": pub_msg,},
                     )
-
-                    LOG.success(rep_priv)
-                    LOG.success(rep_pub)
-
-                    check_commit(rep_priv, result=True)
+                    check_commit_n(rep_priv, result=True)
                     check_commit(rep_pub, result=True)
 
                     self.priv[self.next_priv_index] = priv_msg
@@ -102,57 +98,40 @@ class LoggingTxs(reqs.TxInterface):
             with primary.user_client(format="json") as uc:
 
                 for pub_tx_index in self.pub:
-                    LOG.warning(pub_tx_index)
                     check(
                         uc.rpc("LOG_get_pub", {"id": pub_tx_index}),
                         result={"msg": self.pub[pub_tx_index]},
                     )
 
                 for priv_tx_index in self.priv:
-                    LOG.warning(priv_tx_index)
                     check(
                         uc.rpc("LOG_get", {"id": priv_tx_index}),
                         result={"msg": self.priv[priv_tx_index]},
                     )
 
 
-@reqs.supports_methods("mkSign", "LOG_record", "LOG_get")
+@reqs.supports_methods("LOG_record", "LOG_record_pub", "LOG_get", "LOG_get_pub")
 @reqs.at_least_n_nodes(2)
 def test(network, args, notifications_queue=None):
     LOG.info("Running transactions against logging app")
-    primary, backup = network.find_primary_and_any_backup()
 
-    with primary.node_client(format="json") as mc:
-        check_commit = infra.checker.Checker(mc, notifications_queue)
+    txs = LoggingTxs(notifications_queue=notifications_queue)
+    txs.issue(network=network, number_msgs=1)
+    txs.issue(network=network, number_msgs=1, on_backup=True)
+    txs.verify(network)
+
+    return network
+
+
+@reqs.supports_methods("LOG_record", "LOG_get")
+def test_large_messages(network, args):
+    LOG.info("Write/Read large messages on primary")
+    primary, _ = network.find_primary()
+
+    with primary.node_client(format="json") as nc:
+        check_commit = infra.checker.Checker(nc)
         check = infra.checker.Checker()
 
-        msg = "Hello world"
-        msg2 = "Hello there"
-        backup_msg = "Msg sent to a backup"
-
-        LOG.info("Write/Read on primary")
-        with primary.user_client(format="json") as c:
-            check_commit(c.rpc("LOG_record", {"id": 42, "msg": msg}), result=True)
-            check_commit(c.rpc("LOG_record", {"id": 43, "msg": msg2}), result=True)
-            check(c.rpc("LOG_get", {"id": 42}), result={"msg": msg})
-            check(c.rpc("LOG_get", {"id": 43}), result={"msg": msg2})
-
-        LOG.info("Write on all backup frontends")
-        with backup.node_client(format="json") as c:
-            check_commit(c.do("mkSign", params={}), result=True)
-        with backup.member_client(format="json") as c:
-            check_commit(c.do("mkSign", params={}), result=True)
-
-        LOG.info("Write/Read on backup")
-
-        with backup.user_client(format="json") as c:
-            check_commit(
-                c.rpc("LOG_record", {"id": 100, "msg": backup_msg}), result=True
-            )
-            check(c.rpc("LOG_get", {"id": 100}), result={"msg": backup_msg})
-            check(c.rpc("LOG_get", {"id": 42}), result={"msg": msg})
-
-        LOG.info("Write/Read large messages on primary")
         with primary.user_client(format="json") as c:
             id = 44
             for p in range(14, 20):
@@ -162,6 +141,22 @@ def test(network, args, notifications_queue=None):
                 )
                 check(c.rpc("LOG_get", {"id": id}), result={"msg": long_msg})
                 id += 1
+
+    return network
+
+
+@reqs.supports_methods("mkSign")
+@reqs.at_least_n_nodes(2)
+def test_forwarding_frontend(network, args):
+    LOG.info("Testing forwarding on member and node frontends")
+    primary, backup = network.find_primary_and_any_backup()
+
+    with primary.node_client(format="json") as nc:
+        check_commit = infra.checker.Checker(nc)
+        with backup.node_client(format="json") as c:
+            check_commit(c.do("mkSign", params={}), result=True)
+        with backup.member_client(format="json") as c:
+            check_commit(c.do("mkSign", params={}), result=True)
 
     return network
 
@@ -181,6 +176,8 @@ def run(args):
         ) as network:
             network.start_and_join(args)
             network = test(network, args, notifications_queue)
+            network = test_large_messages(network, args)
+            network = test_forwarding_frontend(network, args)
             network = test_update_lua(network, args)
 
 

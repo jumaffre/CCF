@@ -7,6 +7,7 @@ import functools
 from loguru import logger as LOG
 
 
+# TODO: Move somewhere else?
 class TxInterface:
     def issue(self, network, number_transactions):
         raise NotImplementedError
