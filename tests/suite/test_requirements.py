@@ -7,6 +7,14 @@ import functools
 from loguru import logger as LOG
 
 
+class TxInterface:
+    def issue(self, network, number_transactions):
+        raise NotImplementedError
+
+    def verify(self, network):
+        raise NotImplementedError
+
+
 class TestRequirementsNotMet(Exception):
     pass
 

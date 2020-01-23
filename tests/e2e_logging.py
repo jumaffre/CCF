@@ -55,6 +55,67 @@ def test_update_lua(network, args):
     return network
 
 
+class LoggingTxs(reqs.TxInterface):
+    def __init__(self):
+        self.pub = {}
+        self.priv = {}
+        self.next_pub_index = 0
+        self.next_priv_index = 0
+
+    def issue(self, network, number_transactions):
+        primary, term = network.find_primary()
+
+        with primary.node_client(format="json") as mc:
+            check_commit = infra.checker.Checker(mc)
+
+            LOG.info("Record on primary")
+            with primary.user_client(format="json") as uc:
+
+                for _ in range(number_transactions):
+                    # TODO: Can we do this cheaper, i.e. only verify global commit for the latest transaction.
+                    priv_msg = f"Private message at index {self.next_priv_index}, recorded in term {term}"
+                    pub_msg = f"Public message at index {self.next_pub_index}, recorded in term {term}"
+                    rep_priv = uc.rpc(
+                        "LOG_record", {"id": self.next_priv_index, "msg": priv_msg,},
+                    )
+                    rep_pub = uc.rpc(
+                        "LOG_record_pub", {"id": self.next_pub_index, "msg": pub_msg,},
+                    )
+
+                    LOG.success(rep_priv)
+                    LOG.success(rep_pub)
+
+                    check_commit(rep_priv, result=True)
+                    check_commit(rep_pub, result=True)
+
+                    self.priv[self.next_priv_index] = priv_msg
+                    self.pub[self.next_pub_index] = pub_msg
+                    self.next_priv_index += 1
+                    self.next_pub_index += 1
+
+    def verify(self, network):
+        primary, term = network.find_primary()
+
+        with primary.node_client(format="json") as mc:
+            check = infra.checker.Checker()
+
+            with primary.user_client(format="json") as uc:
+
+                for pub_tx_index in self.pub:
+                    LOG.warning(pub_tx_index)
+                    check(
+                        uc.rpc("LOG_get_pub", {"id": pub_tx_index}),
+                        result={"msg": self.pub[pub_tx_index]},
+                    )
+
+                for priv_tx_index in self.priv:
+                    LOG.warning(priv_tx_index)
+                    check(
+                        uc.rpc("LOG_get", {"id": priv_tx_index}),
+                        result={"msg": self.priv[priv_tx_index]},
+                    )
+
+
 @reqs.supports_methods("mkSign", "LOG_record", "LOG_get")
 @reqs.at_least_n_nodes(2)
 def test(network, args, notifications_queue=None):

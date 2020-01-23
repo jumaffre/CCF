@@ -5,6 +5,7 @@ import e2e_args
 import infra.ccf
 import suite.test_suite as s
 import suite.test_requirements as reqs
+import e2e_logging
 import time
 import json
 from enum import Enum
@@ -34,6 +35,8 @@ def run(args):
     run_tests = {}
     elapsed = args.test_duration
 
+    txs = e2e_logging.LoggingTxs()
+
     for i, test in enumerate(s.tests):
         status = None
         reason = None
@@ -45,6 +48,11 @@ def run(args):
         try:
             LOG.debug(f"Running {s.test_name(test)}...")
             test_time_before = time.time()
+
+            # TODO: If required, run some transactions
+            LOG.warning("About to issue transactions....")
+            txs.issue(network, 2)
+            LOG.warning("Done issuing transactions")
 
             # Actually run the test
             new_network = test(network, args)
@@ -82,6 +90,10 @@ def run(args):
         if new_network != network:
             network.stop_all_nodes()
             network = new_network
+
+        LOG.warning("About to verify transactions....")
+        txs.verify(network)
+        LOG.warning("Done verifying transactions")
 
         LOG.debug(f"Test {s.test_name(test)} took {test_elapsed:.2f} secs")
 
