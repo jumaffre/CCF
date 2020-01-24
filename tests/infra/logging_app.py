@@ -3,6 +3,9 @@
 
 import infra.ccf
 
+from loguru import logger as LOG
+
+
 
 class LoggingTxs:
     def __init__(self, notifications_queue=None):
@@ -13,6 +16,7 @@ class LoggingTxs:
         self.notifications_queue = notifications_queue
 
     def issue(self, network, number_txs, on_backup=False):
+        LOG.success(f"Applying {number_txs} logging txs")
         primary, backup = network.find_primary_and_any_backup()
         remote_node = backup if on_backup else primary
 
@@ -39,6 +43,7 @@ class LoggingTxs:
                     self.next_pub_index += 1
 
     def verify(self, network):
+        LOG.success(f"Verifying all logging txs")
         primary, term = network.find_primary()
 
         with primary.node_client(format="json") as mc:
