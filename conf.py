@@ -52,6 +52,7 @@ extensions = [
     "sphinx.ext.autosectionlabel",
     "sphinx.ext.githubpages",
     "sphinx-jsonschema",
+    "sphinxcontrib.versioning.sphinx_",
 ]
 
 autosectionlabel_prefix_document = True
