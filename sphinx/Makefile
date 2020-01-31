@@ -5,7 +5,7 @@
 
 # You can set these variables from the command line.
 SPHINXOPTS    =
-SPHINXBUILD   = sphinx-versioning
+SPHINXBUILD   = sphinx-build
 SPHINXPROJ    = CCF
 SOURCEDIR     = source
 BUILDDIR      = build
