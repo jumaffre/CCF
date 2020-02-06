@@ -273,7 +273,6 @@ if(BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kv/test/kv_contention.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/kv/test/kv_serialisation.cpp
   )
-  use_client_mbedtls(kv_test)
   target_link_libraries(
     kv_test PRIVATE ${CMAKE_THREAD_LIBS_INIT} secp256k1.host
   )
@@ -326,8 +325,12 @@ if(BUILD_TESTS)
     encryptor_test ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/encryptor.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/src/crypto/symmkey.cpp
   )
-  use_client_mbedtls(encryptor_test)
   target_link_libraries(encryptor_test PRIVATE secp256k1.host)
+
+  add_unit_test(
+    secretsharing_test ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/secretsharing.cpp
+  )
+  target_link_libraries(secretsharing_test PRIVATE sss.host)
 
   add_unit_test(
     msgpack_serialization_test
@@ -342,13 +345,11 @@ if(BUILD_TESTS)
   add_unit_test(
     keyexchange_test ${CMAKE_CURRENT_SOURCE_DIR}/src/tls/test/keyexchange.cpp
   )
-  use_client_mbedtls(keyexchange_test)
   target_link_libraries(keyexchange_test PRIVATE secp256k1.host)
 
   add_unit_test(
     channels_test ${CMAKE_CURRENT_SOURCE_DIR}/src/node/test/channels.cpp
   )
-  use_client_mbedtls(channels_test)
   target_link_libraries(channels_test PRIVATE secp256k1.host)
 
   add_unit_test(http_test ${CMAKE_CURRENT_SOURCE_DIR}/src/enclave/test/http.cpp)
