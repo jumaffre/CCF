@@ -5,6 +5,7 @@
 #include "../hash.h"
 #include "../symmkey.h"
 #include "../tls/base64.h"
+#include "../tls/entropy.h"
 
 #include <doctest/doctest.h>
 #include <iomanip>
@@ -77,30 +78,57 @@ TEST_CASE("EverCrypt SHA256 no-collision check")
 
 TEST_CASE("Public key encryption")
 {
-  // Manually generated x25519 key pairs
-  // One could use EverCrypt_Curve25519_secret_to_public() for key generation
-  // too but members will generate their encryption from the command line.
-  auto sender_sk_raw =
-    tls::raw_from_b64("0FQphYDQwrdJIvkFJtiNyTQ277WlvZIgl8y5oCRBJFA=");
-  auto sender_pk_raw =
-    tls::raw_from_b64("DbnWc4wF8k2C2DqGvK3YEcF2hfivIJTHBcHYRfzSnDA=");
-  auto recipient_sk_raw =
-    tls::raw_from_b64("CMRbAAokc9fcEClWRn5CKK4tGWsCPvseUA6x4Ncdw3w=");
-  auto recipient_pk_raw =
-    tls::raw_from_b64("wHMY7N74MlAkGJlk+DGsbHarQ+f9dr0WmDZ0UsE4wB0=");
-
-  std::string plaintext = "This is a plaintext message to encrypt";
-  auto plaintext_raw = std::vector<uint8_t>(plaintext.begin(), plaintext.end());
-  crypto::BoxNonce nonce = {};
-
-  auto cipher =
-    crypto::Box::create(plaintext_raw, nonce, recipient_pk_raw, sender_sk_raw);
-  auto decrypted =
-    crypto::Box::open(cipher, nonce, sender_pk_raw, recipient_sk_raw);
-  REQUIRE(decrypted == plaintext_raw);
-
-  INFO("Cipher too short");
+  INFO("Pre-generated keys");
   {
+    // Manually generated x25519 key pairs
+    // One could use EverCrypt_Curve25519_secret_to_public() for key generation
+    // too but members will generate their encryption from the command line.
+    auto sender_sk_raw =
+      tls::raw_from_b64("0FQphYDQwrdJIvkFJtiNyTQ277WlvZIgl8y5oCRBJFA=");
+    auto sender_pk_raw =
+      tls::raw_from_b64("DbnWc4wF8k2C2DqGvK3YEcF2hfivIJTHBcHYRfzSnDA=");
+    auto recipient_sk_raw =
+      tls::raw_from_b64("CMRbAAokc9fcEClWRn5CKK4tGWsCPvseUA6x4Ncdw3w=");
+    auto recipient_pk_raw =
+      tls::raw_from_b64("wHMY7N74MlAkGJlk+DGsbHarQ+f9dr0WmDZ0UsE4wB0=");
+
+    std::string plaintext = "This is a plaintext message to encrypt";
+    auto plaintext_raw =
+      std::vector<uint8_t>(plaintext.begin(), plaintext.end());
+    crypto::Box::BoxNonce nonce = {};
+
+    auto cipher = crypto::Box::create(
+      plaintext_raw, nonce, recipient_pk_raw, sender_sk_raw);
+    auto decrypted =
+      crypto::Box::open(cipher, nonce, sender_pk_raw, recipient_sk_raw);
+    REQUIRE(decrypted == plaintext_raw);
+
+    REQUIRE_THROWS_AS(
+      crypto::Box::open({}, nonce, sender_pk_raw, recipient_sk_raw),
+      std::logic_error);
+  }
+
+  INFO("Fresh keys");
+  {
+    auto sender_sk_raw =
+      tls::create_entropy()->random(crypto::BoxKey::KEY_SIZE);
+    auto sender_pk_raw = crypto::BoxKey::public_from_private(sender_sk_raw);
+    auto recipient_sk_raw =
+      tls::create_entropy()->random(crypto::BoxKey::KEY_SIZE);
+    auto recipient_pk_raw =
+      crypto::BoxKey::public_from_private(recipient_sk_raw);
+
+    std::string plaintext = "This is a plaintext message to encrypt";
+    auto plaintext_raw =
+      std::vector<uint8_t>(plaintext.begin(), plaintext.end());
+    crypto::Box::BoxNonce nonce = {};
+
+    auto cipher = crypto::Box::create(
+      plaintext_raw, nonce, recipient_pk_raw, sender_sk_raw);
+    auto decrypted =
+      crypto::Box::open(cipher, nonce, sender_pk_raw, recipient_sk_raw);
+    REQUIRE(decrypted == plaintext_raw);
+
     REQUIRE_THROWS_AS(
       crypto::Box::open({}, nonce, sender_pk_raw, recipient_sk_raw),
       std::logic_error);
