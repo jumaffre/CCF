@@ -84,18 +84,18 @@ TEST_CASE("Public key encryption")
     // One could use EverCrypt_Curve25519_secret_to_public() for key generation
     // too but members will generate their encryption from the command line.
     auto sender_sk_raw =
-      tls::raw_from_b64("0FQphYDQwrdJIvkFJtiNyTQ277WlvZIgl8y5oCRBJFA=");
+      tls::raw_from_b64("OAnw7NBrLH1hdnKEogwGKrO/6aBFeWmPetAFK/RnYGw=");
     auto sender_pk_raw =
-      tls::raw_from_b64("DbnWc4wF8k2C2DqGvK3YEcF2hfivIJTHBcHYRfzSnDA=");
+      tls::raw_from_b64("H6FoHb32GIB4LPvv0MK0IC0zgPQBPizNSik174sxigo=");
     auto recipient_sk_raw =
-      tls::raw_from_b64("CMRbAAokc9fcEClWRn5CKK4tGWsCPvseUA6x4Ncdw3w=");
+      tls::raw_from_b64("QMaKwhyuEvCSJ4wftClsSp944h7wx96FB5ObQc70LH4=");
     auto recipient_pk_raw =
-      tls::raw_from_b64("wHMY7N74MlAkGJlk+DGsbHarQ+f9dr0WmDZ0UsE4wB0=");
+      tls::raw_from_b64("jHATRO/DAcuJWiA30NlCTbysyBXYMzM2SovbPnuP+1s=");
 
     std::string plaintext = "This is a plaintext message to encrypt";
     auto plaintext_raw =
       std::vector<uint8_t>(plaintext.begin(), plaintext.end());
-    crypto::Box::BoxNonce nonce = {};
+    crypto::Box::Nonce nonce = {};
 
     auto cipher = crypto::Box::create(
       plaintext_raw, nonce, recipient_pk_raw, sender_sk_raw);
@@ -118,10 +118,17 @@ TEST_CASE("Public key encryption")
     auto recipient_pk_raw =
       crypto::BoxKey::public_from_private(recipient_sk_raw);
 
+    std::cout << "Send priv:" << tls::b64_from_raw(sender_sk_raw) << std::endl;
+    std::cout << "Send pub:" << tls::b64_from_raw(sender_pk_raw) << std::endl;
+    std::cout << "Recv priv:" << tls::b64_from_raw(recipient_sk_raw)
+              << std::endl;
+    std::cout << "Recv pub:" << tls::b64_from_raw(recipient_pk_raw)
+              << std::endl;
+
     std::string plaintext = "This is a plaintext message to encrypt";
     auto plaintext_raw =
       std::vector<uint8_t>(plaintext.begin(), plaintext.end());
-    crypto::Box::BoxNonce nonce = {};
+    crypto::Box::Nonce nonce = {};
 
     auto cipher = crypto::Box::create(
       plaintext_raw, nonce, recipient_pk_raw, sender_sk_raw);

@@ -534,8 +534,11 @@ namespace ccf
         g.init_values();
         for (auto& [cert, k_encryption_key] : in.members_info)
         {
+          std::cout << "Adding member" << std::endl;
           g.add_member(cert, k_encryption_key);
         }
+
+        node.set_encrypted_shares(args.tx);
 
         size_t self = g.add_node({in.node_info_network,
                                   in.node_cert,
@@ -567,7 +570,7 @@ namespace ccf
 
         g.create_service(in.network_cert);
 
-        g.add_key_share_info(in.genesis_key_share_info);
+        // g.add_key_share_info(in.genesis_key_share_info);
 
         args.rpc_ctx->set_response_result(true);
         return;

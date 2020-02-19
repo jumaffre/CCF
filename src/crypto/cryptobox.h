@@ -41,11 +41,11 @@ namespace crypto
   public:
     static constexpr size_t NONCE_SIZE = 24;
     static constexpr size_t EXTRA_SIZE = 16;
-    using BoxNonce = std::array<uint8_t, NONCE_SIZE>;
+    using Nonce = std::array<uint8_t, NONCE_SIZE>;
 
     static std::vector<uint8_t> create(
       std::vector<uint8_t>& plain,
-      BoxNonce& nonce,
+      Nonce& nonce,
       std::vector<uint8_t>& recipient_public,
       std::vector<uint8_t>& sender_private)
     {
@@ -68,7 +68,7 @@ namespace crypto
 
     static std::vector<uint8_t> open(
       const std::vector<uint8_t>& cipher,
-      BoxNonce& nonce,
+      Nonce& nonce,
       const std::vector<uint8_t>& sender_public,
       const std::vector<uint8_t>& recipient_private)
     {
