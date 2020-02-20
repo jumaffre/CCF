@@ -40,7 +40,7 @@ namespace crypto
   {
   public:
     static constexpr size_t NONCE_SIZE = 24;
-    static constexpr size_t EXTRA_SIZE = 16;
+    static constexpr size_t CIPHER_EXTRA_SIZE = 16;
 
     static std::vector<uint8_t> create(
       std::vector<uint8_t>& plain,
@@ -53,7 +53,7 @@ namespace crypto
         throw std::logic_error(
           fmt::format("Box create(): nonce size is not {}", NONCE_SIZE));
       }
-      std::vector<uint8_t> cipher(plain.size() + EXTRA_SIZE);
+      std::vector<uint8_t> cipher(plain.size() + CIPHER_EXTRA_SIZE);
 
       if (
         Hacl_NaCl_crypto_box_easy(
@@ -76,10 +76,11 @@ namespace crypto
       const std::vector<uint8_t>& sender_public,
       const std::vector<uint8_t>& recipient_private)
     {
-      if (cipher.size() < EXTRA_SIZE)
+      if (cipher.size() < CIPHER_EXTRA_SIZE)
       {
         throw std::logic_error(fmt::format(
-          "Box open(): cipher to open should be of size > {}", EXTRA_SIZE));
+          "Box open(): cipher to open should be of size > {}",
+          CIPHER_EXTRA_SIZE));
       }
 
       if (nonce.size() != NONCE_SIZE)
@@ -88,7 +89,7 @@ namespace crypto
           fmt::format("Box open(): nonce size is not {}", NONCE_SIZE));
       }
 
-      std::vector<uint8_t> plain(cipher.size() - EXTRA_SIZE);
+      std::vector<uint8_t> plain(cipher.size() - CIPHER_EXTRA_SIZE);
 
       if (
         Hacl_NaCl_crypto_box_open_easy(

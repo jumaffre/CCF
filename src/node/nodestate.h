@@ -1041,27 +1041,14 @@ namespace ccf
         std::cout << "Encrypting share for active member " << member_id
                   << std::endl;
 
-        auto share_vec = std::vector<uint8_t>(
+        auto share_raw = std::vector<uint8_t>(
           shares[share_index].begin(), shares[share_index].end());
 
         auto enc_pub_key_raw = tls::parse_25519_public(tls::Pem(enc_pub_key));
 
         auto encrypted_share = crypto::Box::create(
-          share_vec, nonce, enc_pub_key_raw, network.encryption_priv_key);
+          share_raw, nonce, enc_pub_key_raw, network.encryption_priv_key);
 
-        if (false)
-        {
-          // TODO: This is just for testing
-          auto member_priv =
-            tls::raw_from_b64("H6FoHb32GIB4LPvv0MK0IC0zgPQBPizNSik174sxigo=");
-          auto decrypted_share = crypto::Box::open(
-            encrypted_share,
-            nonce,
-            crypto::BoxKey::public_from_private(network.encryption_priv_key),
-            member_priv);
-
-          assert(decrypted_share == share_vec);
-        }
         encrypted_shares[member_id] = {nonce, encrypted_share};
         share_index++;
       }
