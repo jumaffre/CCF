@@ -261,7 +261,6 @@ namespace ccf
         [&active_members_info](const MemberId& mid, const MemberInfo& mi) {
           if (mi.status == MemberStatus::ACTIVE)
           {
-            std::cout << "One active member" << std::endl;
             active_members_info[mid] = mi.keyshare;
           }
           return true;

@@ -993,11 +993,8 @@ namespace ccf
       });
     };
 
-    void set_encrypted_shares(Store::Tx& tx) override
+    void split_ledger_secrets(Store::Tx& tx) override
     {
-      auto share_view = tx.get_view(network.shares);
-      GenesisGenerator g(network, tx);
-
       auto share_wrapping_key_raw =
         tls::create_entropy()->random(crypto::GCM_SIZE_KEY);
       auto share_wrapping_key = crypto::KeyAesGcm(share_wrapping_key_raw);
@@ -1014,9 +1011,8 @@ namespace ccf
         encrypted_ls.cipher.data(),
         encrypted_ls.hdr.tag);
 
+      GenesisGenerator g(network, tx);
       auto active_members = g.get_active_members_keyshare();
-      std::cout << active_members.size() << "active members for key sharing"
-                << std::endl;
 
       SecretSharing::SecretToSplit secret_to_split = {};
       std::copy_n(
@@ -1026,18 +1022,18 @@ namespace ccf
 
       // For now, the secret sharing threshold is set to the number of initial
       // members
-      size_t k = active_members.size();
+      size_t threshold = active_members.size();
       auto shares =
-        SecretSharing::split(secret_to_split, active_members.size(), k);
+        SecretSharing::split(secret_to_split, active_members.size(), threshold);
 
       {
         // Until recovery with key share is complete, this checks that the
         // shares can be combined
-        assert(SecretSharing::combine(shares, k) == secret_to_split);
+        assert(SecretSharing::combine(shares, threshold) == secret_to_split);
       }
 
       EncryptedSharesMap encrypted_shares;
-      crypto::Box::Nonce nonce = {}; // TODO: Set it to???
+      auto nonce = tls::create_entropy()->random(crypto::Box::NONCE_SIZE);
 
       size_t share_index = 0;
       for (auto const& [member_id, enc_pub_key] : active_members)
@@ -1045,7 +1041,6 @@ namespace ccf
         std::cout << "Encrypting share for active member " << member_id
                   << std::endl;
 
-        // TODO: Make everything for keyshare vectors?
         auto share_vec = std::vector<uint8_t>(
           shares[share_index].begin(), shares[share_index].end());
 
@@ -1067,9 +1062,7 @@ namespace ccf
 
           assert(decrypted_share == share_vec);
         }
-        // TODO: Also need to record the nonce?
-        encrypted_shares[member_id] = encrypted_share;
-
+        encrypted_shares[member_id] = {nonce, encrypted_share};
         share_index++;
       }
 

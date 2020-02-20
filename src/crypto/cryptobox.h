@@ -41,14 +41,18 @@ namespace crypto
   public:
     static constexpr size_t NONCE_SIZE = 24;
     static constexpr size_t EXTRA_SIZE = 16;
-    using Nonce = std::array<uint8_t, NONCE_SIZE>;
 
     static std::vector<uint8_t> create(
       std::vector<uint8_t>& plain,
-      Nonce& nonce,
+      std::vector<uint8_t>& nonce,
       std::vector<uint8_t>& recipient_public,
       std::vector<uint8_t>& sender_private)
     {
+      if (nonce.size() != NONCE_SIZE)
+      {
+        throw std::logic_error(
+          fmt::format("Box create(): nonce size is not {}", NONCE_SIZE));
+      }
       std::vector<uint8_t> cipher(plain.size() + EXTRA_SIZE);
 
       if (
@@ -60,7 +64,7 @@ namespace crypto
           recipient_public.data(),
           sender_private.data()) != 0)
       {
-        throw std::logic_error("Box create() failed");
+        throw std::logic_error("Box create(): encryption failed");
       }
 
       return cipher;
@@ -68,14 +72,20 @@ namespace crypto
 
     static std::vector<uint8_t> open(
       const std::vector<uint8_t>& cipher,
-      Nonce& nonce,
+      std::vector<uint8_t>& nonce,
       const std::vector<uint8_t>& sender_public,
       const std::vector<uint8_t>& recipient_private)
     {
       if (cipher.size() < EXTRA_SIZE)
       {
         throw std::logic_error(fmt::format(
-          "Box cipher to open should be of length > {}", EXTRA_SIZE));
+          "Box open(): cipher to open should be of size > {}", EXTRA_SIZE));
+      }
+
+      if (nonce.size() != NONCE_SIZE)
+      {
+        throw std::logic_error(
+          fmt::format("Box open(): nonce size is not {}", NONCE_SIZE));
       }
 
       std::vector<uint8_t> plain(cipher.size() - EXTRA_SIZE);
@@ -89,7 +99,7 @@ namespace crypto
           (uint8_t*)sender_public.data(),
           (uint8_t*)recipient_private.data()) != 0)
       {
-        throw std::logic_error("Box open() failed");
+        throw std::logic_error("Box open(): decryption failed");
       }
       return plain;
     }

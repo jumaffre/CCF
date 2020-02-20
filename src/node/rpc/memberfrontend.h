@@ -534,11 +534,10 @@ namespace ccf
         g.init_values();
         for (auto& [cert, k_encryption_key] : in.members_info)
         {
-          std::cout << "Adding member" << std::endl;
           g.add_member(cert, k_encryption_key);
         }
 
-        node.set_encrypted_shares(args.tx);
+        node.split_ledger_secrets(args.tx);
 
         size_t self = g.add_node({in.node_info_network,
                                   in.node_cert,
@@ -548,7 +547,10 @@ namespace ccf
 
         if (self != 0)
         {
-          throw std::logic_error(fmt::format("My node was set to {}", self));
+          args.rpc_ctx->set_response_error(
+            jsonrpc::StandardErrorCodes::INTERNAL_ERROR,
+            "Starting node ID is not 0");
+          return;
         }
 
 #ifdef GET_QUOTE
