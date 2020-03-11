@@ -41,9 +41,7 @@ namespace ccf
       }
     }
 
-    LedgerSecret(const std::vector<uint8_t>& ledger_master_) :
-      master(ledger_master_)
-    {}
+    LedgerSecret(const std::vector<uint8_t>& master_) : master(master_) {}
   };
 
   class LedgerSecrets

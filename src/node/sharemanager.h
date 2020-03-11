@@ -105,7 +105,7 @@ namespace ccf
 
     // For now, the shares are passed directly to this function. Shares should
     // be retrieved from the KV instead.
-    void restore(Store::Tx& tx, const std::vector<Share>& shares)
+    LedgerSecret restore(Store::Tx& tx, const std::vector<Share>& shares)
     {
       // First, re-assemble the ledger secrets wrapping key from the given
       // shares
@@ -122,8 +122,8 @@ namespace ccf
 
       std::vector<uint8_t> decrypted_ls(LedgerSecret::MASTER_KEY_SIZE);
       crypto::GcmCipher encrypted_ls;
-
       encrypted_ls.deserialise(key_share_info->encrypted_ledger_secret);
+
       if (!crypto::KeyAesGcm(ls_wrapping_key.data)
              .decrypt(
                encrypted_ls.hdr.get_iv(), // iv is 0
@@ -134,6 +134,8 @@ namespace ccf
       {
         throw std::logic_error("Decryption of ledger secrets failed");
       }
+
+      return LedgerSecret(std::move(decrypted_ls));
     }
   };
 }

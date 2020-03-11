@@ -255,8 +255,6 @@ namespace ccf
       active_service->status = ServiceStatus::WAITING_FOR_RECOVERY_SHARES;
       service_view->put(0, active_service.value());
 
-      LOG_FAIL_FMT("Service is not waiting for RS");
-
       return true;
     }
 

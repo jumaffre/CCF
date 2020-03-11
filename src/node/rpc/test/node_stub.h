@@ -18,7 +18,8 @@ namespace ccf
       network(network_)
     {}
 
-    bool finish_recovery(Store::Tx& tx, const nlohmann::json& args) override
+    bool finish_recovery(
+      Store::Tx& tx, const nlohmann::json& args, bool with_shares) override
     {
       return true;
     }
