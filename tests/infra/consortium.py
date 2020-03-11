@@ -319,6 +319,7 @@ class Consortium:
                 r = mc.rpc(
                     "submitRecoveryShare", params={"share": list(decrypted_share)}
                 )
+                assert r.error is None, f"Error submitting recovery share: {r.error}"
                 if m == 2:
                     assert (
                         r.result == True

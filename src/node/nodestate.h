@@ -23,6 +23,7 @@
 #include "rpc/serialization.h"
 #include "seal.h"
 #include "secretshare.h"
+#include "sharemanager.h"
 #include "timer.h"
 #include "tls/25519.h"
 #include "tls/client.h"
@@ -181,6 +182,7 @@ namespace ccf
     std::shared_ptr<kv::AbstractTxEncryptor> encryptor;
 
     std::shared_ptr<Seal> seal;
+    ShareManager share_manager;
 
     //
     // join protocol
@@ -218,7 +220,8 @@ namespace ccf
       rpcsessions(rpcsessions),
       notifier(notifier),
       timers(timers),
-      seal(std::make_shared<Seal>(writer_factory))
+      seal(std::make_shared<Seal>(writer_factory)),
+      share_manager(network)
     {
       ::EverCrypt_AutoConfig2_init();
     }
@@ -791,6 +794,12 @@ namespace ccf
       std::lock_guard<SpinLock> guard(lock);
       sm.expect(State::partOfPublicNetwork);
 
+      GenesisGenerator g(network, tx);
+      if (!g.service_wait_for_shares())
+      {
+        return false;
+      }
+
       LOG_INFO_FMT("Initiating end of recovery (primary)");
 
       // Unseal past network secrets
@@ -1007,59 +1016,31 @@ namespace ccf
       });
     };
 
-    void split_ledger_secrets(Store::Tx& tx) override
+    bool split_ledger_secrets(Store::Tx& tx) override
     {
-      auto share_wrapping_key_raw =
-        tls::create_entropy()->random(crypto::GCM_SIZE_KEY);
-      auto share_wrapping_key = crypto::KeyAesGcm(share_wrapping_key_raw);
-
-      // Once sealing is completely removed, this can be called from the
-      // LedgerSecrets class directly
-      crypto::GcmCipher encrypted_ls(LedgerSecret::MASTER_KEY_SIZE);
-      share_wrapping_key.encrypt(
-        encrypted_ls.hdr.get_iv(), // iv is always 0 here as the share wrapping
-                                   // key is never re-used for encryption
-        network.ledger_secrets->get_secret(1)->master,
-        nullb,
-        encrypted_ls.cipher.data(),
-        encrypted_ls.hdr.tag);
-
-      GenesisGenerator g(network, tx);
-      auto active_members = g.get_active_members_keyshare();
-
-      SecretSharing::SplitSecret secret_to_split = {};
-      std::copy_n(
-        share_wrapping_key_raw.begin(),
-        share_wrapping_key_raw.size(),
-        secret_to_split.begin());
-
-      // For now, the secret sharing threshold is set to the number of initial
-      // members
-      size_t threshold = active_members.size();
-      auto shares =
-        SecretSharing::split(secret_to_split, active_members.size(), threshold);
-
-      EncryptedSharesMap encrypted_shares;
-      auto nonce = tls::create_entropy()->random(crypto::Box::NONCE_SIZE);
-
-      size_t share_index = 0;
-      for (auto const& [member_id, enc_pub_key] : active_members)
+      try
       {
-        auto share_raw = std::vector<uint8_t>(
-          shares[share_index].begin(), shares[share_index].end());
-
-        auto enc_pub_key_raw = tls::PublicX25519::parse(tls::Pem(enc_pub_key));
-        auto encrypted_share = crypto::Box::create(
-          share_raw,
-          nonce,
-          enc_pub_key_raw,
-          network.encryption_key->private_raw);
-
-        encrypted_shares[member_id] = {nonce, encrypted_share};
-        share_index++;
+        share_manager.create(tx);
       }
+      catch (const std::logic_error& e)
+      {
+        return false;
+      }
+      return true;
+    }
 
-      g.add_key_share_info({encrypted_ls.serialise(), encrypted_shares});
+    bool combine_recovery_shares(
+      Store::Tx& tx, const std::vector<SecretSharing::Share>& shares) override
+    {
+      try
+      {
+        share_manager.restore(tx, shares);
+      }
+      catch (const std::logic_error& e)
+      {
+        return false;
+      }
+      return true;
     }
 
     NodeId get_node_id() const override

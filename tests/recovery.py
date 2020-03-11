@@ -42,13 +42,14 @@ def test(network, args, use_shares=False):
     LOG.info("Members verify that the new nodes have joined the network")
     recovered_network.wait_for_all_nodes_to_be_trusted()
 
-    if use_shares:
-        recovered_network.consortium.get_and_decrypt_shares(remote_node=primary)
-
     LOG.info("Members vote to complete the recovery")
     recovered_network.consortium.accept_recovery(
         member_id=1, remote_node=primary, sealed_secrets=sealed_secrets
     )
+
+    if use_shares:
+        LOG.warning("Retrieve and submit recovery shares")
+        recovered_network.consortium.get_and_decrypt_shares(remote_node=primary)
 
     for node in recovered_network.nodes:
         recovered_network.wait_for_state(node, "partOfNetwork")
