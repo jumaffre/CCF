@@ -3,6 +3,7 @@
 #include "enclave/appinterface.h"
 #include "formatters.h"
 #include "logging_schema.h"
+#include "node/genesisgen.h"
 #include "node/quote.h"
 #include "node/rpc/userfrontend.h"
 
@@ -27,7 +28,7 @@ namespace ccfapp
     static constexpr auto LOG_GET_PUBLIC = "LOG_get_pub";
 
     static constexpr auto LOG_RECORD_PREFIX_CERT = "LOG_record_prefix_cert";
-    static constexpr auto LOG_RECORD_ANONYMOUS_CALLER = "LOG_record_anonymous";
+    static constexpr auto SELF_REGISTER = "self_register";
   };
 
   // SNIPPET: table_definition
@@ -39,6 +40,7 @@ namespace ccfapp
   private:
     Table& records;
     Table& public_records;
+    NetworkTables& network;
     CodeIDs& user_code_ids;
 
     const nlohmann::json record_public_params_schema;
@@ -71,6 +73,7 @@ namespace ccfapp
     // SNIPPET_START: constructor
     LoggerHandlers(NetworkTables& nwt, AbstractNotifier& notifier) :
       UserHandlerRegistry(nwt),
+      network(nwt),
       records(
         nwt.tables->create<Table>("records", kv::SecurityDomain::PRIVATE)),
       public_records(nwt.tables->create<Table>(
@@ -199,20 +202,32 @@ namespace ccfapp
       };
       // SNIPPET_END: log_record_prefix_cert
 
-      auto log_record_anonymous =
-        [this](RequestArgs& args, nlohmann::json&& params) {
-          const auto in = params.get<LoggingRecord::In>();
-          if (in.msg.empty())
-          {
-            return make_error(
-              HTTP_STATUS_BAD_REQUEST, "Cannot record an empty log message");
-          }
+      auto self_register = [this](RequestArgs& args, nlohmann::json&& params) {
+        const auto in = params.get<SelfRegistration::In>();
 
-          const auto log_line = fmt::format("Anonymous: {}", in.msg);
-          auto view = args.tx.get_view(records);
-          view->put(in.id, log_line);
-          return make_success(true);
-        };
+#ifdef GET_QUOTE
+        auto rc = ccf::QuoteVerifier::verify_quote_against_store(
+          args.tx,
+          user_code_ids,
+          in.quote,
+          tls::cert_der_to_pem(args.rpc_ctx->session->caller_cert));
+        if (rc != QuoteVerificationResult::VERIFIED)
+        {
+          const auto [code, message] =
+            QuoteVerifier::quote_verification_error(rc);
+          return make_error(code, message);
+        }
+#endif
+
+        // Quote verification was successful
+        ccf::GenesisGenerator g(network, args.tx);
+        auto new_user_id =
+          g.add_user(tls::cert_der_to_pem(args.rpc_ctx->session->caller_cert));
+
+        LOG_INFO_FMT("New user {} has self-registered", new_user_id);
+
+        return make_success(true);
+      };
 
       install(Procs::LOG_RECORD, json_adapter(record), Write)
         .set_auto_schema<LoggingRecord::In, bool>();
@@ -230,11 +245,8 @@ namespace ccfapp
         .set_result_schema(get_public_result_schema);
 
       install(Procs::LOG_RECORD_PREFIX_CERT, log_record_prefix_cert, Write);
-      install(
-        Procs::LOG_RECORD_ANONYMOUS_CALLER,
-        json_adapter(log_record_anonymous),
-        Write)
-        .set_auto_schema<LoggingRecord::In, bool>()
+      install(Procs::SELF_REGISTER, json_adapter(self_register), Write)
+        .set_auto_schema<SelfRegistration::In, bool>()
         .set_require_client_identity(false);
 
       nwt.signatures.set_global_hook([this, &notifier](

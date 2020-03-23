@@ -184,10 +184,10 @@ def run(args):
                 notifications_queue,
                 verify=args.package is not "libjsgeneric",
             )
-            network = test_large_messages(network, args)
-            network = test_forwarding_frontends(network, args)
-            network = test_update_lua(network, args)
-            network = test_cert_prefix(network, args)
+            # network = test_large_messages(network, args)
+            # network = test_forwarding_frontends(network, args)
+            # network = test_update_lua(network, args)
+            # network = test_cert_prefix(network, args)
             network = test_anonymous_caller(network, args)
 
 

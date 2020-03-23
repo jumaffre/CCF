@@ -30,6 +30,14 @@ namespace ccf
     };
   };
 
+  struct SelfRegistration
+  {
+    struct In
+    {
+      std::vector<uint8_t> quote;
+    };
+  };
+
   DECLARE_JSON_TYPE(LoggingRecord::In);
   DECLARE_JSON_REQUIRED_FIELDS(LoggingRecord::In, id, msg);
 
@@ -37,6 +45,9 @@ namespace ccf
   DECLARE_JSON_REQUIRED_FIELDS(LoggingGet::In, id);
   DECLARE_JSON_TYPE(LoggingGet::Out);
   DECLARE_JSON_REQUIRED_FIELDS(LoggingGet::Out, msg);
+
+  DECLARE_JSON_TYPE(SelfRegistration::In);
+  DECLARE_JSON_REQUIRED_FIELDS(SelfRegistration::In, quote);
   // SNIPPET_END: macro_validation_macros
 
   // Public record/get
