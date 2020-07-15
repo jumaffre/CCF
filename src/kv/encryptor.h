@@ -105,7 +105,7 @@ namespace kv
       get_encryption_key(version).encrypt(
         gcm_hdr.get_iv(), plain, additional_data, cipher.data(), gcm_hdr.tag);
 
-      serialised_header = std::move(gcm_hdr.serialise());
+      serialised_header = gcm_hdr.serialise();
     }
 
     /**

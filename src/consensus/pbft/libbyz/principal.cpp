@@ -22,7 +22,7 @@ Principal::Principal(
 
   if (!cert_.empty())
   {
-    verifier = std::move(tls::make_unique_verifier(cert_));
+    verifier = tls::make_unique_verifier(cert_);
     cert = cert_;
   }
 

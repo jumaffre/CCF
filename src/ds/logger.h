@@ -235,7 +235,7 @@ namespace logger
       std::vector<std::unique_ptr<AbstractLogger>>& the_loggers = get_loggers();
       if (the_loggers.size() > 0)
       {
-        the_loggers.front() = std::move(std::make_unique<JsonConsoleLogger>());
+        the_loggers.front() = std::make_unique<JsonConsoleLogger>();
       }
       else
       {

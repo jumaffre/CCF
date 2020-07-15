@@ -3,10 +3,9 @@
 // Copyright (c) 2000, 2001 Miguel Castro, Rodrigo Rodrigues, Barbara Liskov.
 // Licensed under the MIT license.
 
-#include "pre_prepare.h"
-
 #include "ds/ccf_assert.h"
 #include "message_tags.h"
+#include "pre_prepare.h"
 #include "prepare.h"
 #include "prepared_cert.h"
 #include "principal.h"
@@ -422,7 +421,7 @@ bool Pre_prepare::Requests_iter::get_big_request(
       return true;
     }
     CCF_ASSERT(r != 0, "Missing big req");
-    req = Request((Request_rep*)r->contents(), std::move(r->get_request_ctx()));
+    req = Request((Request_rep*)r->contents(), r->get_request_ctx());
     return true;
   }
 

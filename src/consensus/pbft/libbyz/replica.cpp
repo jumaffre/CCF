@@ -3,8 +3,6 @@
 // Copyright (c) 2000, 2001 Miguel Castro, Rodrigo Rodrigues, Barbara Liskov.
 // Licensed under the MIT license.
 
-#include "replica.h"
-
 #include "append_entries.h"
 #include "checkpoint.h"
 #include "commit.h"
@@ -28,6 +26,7 @@
 #include "prepared_cert.h"
 #include "principal.h"
 #include "query_stable.h"
+#include "replica.h"
 #include "reply.h"
 #include "reply_stable.h"
 #include "request.h"
@@ -496,8 +495,8 @@ void Replica::playback_request(kv::Tx& tx)
 
   waiting_for_playback_pp = true;
 
-  vec_exec_cmds[0] = std::move(execute_tentative_request(
-    *req, playback_max_local_commit_value, true, &tx, -1));
+  vec_exec_cmds[0] = execute_tentative_request(
+    *req, playback_max_local_commit_value, true, &tx, -1);
 
   exec_command(vec_exec_cmds, playback_byz_info, 1, 0, false, view());
   did_exec_gov_req = did_exec_gov_req || playback_byz_info.did_exec_gov_req;

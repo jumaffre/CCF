@@ -29,6 +29,9 @@ if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   )
 endif()
 
+# add_compile_options(-Wpessimizing-move)
+add_compile_options(-Wall)
+
 message(STATUS "CMAKE_INSTALL_PREFIX is '${CMAKE_INSTALL_PREFIX}'")
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/preproject.cmake

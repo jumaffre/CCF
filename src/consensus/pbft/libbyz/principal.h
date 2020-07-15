@@ -97,7 +97,7 @@ inline bool Principal::has_certificate_set()
 
 inline void Principal::set_certificate(const std::vector<uint8_t>& cert_)
 {
-  verifier = std::move(tls::make_unique_verifier(cert_));
+  verifier = tls::make_unique_verifier(cert_);
   cert = cert_;
   LOG_TRACE_FMT("Certificate for node {} has been set", id);
 }
