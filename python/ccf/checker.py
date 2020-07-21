@@ -16,6 +16,9 @@ def wait_for_global_commit(client, seqno, view, timeout=3):
     A TimeoutError exception is raised if the commit index is not globally
     committed within the given timeout.
     """
+    if seqno is None or view is None:
+        return
+
     end_time = time.time() + timeout
     while time.time() < end_time:
         r = client.get("/node/tx", {"view": view, "seqno": seqno})
