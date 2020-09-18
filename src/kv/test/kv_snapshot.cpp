@@ -110,6 +110,50 @@ TEST_CASE("Simple snapshot" * doctest::test_suite("snapshot"))
   }
 }
 
+TEST_CASE("Deleted keys" * doctest::test_suite("snapshot"))
+{
+  kv::Store store;
+  auto& string_map = store.create<MapTypes::StringString>(
+    "string_map", kv::SecurityDomain::PUBLIC);
+
+  kv::Version snapshot_version = kv::NoVersion;
+  INFO("Apply transactions to original store");
+  {
+    kv::Tx tx1;
+    auto view_1 = tx1.get_view(string_map);
+    view_1->put("foo", "foo");
+    view_1->put("bar", "bar");
+    view_1->put("foo", "foooooooooooooooooooooooo");
+    view_1->put("lalal", "fdsfsfsd");
+    REQUIRE(tx1.commit() == kv::CommitSuccess::OK); // Committed at 1
+
+    kv::Tx tx2;
+    auto view_2 = tx2.get_view(string_map);
+    view_2->remove("foo");
+    view_2->put("lalla", "hohoho");
+    REQUIRE(tx2.commit() == kv::CommitSuccess::OK); // Committed at 2
+    snapshot_version = tx2.commit_version();
+  }
+
+  auto snapshot = store.snapshot(snapshot_version);
+  auto serialised_snapshot = store.serialise_snapshot(std::move(snapshot));
+
+  INFO("Apply snapshots and verify deleted keys");
+  {
+    kv::Store new_store;
+    new_store.clone_schema(store);
+
+    new_store.deserialise_snapshot(serialised_snapshot);
+
+    auto new_string_map = new_store.get<MapTypes::StringString>("string_map");
+    kv::Tx tx;
+    auto view = tx.get_view(*new_string_map);
+
+    REQUIRE_FALSE(view->get("foo").has_value());
+    REQUIRE(view->get("bar").has_value());
+  }
+}
+
 TEST_CASE(
   "Commit transaction while applying snapshot" *
   doctest::test_suite("snapshot"))

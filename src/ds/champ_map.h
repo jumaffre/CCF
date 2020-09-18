@@ -406,14 +406,18 @@ namespace champ
     const Map<K, V, H> put(const K& key, const V& value) const
     {
       auto r = root->put(0, H()(key), key, value);
+
+      // Keep track of map size changes as well as its serialised representation
+      // for snapshotting
       auto size_ = map_size;
+      int64_t size_change = -r.second;
       if (r.second == 0)
       {
         size_++;
+        size_change += get_size_with_padding<K, V>(key, value);
       }
 
-      int64_t size_change = get_size_with_padding<K, V>(key, value) - r.second;
-      return Map(std::move(r.first), size_, size_change + serialized_size);
+      return Map(std::move(r.first), size_, serialized_size + size_change);
     }
 
     template <class F>
@@ -474,6 +478,11 @@ namespace champ
       size_t size = 0;
 
       map.foreach([&](auto& key, auto& value) {
+        if (value.version < 0)
+        {
+          return true;
+        }
+
         K* k = &key;
         V* v = &value;
         uint32_t ks = champ::get_size(key);
