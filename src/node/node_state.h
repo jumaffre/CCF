@@ -301,7 +301,43 @@ namespace ccf
           // has joined
           accept_node_tls_connections();
 
-          sm.advance(State::pending);
+          bool from_snapshot = !args.config.startup_snapshot.empty();
+          if (from_snapshot)
+          {
+            setup_history();
+
+            // It is necessary to give an encryptor to the store for it to
+            // deserialise the public domain when recovering the public ledger.
+            // Once the public recovery is complete, the existing encryptor is
+            // replaced with a new one initialised with recovered ledger
+            // secrets.
+            setup_encryptor(network.consensus_type);
+            // Keep a reference to snapshot for private recovery
+            recovery_snapshot = std::make_unique<std::vector<uint8_t>>(
+              args.config.startup_snapshot);
+
+            LOG_DEBUG_FMT(
+              "Deserialising public snapshot ({})", recovery_snapshot->size());
+            auto rc = network.tables->deserialise_snapshot(
+              *recovery_snapshot, &view_history, true);
+            if (rc != kv::DeserialiseSuccess::PASS)
+            {
+              throw std::logic_error(
+                fmt::format("Failed to apply public snapshot: {}", rc));
+            }
+
+            ledger_idx = network.tables->current_version();
+            last_recovered_signed_idx = ledger_idx;
+            snapshotter->set_last_snapshot_idx(ledger_idx);
+
+            LOG_DEBUG_FMT("Snapshot deserialised at seqno {}", ledger_idx);
+
+            sm.advance(State::readingPublicLedger);
+          }
+          else
+          {
+            sm.advance(State::pending);
+          }
 
           return Success<CreateNew::Out>({node_cert, {}, {}});
         }
@@ -316,7 +352,7 @@ namespace ccf
             tls::create_entropy()->random(crypto::BoxKey::KEY_SIZE));
 
           setup_history();
-          setup_consensus();
+          // setup_consensus(); // TODO: This doesn't seem necessary
 
           // It is necessary to give an encryptor to the store for it to
           // deserialise the public domain when recovering the public ledger.
