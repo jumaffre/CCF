@@ -312,6 +312,9 @@ namespace ccf
           {
             setup_history();
 
+            // TODO: It seems necessary to give LedgerSecrets to the encryptor
+            // for now but this should become optional
+            network.ledger_secrets = std::make_shared<LedgerSecrets>();
             // It is necessary to give an encryptor to the store for it to
             // deserialise the public domain when recovering the public ledger.
             // Once the public recovery is complete, the existing encryptor is

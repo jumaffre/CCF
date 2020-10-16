@@ -64,23 +64,41 @@ namespace asynchost
     return std::stol(file_name.substr(pos + 1));
   }
 
+  // TODO: We can now read non-committed files in ledger directory. Do we want
+  // this??
   std::optional<std::string> get_file_name_with_idx(
     const std::string& dir, size_t idx)
   {
     std::optional<std::string> match = std::nullopt;
+    size_t max_start_idx = 0;
     for (auto const& f : fs::directory_iterator(dir))
     {
-      // If any file, based on its name, contains idx. Only committed files
-      // (i.e. those with a last idx) are considered here.
       auto f_name = f.path().filename();
       auto start_idx = get_start_idx_from_file_name(f_name);
-      auto last_idx = get_last_idx_from_file_name(f_name);
-      if (idx >= start_idx && last_idx.has_value() && idx <= last_idx.value())
+      if (start_idx <= idx && start_idx > max_start_idx)
       {
+        max_start_idx = start_idx;
         match = f_name;
-        break;
       }
     }
+
+    return match;
+
+    // for (auto const& f : fs::directory_iterator(dir))
+    // {
+    //   // TODO: Update comment!!
+    //   // If any file, based on its name, contains idx. Only committed files
+    //   // (i.e. those with a last idx) are considered here.
+    //   auto f_name = f.path().filename();
+    //   auto start_idx = get_start_idx_from_file_name(f_name);
+    //   auto last_idx = get_last_idx_from_file_name(f_name);
+    //   if (idx >= start_idx && last_idx.has_value() && idx <=
+    //   last_idx.value())
+    //   {
+    //     match = f_name;
+    //     break;
+    //   }
+    // }
 
     return match;
   }

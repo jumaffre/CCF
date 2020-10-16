@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include "../ledger.h"
-
 #include "../ds/serialized.h"
+#include "../ledger.h"
 
 #include <doctest/doctest.h>
 #include <string>
@@ -800,7 +799,7 @@ TEST_CASE("Multiple ledger paths")
     read_entries_range_from_ledger(ledger, 1, last_idx);
   }
 
-  INFO("Only committed files can be read from read-only directory");
+  INFO("Non committed files can be read from read-only directory");
   {
     Ledger ledger(
       empty_write_ledger_dir,
@@ -809,13 +808,9 @@ TEST_CASE("Multiple ledger paths")
       max_read_cache_size,
       {ledger_dir});
 
-    for (size_t i = 1; i <= last_committed_idx; i++)
+    for (size_t i = 1; i <= last_idx; i++)
     {
       read_entry_from_ledger(ledger, i);
     }
-
-    // Even though the ledger file for last_idx is in ledger_dir, the entry
-    // cannot be read
-    REQUIRE_FALSE(ledger.read_entry(last_idx).has_value());
   }
 }
