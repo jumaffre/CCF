@@ -852,6 +852,11 @@ namespace aft
             break;
           }
 
+          case kv::DeserialiseSuccess::PASS_SNAPSHOT_EVIDENCE:
+          {
+            break;
+          }
+
           default:
           {
             throw std::logic_error("Unknown DeserialiseSuccess value");

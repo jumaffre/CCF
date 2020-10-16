@@ -712,6 +712,38 @@ namespace ccf
           throw std::logic_error("Invalid signature");
         }
       }
+      else if (result == kv::DeserialiseSuccess::PASS_SNAPSHOT_EVIDENCE)
+      {
+        static consensus::Index snapshot_evidence_idx = ledger_idx;
+        LOG_FAIL_FMT("Found snapshot evidence at {}", snapshot_evidence_idx);
+
+        auto tx = network.tables->create_tx();
+        auto snapshot_evidence_view = tx.get_view(network.snapshot_evidence);
+        if (!snapshot_evidence_view)
+        {
+          throw std::logic_error("Invalid snapshot evidence");
+        }
+
+        auto snapshot_evidence = snapshot_evidence_view->get(0);
+        if (!snapshot_evidence.has_value())
+        {
+          throw std::logic_error("Invalid snapshot evidence");
+        }
+
+        if (
+          snapshot_evidence->hash !=
+          crypto::Sha256Hash(*recovery_snapshot.get()))
+        {
+          throw std::logic_error("Snapshot doesn't match!");
+        }
+        else
+        {
+          LOG_FAIL_FMT("Snapshot evidence matched!!");
+        }
+
+        // TODO: Hash snapshot and verify that it matches - don't fail if it
+        // doesn't!
+      }
 
       read_ledger_idx(++ledger_idx);
     }

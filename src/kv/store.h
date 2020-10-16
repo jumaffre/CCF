@@ -816,6 +816,12 @@ namespace kv
           success = DeserialiseSuccess::PASS_SIGNATURE;
         }
 
+        search = views.find(ccf::Tables::SNAPSHOT_EVIDENCE);
+        if (search != views.end())
+        {
+          success = DeserialiseSuccess::PASS_SNAPSHOT_EVIDENCE;
+        }
+
         if (h)
         {
           h->append(data.data(), data.size());
