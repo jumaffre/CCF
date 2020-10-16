@@ -4,12 +4,15 @@ import tempfile
 import http
 import subprocess
 import os
+import json
 import shutil
+from base64 import b64encode
 import infra.network
 import infra.path
 import infra.proc
 import infra.net
 import infra.e2e_args
+import infra.crypto
 import suite.test_requirements as reqs
 import ccf.proposal_generator
 
@@ -175,6 +178,52 @@ def test_app_bundle(network, args):
     return network
 
 
+@reqs.description("Test dynamically installed endpoint properties")
+def test_dynamic_endpoints(network, args):
+    primary, _ = network.find_nodes()
+
+    bundle_dir = os.path.join(THIS_DIR, "js-app-bundle")
+
+    LOG.info("Deploying initial js app bundle archive")
+    network.consortium.deploy_js_app(primary, bundle_dir)
+
+    valid_body = {"op": "sub", "left": 82, "right": 40}
+    expected_response = {"result": 42}
+
+    LOG.info("Checking initial endpoint is accessible")
+    with primary.client("user0") as c:
+        r = c.post("/app/compute", valid_body)
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        assert r.headers["content-type"] == "application/json"
+        assert r.body.json() == expected_response, r.body
+
+    LOG.info("Checking initial endpoint is inaccessible without auth")
+    with primary.client() as c:
+        r = c.post("/app/compute", valid_body)
+        assert r.status_code == http.HTTPStatus.FORBIDDEN, r.status_code
+
+    LOG.info("Deploying modified js app bundle")
+    with tempfile.TemporaryDirectory(prefix="ccf") as tmp_dir:
+        modified_bundle_dir = shutil.copytree(bundle_dir, tmp_dir, dirs_exist_ok=True)
+        metadata_path = os.path.join(modified_bundle_dir, "app.json")
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+        # Modifying a single entry
+        metadata["endpoints"]["/compute"]["post"]["require_client_identity"] = False
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        network.consortium.deploy_js_app(primary, modified_bundle_dir)
+
+    LOG.info("Checking modified endpoint is accessible without auth")
+    with primary.client() as c:
+        r = c.post("/app/compute", valid_body)
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        assert r.headers["content-type"] == "application/json"
+        assert r.body.json() == expected_response, r.body
+
+    return network
+
+
 @reqs.description("Test basic Node.js/npm app")
 def test_npm_app(network, args):
     primary, _ = network.find_nodes()
@@ -211,6 +260,28 @@ def test_npm_app(network, args):
         assert r.status_code == http.HTTPStatus.OK, r.status_code
         assert len(r.body.data()) == key_size // 8
         assert r.body.data() != b"\x00" * (key_size // 8)
+
+        aes_key_to_wrap = infra.crypto.generate_aes_key(256)
+        wrapping_key_priv_pem, wrapping_key_pub_pem = infra.crypto.generate_rsa_keypair(
+            2048
+        )
+        label = "label42"
+        r = c.post(
+            "/app/wrapKeyRsaOaep",
+            {
+                "key": b64encode(aes_key_to_wrap).decode(),
+                "wrappingKey": wrapping_key_pub_pem,
+                "label": label,
+            },
+        )
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        unwrapped = infra.crypto.unwrap_key_rsa_oaep(
+            r.body.data(), wrapping_key_priv_pem, label.encode("ascii")
+        )
+        assert unwrapped == aes_key_to_wrap
+
+        r = c.get("/app/log?id=42")
+        assert r.status_code == http.HTTPStatus.NOT_FOUND, r.status_code
 
         r = c.post("/app/log?id=42", {"msg": "Hello!"})
         assert r.status_code == http.HTTPStatus.OK, r.status_code
@@ -267,6 +338,7 @@ def run(args):
         network = test_module_set_and_remove(network, args)
         network = test_module_import(network, args)
         network = test_app_bundle(network, args)
+        network = test_dynamic_endpoints(network, args)
         network = test_npm_app(network, args)
         network = test_npm_tsoa_app(network, args)
 

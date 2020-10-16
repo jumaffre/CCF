@@ -37,6 +37,7 @@ export type EndpointFn<A extends JsonCompatible<A> = any, B extends ResponseBody
     (request: Request<A>) => Response<B>
 
 export interface KVMap {
+    has: (key: ArrayBuffer) => boolean
     get: (key: ArrayBuffer) => ArrayBuffer
     set: (key: ArrayBuffer, value: ArrayBuffer) => void
     delete: (key: ArrayBuffer) => void
@@ -44,12 +45,24 @@ export interface KVMap {
 
 export type KVMaps =  { [key: string]: KVMap; };
 
+interface WrapAlgoBase {
+    name: string
+}
+
+export interface RsaOaepParams extends WrapAlgoBase {
+    // name == 'RSA-OAEP'
+    label?: ArrayBuffer
+}
+
+export type WrapAlgo = RsaOaepParams
+
 export interface CCF {
     strToBuf(v: string): ArrayBuffer
     bufToStr(v: ArrayBuffer): string
     jsonCompatibleToBuf<T extends JsonCompatible<T>>(v: T): ArrayBuffer
     bufToJsonCompatible<T extends JsonCompatible<T>>(v: ArrayBuffer): T
     generateAesKey(size: number): ArrayBuffer
+    wrapKey(key: ArrayBuffer, wrappingKey: ArrayBuffer, wrapAlgo: WrapAlgo): ArrayBuffer
 
     kv: KVMaps
 }
@@ -237,6 +250,9 @@ export class TypedKVMap<K, V> {
         private kv: KVMap,
         private kt: DataConverter<K>,
         private vt: DataConverter<V>) {
+    }
+    has(key: K): boolean {
+        return this.kv.has(this.kt.encode(key));
     }
     get(key: K): V {
         return this.vt.decode(this.kv.get(this.kt.encode(key)));
