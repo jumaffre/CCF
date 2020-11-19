@@ -201,6 +201,8 @@ namespace messaging
     RingbufferDispatcher dispatcher;
     std::atomic<bool> finished;
 
+    static constexpr size_t max_read_messages_at_once = 4096;
+
   public:
     BufferProcessor(char const* name = "") : dispatcher(name), finished(false)
     {}
@@ -254,7 +256,7 @@ namespace messaging
 
       while (!finished.load())
       {
-        auto num_read = read_n(-1, r);
+        auto num_read = read_n(max_read_messages_at_once, r);
         total_read += num_read;
 
         if (num_read == 0)

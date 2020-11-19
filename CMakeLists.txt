@@ -860,12 +860,14 @@ if(BUILD_TESTS)
     ADDITIONAL_ARGS
       --package
       liblogging
+      --snapshot-tx-interval
+      10000
       --scenario-file
       ${CMAKE_CURRENT_LIST_DIR}/tests/perf_logging_scenario_100txs.json
-      --max-writes-ahead
-      1000
+      # --max-writes-ahead
+      # 1000
       --repetitions
-      1000
+      10000
   )
 
   add_perf_test(
@@ -877,6 +879,8 @@ if(BUILD_TESTS)
     ADDITIONAL_ARGS
       --package
       liblogging
+      --snapshot-tx-interval
+      10000
       --scenario-file
       ${CMAKE_CURRENT_LIST_DIR}/tests/perf_logging_scenario_100txs.json
       --max-writes-ahead

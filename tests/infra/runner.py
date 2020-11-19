@@ -125,7 +125,7 @@ def run(get_command, args):
             for remote_client in clients:
                 remote_client.start()
 
-            hard_stop_timeout = 90
+            hard_stop_timeout = 900
 
             try:
                 with cimetrics.upload.metrics(complete=False) as metrics:

@@ -315,9 +315,21 @@ namespace enclave
           // If we have pending thread messages, handle them now (and don't
           // sleep)
           {
-            bool task_run =
-              threading::ThreadMessaging::thread_messaging.run_one();
-            if (task_run)
+            // TODO: Don't sleep if we get to the end
+            int i = 0;
+            for (i = 0; i < 8192; i++)
+            {
+              if (!threading::ThreadMessaging::thread_messaging.run_one())
+              {
+                break;
+              }
+              // if (task_run)
+              // {
+              //   LOG_FAIL_FMT("One task was run");
+              //   return;
+              // }
+            }
+            if (i == 8191)
             {
               return;
             }

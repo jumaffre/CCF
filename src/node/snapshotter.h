@@ -171,6 +171,7 @@ namespace ccf
         msg->data.self = shared_from_this();
         msg->data.snapshot = network.tables->snapshot(idx);
 
+        LOG_FAIL_FMT("Scheduling snapshot");
         last_snapshot_idx = idx;
         threading::ThreadMessaging::thread_messaging.add_task(
           get_execution_thread(), std::move(msg));
