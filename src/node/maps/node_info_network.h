@@ -10,8 +10,12 @@
 
 namespace ccf
 {
-  struct NodeInfoNetwork
+  /** @class NodeInfoNetwork
+   *  @brief Node network information
+   */
+  class NodeInfoNetwork
   {
+  protected:
     std::string rpchost;
     std::string pubhost;
     std::string nodehost;

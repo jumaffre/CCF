@@ -9,13 +9,20 @@
 #include <string>
 #include <vector>
 
+/** @file */
+
 namespace ccf
 {
+  /** @enum NodeStatus
+   * @brief NodeStatus enum
+   * Indicates whether has been trusted by the consortium to be part of the
+   * service.
+   */
   enum class NodeStatus
   {
-    PENDING = 0,
-    TRUSTED = 1,
-    RETIRED = 2
+    PENDING = 0, /**< PENDING: The node is not yet trusted by the consortium */
+    TRUSTED = 1, /**< TRUSTED: The node has been trusted by the consortiun */
+    RETIRED = 2 /**< RETIRED: The node has been retired by the consortium */
   };
   DECLARE_JSON_ENUM(
     NodeStatus,
@@ -28,8 +35,13 @@ MSGPACK_ADD_ENUM(ccf::NodeStatus);
 
 namespace ccf
 {
-  struct NodeInfo : NodeInfoNetwork
+  /** @class NodeInfo
+   * @brief Node information
+   * Lala
+   */
+  class NodeInfo : public NodeInfoNetwork
   {
+  public:
     tls::Pem cert;
     std::vector<uint8_t> quote;
     tls::Pem encryption_pub_key;
