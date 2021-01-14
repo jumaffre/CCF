@@ -10,14 +10,11 @@ namespace consensus
 {
   class LedgerEnclave
   {
-  public:
-    static constexpr size_t FRAME_SIZE = sizeof(uint32_t);
-
   private:
     ringbuffer::WriterPtr to_host;
 
   public:
-    LedgerEnclave(ringbuffer::AbstractWriterFactory& writer_factory_) :
+    LedgerEnclave(oversized::WriterFactory& writer_factory_) :
       to_host(writer_factory_.create_writer_to_outside())
     {}
 

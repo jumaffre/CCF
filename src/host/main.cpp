@@ -158,7 +158,7 @@ int main(int argc, char** argv)
       ledger_chunk_bytes,
       "Size (bytes) at which a new ledger chunk is created")
     ->capture_default_str()
-    ->transform(CLI::AsSizeValue(true)); // 1000 is kb
+    ->transform(CLI::AsSizeValue(true)); // 1000 is kB
 
   size_t snapshot_tx_interval = 10'000;
   app
@@ -217,13 +217,14 @@ int main(int argc, char** argv)
       "--sig-ms-interval", sig_ms_interval, "Milliseconds between signatures")
     ->capture_default_str();
 
-  size_t circuit_size_shift = 22;
+  size_t ring_buffer_size = 1 << 22;
   app
     .add_option(
-      "--circuit-size-shift",
-      circuit_size_shift,
-      "Size of the internal ringbuffers, as a power of 2")
-    ->capture_default_str();
+      "--ring-buffer-size",
+      ring_buffer_size,
+      "Size (bytes) of the internal ringbuffers")
+    ->capture_default_str()
+    ->transform(CLI::AsSizeValue(true)); // 1000 is kB
 
   size_t raft_timeout = 100;
   app
@@ -241,10 +242,8 @@ int main(int argc, char** argv)
       "--raft-election-timeout-ms",
       raft_election_timeout,
       "Raft election timeout in milliseconds. If a follower does not receive "
-      "any "
-      "heartbeat from the leader after this timeout, the follower triggers a "
-      "new "
-      "election.")
+      "any heartbeat from the leader after this timeout, the follower triggers "
+      "a new election.")
     ->capture_default_str();
 
   size_t bft_view_change_timeout = 5000;
@@ -254,8 +253,7 @@ int main(int argc, char** argv)
       bft_view_change_timeout,
       "bft view change timeout in milliseconds. If a backup does not receive "
       "the pre-prepare message for a request forwarded to the primary after "
-      "this "
-      "timeout, the backup triggers a new view change.")
+      "this timeout, the backup triggers a new view change.")
     ->capture_default_str();
 
   size_t bft_status_interval = 100;
@@ -263,32 +261,31 @@ int main(int argc, char** argv)
     .add_option(
       "--bft-status-interval-ms",
       bft_status_interval,
-      "bft status timer interval in milliseconds. All bft nodes send "
-      "messages "
+      "bft status timer interval in milliseconds. All bft nodes send messages "
       "containing their status to all other known nodes at regular intervals "
       "defined by this timer interval.")
     ->capture_default_str();
 
-  size_t max_msg_size = 24;
+  size_t max_msg_size = 1 << 19;
   app
     .add_option(
       "--max-msg-size",
       max_msg_size,
-      "Determines maximum total number of bytes for a message sent over the "
-      "ringbuffer. Messages may be split into multiple fragments, but this "
-      "limits the total size of the sum of those fragments. Value is used as a "
-      "shift factor, ie - given N, the limit is (1 << N)")
-    ->capture_default_str();
+      "Total number of bytes for a message sent over the ringbuffer. Messages "
+      "may be split into multiple fragments, but this limits the total size of "
+      "the sum of those fragments.")
+    ->capture_default_str()
+    ->transform(CLI::AsSizeValue(true)); // 1000 is kB
 
-  size_t max_fragment_size = 16;
+  size_t max_fragment_size = 1 << 16;
   app
     .add_option(
       "--max-fragment-size",
       max_fragment_size,
-      "Determines maximum size of individual ringbuffer message fragments. "
-      "Messages larger than this will be split into multiple fragments. Value "
-      "is used as a shift factor, ie - given N, the limit is (1 << N)")
-    ->capture_default_str();
+      "Maximum size (in bytes) of individual ringbuffer message fragments. "
+      "Messages larger than this will be split into multiple fragments.")
+    ->capture_default_str()
+    ->transform(CLI::AsSizeValue(true)); // 1000 is kB
 
   size_t tick_period_ms = 10;
   app
@@ -533,15 +530,12 @@ int main(int argc, char** argv)
   // create the enclave
   host::Enclave enclave(enclave_file, oe_flags);
 
-  // messaging ring buffers
-  const auto buffer_size = 1 << circuit_size_shift;
-
-  std::vector<uint8_t> to_enclave_buffer(buffer_size);
+  std::vector<uint8_t> to_enclave_buffer(ring_buffer_size);
   ringbuffer::Offsets to_enclave_offsets;
   ringbuffer::BufferDef to_enclave_def{
     to_enclave_buffer.data(), to_enclave_buffer.size(), &to_enclave_offsets};
 
-  std::vector<uint8_t> from_enclave_buffer(buffer_size);
+  std::vector<uint8_t> from_enclave_buffer(ring_buffer_size);
   ringbuffer::Offsets from_enclave_offsets;
   ringbuffer::BufferDef from_enclave_def{from_enclave_buffer.data(),
                                          from_enclave_buffer.size(),
@@ -556,8 +550,7 @@ int main(int argc, char** argv)
   ringbuffer::NonBlockingWriterFactory non_blocking_factory(base_factory);
 
   // Factory for creating writers which will handle writing of large messages
-  oversized::WriterConfig writer_config{(size_t)(1 << max_fragment_size),
-                                        (size_t)(1 << max_msg_size)};
+  oversized::WriterConfig writer_config{max_fragment_size, max_msg_size};
   oversized::WriterFactory writer_factory(non_blocking_factory, writer_config);
 
   // reconstruct oversized messages sent to the host

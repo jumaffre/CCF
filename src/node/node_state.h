@@ -125,7 +125,7 @@ namespace ccf
     //
     // kv store, replication, and I/O
     //
-    ringbuffer::AbstractWriterFactory& writer_factory;
+    oversized::WriterFactory& writer_factory;
     ringbuffer::WriterPtr to_host;
     consensus::Config consensus_config;
     size_t sig_tx_interval;
@@ -229,7 +229,7 @@ namespace ccf
 
   public:
     NodeState(
-      ringbuffer::AbstractWriterFactory& writer_factory,
+      oversized::WriterFactory& writer_factory,
       NetworkState& network,
       std::shared_ptr<enclave::RPCSessions> rpcsessions,
       ShareManager& share_manager) :

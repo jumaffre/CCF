@@ -312,6 +312,11 @@ namespace oversized
 
       return next;
     }
+
+    size_t get_max_total_size()
+    {
+      return max_total_size;
+    }
   };
 
   struct WriterConfig
@@ -319,6 +324,8 @@ namespace oversized
     size_t max_fragment_size;
     size_t max_total_size;
   };
+
+  using WriterPtr = std::shared_ptr<Writer>;
 
   // Wrap ringbuffer::Circuit to provide the same fragment/total maximum sizes
   // for every Writer

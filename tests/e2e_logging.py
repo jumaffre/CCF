@@ -91,14 +91,17 @@ def test_large_messages(network, args):
 
         with primary.client("user0") as c:
             log_id = 44
-            for p in range(14, 20) if args.consensus == "cft" else range(10, 13):
-                long_msg = "X" * (2 ** p)
-                check_commit(
-                    c.post("/app/log/private", {"id": log_id, "msg": long_msg}),
-                    result=True,
-                )
-                check(c.get(f"/app/log/private?id={log_id}"), result={"msg": long_msg})
-                log_id += 1
+            for _ in range(1, 3):
+                for p in range(14, 18):
+                    long_msg = "X" * (2 ** p)
+                    check_commit(
+                        c.post("/app/log/private", {"id": log_id, "msg": long_msg}),
+                        result=True,
+                    )
+                    check(
+                        c.get(f"/app/log/private?id={log_id}"), result={"msg": long_msg}
+                    )
+                    log_id += 1
 
     return network
 
@@ -679,26 +682,26 @@ def run(args):
     ) as network:
         network.start_and_join(args)
 
-        network = test(
-            network,
-            args,
-            verify=args.package != "libjs_generic",
-        )
-        network = test_illegal(network, args, verify=args.package != "libjs_generic")
+        # network = test(
+        #     network,
+        #     args,
+        #     verify=args.package != "libjs_generic",
+        # )
+        # network = test_illegal(network, args, verify=args.package != "libjs_generic")
         network = test_large_messages(network, args)
-        network = test_remove(network, args)
-        network = test_forwarding_frontends(network, args)
-        network = test_user_data_ACL(network, args)
-        network = test_cert_prefix(network, args)
-        network = test_anonymous_caller(network, args)
-        network = test_multi_auth(network, args)
-        network = test_custom_auth(network, args)
-        network = test_raw_text(network, args)
-        network = test_historical_query(network, args)
-        network = test_view_history(network, args)
-        network = test_primary(network, args)
-        network = test_metrics(network, args)
-        network = test_memory(network, args)
+        # network = test_remove(network, args)
+        # network = test_forwarding_frontends(network, args)
+        # network = test_user_data_ACL(network, args)
+        # network = test_cert_prefix(network, args)
+        # network = test_anonymous_caller(network, args)
+        # network = test_multi_auth(network, args)
+        # network = test_custom_auth(network, args)
+        # network = test_raw_text(network, args)
+        # network = test_historical_query(network, args)
+        # network = test_view_history(network, args)
+        # network = test_primary(network, args)
+        # network = test_metrics(network, args)
+        # network = test_memory(network, args)
 
 
 if __name__ == "__main__":

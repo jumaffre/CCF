@@ -13,6 +13,7 @@
 #include "node/network_state.h"
 #include "node/snapshot_evidence.h"
 
+#include <algorithm>
 #include <deque>
 #include <optional>
 
@@ -24,7 +25,7 @@ namespace ccf
     static constexpr auto max_tx_interval = std::numeric_limits<size_t>::max();
 
   private:
-    ringbuffer::WriterPtr to_host;
+    oversized::WriterPtr to_host;
     SpinLock lock;
 
     NetworkState& network;
@@ -58,8 +59,45 @@ namespace ccf
       consensus::Index evidence_idx,
       const std::vector<uint8_t>& serialised_snapshot)
     {
-      RINGBUFFER_WRITE_MESSAGE(
-        consensus::snapshot, to_host, idx, evidence_idx, serialised_snapshot);
+      // TODO:
+      // 1. Get `to_host` maximum size
+      // 2. Split serialised_snapshot accordingly
+      // 3. Unit test in snapshotter.cpp
+      // to_host->;
+      LOG_FAIL_FMT("Snapshot size: {}", serialised_snapshot.size());
+
+      size_t fragment_idx = 0;
+      auto fragment_begin = serialised_snapshot.begin();
+
+      auto maximum_size = to_host->get_max_total_size() -
+        (sizeof(idx) + sizeof(evidence_idx) + sizeof(fragment_idx));
+
+      LOG_FAIL_FMT("Max ring buffer size: {}", maximum_size);
+
+      while (std::distance(fragment_begin, serialised_snapshot.end()) > 0)
+      {
+        auto snapshot_fragment_size = std::min(
+          static_cast<size_t>(
+            std::distance(fragment_begin, serialised_snapshot.end())),
+          maximum_size);
+
+        LOG_FAIL_FMT("Snapshot fragment size: {}", snapshot_fragment_size);
+
+        // TODO: Avoid copy here by passing
+        std::vector<uint8_t> snapshot_fragment(
+          fragment_begin, fragment_begin + snapshot_fragment_size);
+
+        RINGBUFFER_WRITE_MESSAGE(
+          consensus::snapshot,
+          to_host,
+          idx,
+          evidence_idx,
+          fragment_idx,
+          std::move(snapshot_fragment));
+
+        fragment_begin += snapshot_fragment_size;
+        fragment_idx++;
+      }
     }
 
     void commit_snapshot(
@@ -126,9 +164,8 @@ namespace ccf
 
   public:
     Snapshotter(
-      ringbuffer::AbstractWriterFactory& writer_factory,
-      NetworkState& network_) :
-      to_host(writer_factory.create_writer_to_outside()),
+      oversized::WriterFactory& writer_factory, NetworkState& network_) :
+      to_host(writer_factory.create_oversized_writer_to_outside()),
       network(network_)
     {
       next_snapshot_indices.push_back(last_snapshot_idx);

@@ -250,6 +250,13 @@ namespace asynchost
         disp, consensus::snapshot, [this](const uint8_t* data, size_t size) {
           auto idx = serialized::read<consensus::Index>(data, size);
           auto evidence_idx = serialized::read<consensus::Index>(data, size);
+          auto snapshot_fragment_idx = serialized::read<size_t>(data, size);
+
+          if (snapshot_fragment_idx > 0)
+          {
+            throw std::logic_error(
+              "Can't handle multiple snapshot fragment idx");
+          }
           write_snapshot(idx, evidence_idx, data, size);
         });
 

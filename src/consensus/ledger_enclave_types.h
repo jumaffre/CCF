@@ -60,6 +60,7 @@ DECLARE_RINGBUFFER_MESSAGE_PAYLOAD(
   consensus::snapshot,
   consensus::Index /* snapshot idx */,
   consensus::Index /* evidence idx */,
+  size_t, /* fragment idx */
   std::vector<uint8_t>);
 DECLARE_RINGBUFFER_MESSAGE_PAYLOAD(
   consensus::snapshot_commit,
