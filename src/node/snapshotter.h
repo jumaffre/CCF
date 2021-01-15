@@ -59,27 +59,26 @@ namespace ccf
       consensus::Index evidence_idx,
       const std::vector<uint8_t>& serialised_snapshot)
     {
-      // TODO:
-      // 1. Get `to_host` maximum size
-      // 2. Split serialised_snapshot accordingly
-      // 3. Unit test in snapshotter.cpp
-      // to_host->;
       LOG_FAIL_FMT("Snapshot size: {}", serialised_snapshot.size());
 
-      size_t fragment_idx = 0;
       auto fragment_begin = serialised_snapshot.begin();
 
-      auto maximum_size = to_host->get_max_total_size() -
-        (sizeof(idx) + sizeof(evidence_idx) + sizeof(fragment_idx));
+      // TODO: How to always keep this in sync?? Create a shared struct and send
+      // that instead??
+      auto maximum_msg_size = to_host->get_max_total_size() -
+        (sizeof(idx) + sizeof(evidence_idx) + sizeof(size_t));
+      size_t fragment_count =
+        (serialised_snapshot.size() / maximum_msg_size) + 1;
 
-      LOG_FAIL_FMT("Max ring buffer size: {}", maximum_size);
+      LOG_FAIL_FMT("Fragment count: {}", fragment_count);
+      LOG_FAIL_FMT("Max ring buffer size: {}", maximum_msg_size);
 
       while (std::distance(fragment_begin, serialised_snapshot.end()) > 0)
       {
         auto snapshot_fragment_size = std::min(
           static_cast<size_t>(
             std::distance(fragment_begin, serialised_snapshot.end())),
-          maximum_size);
+          maximum_msg_size);
 
         LOG_FAIL_FMT("Snapshot fragment size: {}", snapshot_fragment_size);
 
@@ -92,11 +91,10 @@ namespace ccf
           to_host,
           idx,
           evidence_idx,
-          fragment_idx,
+          --fragment_count,
           std::move(snapshot_fragment));
 
         fragment_begin += snapshot_fragment_size;
-        fragment_idx++;
       }
     }
 

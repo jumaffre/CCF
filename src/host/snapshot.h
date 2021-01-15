@@ -83,11 +83,23 @@ namespace asynchost
     return std::make_pair(evidence_idx, evidence_commit_idx);
   }
 
+  struct SnapshotFile
+  {
+    size_t idx;
+    std::ofstream file;
+
+    SnapshotFile(size_t idx_, std::ofstream&& file_) :
+      idx(idx_),
+      file(std::move(file_))
+    {}
+  };
+
   class SnapshotManager
   {
   private:
     const std::string snapshot_dir;
     const Ledger& ledger;
+    std::unique_ptr<SnapshotFile> current_snapshot = nullptr;
 
     static constexpr auto snapshot_file_prefix = "snapshot";
     static constexpr auto snapshot_idx_delimiter = "_";
@@ -126,9 +138,11 @@ namespace asynchost
     void write_snapshot(
       consensus::Index idx,
       consensus::Index evidence_idx,
+      size_t fragment_idx,
       const uint8_t* snapshot_data,
       size_t snapshot_size)
     {
+      LOG_FAIL_FMT("Writing snapshot fragment: {}", fragment_idx);
       auto snapshot_file_name = fmt::format(
         "{}{}{}{}{}",
         snapshot_file_prefix,
@@ -136,29 +150,36 @@ namespace asynchost
         idx,
         snapshot_idx_delimiter,
         evidence_idx);
+
       auto full_snapshot_path =
         fs::path(snapshot_dir) / fs::path(snapshot_file_name);
 
-      if (fs::exists(full_snapshot_path))
-      {
-        throw std::logic_error(fmt::format(
-          "Cannot write snapshot at {} since file already exists: {}",
-          idx,
-          full_snapshot_path));
-      }
+      // if (fs::exists(full_snapshot_path))
+      // {
+      //   throw std::logic_error(fmt::format(
+      //     "Cannot write snapshot at {} since file already exists: {}",
+      //     idx,
+      //     full_snapshot_path));
+      // }
 
       LOG_INFO_FMT(
-        "Writing new snapshot to {} [{}]", snapshot_file_name, snapshot_size);
+        "Writing snapshot fragment to {} [{}]",
+        snapshot_file_name,
+        snapshot_size);
 
-      std::ofstream snapshot_file(
-        full_snapshot_path, std::ios::out | std::ios::binary);
-      snapshot_file.write(
+      current_snapshot = std::make_unique<SnapshotFile>(
+        idx,
+        std::ofstream(full_snapshot_path, std::ios::out | std::ios::binary));
+
+      current_snapshot->file.write(
         reinterpret_cast<const char*>(snapshot_data), snapshot_size);
     }
 
     void commit_snapshot(
       consensus::Index snapshot_idx, consensus::Index evidence_commit_idx)
     {
+      // TODO: Cannot commit if file is in progress!
+
       // Find previously-generated snapshot for snapshot_idx and rename file,
       // including evidence_commit_idx in name too
       for (auto const& f : fs::directory_iterator(snapshot_dir))
@@ -250,14 +271,14 @@ namespace asynchost
         disp, consensus::snapshot, [this](const uint8_t* data, size_t size) {
           auto idx = serialized::read<consensus::Index>(data, size);
           auto evidence_idx = serialized::read<consensus::Index>(data, size);
-          auto snapshot_fragment_idx = serialized::read<size_t>(data, size);
+          auto fragment_idx = serialized::read<size_t>(data, size);
 
-          if (snapshot_fragment_idx > 0)
-          {
-            throw std::logic_error(
-              "Can't handle multiple snapshot fragment idx");
-          }
-          write_snapshot(idx, evidence_idx, data, size);
+          // if (snapshot_fragment_idx > 0)
+          // {
+          //   throw std::logic_error(
+          //     "Can't handle multiple snapshot fragment idx");
+          // }
+          write_snapshot(idx, evidence_idx, fragment_idx, data, size);
         });
 
       DISPATCHER_SET_MESSAGE_HANDLER(
