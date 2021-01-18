@@ -1,6 +1,15 @@
 Built-in Maps
 =============
 
+
+.. doxygenclass:: ccf::NodeInfo
+  :project: CCF
+  :members:
+
+.. doxygentypedef:: ccf::Nodes
+  :project: CCF
+
+
 `public:ccf.gov.nodes.code_ids`
 -------------------------------
 

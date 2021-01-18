@@ -9,8 +9,6 @@
 #include <string>
 #include <vector>
 
-/** @file */
-
 namespace ccf
 {
   /** @enum NodeStatus
@@ -54,6 +52,10 @@ namespace ccf
   DECLARE_JSON_REQUIRED_FIELDS(
     NodeInfo, cert, quote, encryption_pub_key, status);
 
+  /** @typedef Nodes
+   * @tparam Key: NodeId
+   * @tparam: Value: NodeInfo
+   */
   using Nodes = kv::Map<NodeId, NodeInfo>;
 }
 
