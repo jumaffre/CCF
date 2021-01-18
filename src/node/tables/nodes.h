@@ -11,16 +11,18 @@
 
 namespace ccf
 {
+  /** Nodes table name */
+  static constexpr auto NODES_MAP_NAME = "public:ccf.gov.nodes";
+
   /** @enum NodeStatus
-   * @brief NodeStatus enum
-   * Indicates whether has been trusted by the consortium to be part of the
-   * service.
+   * @brief Indicates whether has been trusted by the consortium to be part of
+   * the service.
    */
   enum class NodeStatus
   {
-    PENDING = 0, /**< PENDING: The node is not yet trusted by the consortium */
-    TRUSTED = 1, /**< TRUSTED: The node has been trusted by the consortiun */
-    RETIRED = 2 /**< RETIRED: The node has been retired by the consortium */
+    PENDING = 0, /**< The node is not yet trusted by the consortium */
+    TRUSTED = 1, /**< The node has been trusted by the consortiun */
+    RETIRED = 2 /**< The node has been retired by the consortium */
   };
   DECLARE_JSON_ENUM(
     NodeStatus,
@@ -33,17 +35,17 @@ MSGPACK_ADD_ENUM(ccf::NodeStatus);
 
 namespace ccf
 {
-  /** @class NodeInfo
-   * @brief Node information
-   * Lala
+  /** @struct NodeInfo
+   * @brief Node information...
    */
-  class NodeInfo : public NodeInfoNetwork
+  struct NodeInfo : public NodeInfoNetwork
   {
-  public:
-    tls::Pem cert;
-    std::vector<uint8_t> quote;
-    tls::Pem encryption_pub_key;
-    NodeStatus status = NodeStatus::PENDING;
+    tls::Pem cert; /**< x509 PEM certificate */
+    std::vector<uint8_t> quote; /**< Raw SGW Quote */
+    tls::Pem
+      encryption_pub_key; /**< Node encryption public key (internal use only) */
+    NodeStatus status =
+      NodeStatus::PENDING; /**< ccf::NodeStatus Status of node */
 
     MSGPACK_DEFINE(
       MSGPACK_BASE(NodeInfoNetwork), cert, quote, encryption_pub_key, status);
@@ -52,11 +54,19 @@ namespace ccf
   DECLARE_JSON_REQUIRED_FIELDS(
     NodeInfo, cert, quote, encryption_pub_key, status);
 
+  /** @typedef NodeId
+   * @brief Unique node identifier
+   * @tparam NodeId Unsigned 64-bit integer
+   */
+  using NodeId = uint64_t;
+
   /** @typedef Nodes
+   * @brief Nodes table
    * @tparam Key: NodeId
-   * @tparam: Value: NodeInfo
+   * @tparam Value: NodeInfo
    */
   using Nodes = kv::Map<NodeId, NodeInfo>;
+
 }
 
 FMT_BEGIN_NAMESPACE

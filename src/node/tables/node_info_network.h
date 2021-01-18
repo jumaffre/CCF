@@ -10,18 +10,17 @@
 
 namespace ccf
 {
-  /** @class NodeInfoNetwork
+  /** @struct NodeInfoNetwork
    *  @brief Node network information
    */
-  class NodeInfoNetwork
+  struct NodeInfoNetwork
   {
-  protected:
-    std::string rpchost;
-    std::string pubhost;
-    std::string nodehost;
-    std::string nodeport;
-    std::string rpcport;
-    std::string pubport;
+    std::string rpchost; /**< Node local RPC host */
+    std::string pubhost; /**< Node RPC host */
+    std::string nodehost; /**< Node-to-node local host */
+    std::string nodeport; /**< Node-to-node local port */
+    std::string rpcport; /**< Node local RPC port */
+    std::string pubport; /**< Node RPC host */
 
     MSGPACK_DEFINE(rpchost, pubhost, nodehost, nodeport, rpcport, pubport);
   };

@@ -13,7 +13,6 @@ namespace ccf
 
   constexpr ObjectId INVALID_ID = (std::numeric_limits<ObjectId>::max)();
 
-  using NodeId = uint64_t;
   using Index = int64_t;
   using Node2NodeMsg = uint64_t;
 
@@ -68,7 +67,6 @@ namespace ccf
     static constexpr auto USERS = "public:ccf.gov.users";
     static constexpr auto USER_CERT_DERS = "public:ccf.gov.user_cert_ders";
     static constexpr auto USER_DIGESTS = "public:ccf.gov.user_digests";
-    static constexpr auto NODES = "public:ccf.gov.nodes";
     static constexpr auto VALUES = "public:ccf.gov.values";
     static constexpr auto CONSENSUS = "public:ccf.gov.consensus";
     static constexpr auto WHITELISTS = "public:ccf.gov.whitelists";

@@ -1,13 +1,33 @@
 Built-in Maps
 =============
 
+Nodes
+-----
 
-.. doxygenclass:: ccf::NodeInfo
+Info
+~~~~
+
+.. doxygenvariable:: ccf::NODES_MAP_NAME
   :project: CCF
-  :members:
 
 .. doxygentypedef:: ccf::Nodes
   :project: CCF
+
+Nodes Key
+~~~~~~~~~
+
+.. doxygentypedef:: ccf::NodeId
+  :project: CCF
+
+Nodes Value
+~~~~~~~~~~~
+
+.. doxygenenum:: ccf::NodeStatus
+  :project: CCF
+
+.. doxygenstruct:: ccf::NodeInfo
+  :project: CCF
+  :members:
 
 
 `public:ccf.gov.nodes.code_ids`
