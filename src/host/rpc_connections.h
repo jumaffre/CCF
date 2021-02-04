@@ -145,7 +145,11 @@ namespace asynchost
       s->set_behaviour(std::make_unique<ClientBehaviour>(*this, id));
 
       if (!s->connect(host, service))
+      {
+        LOG_FAIL_FMT("Failed to establish connection to {}:{}", host, service);
+        RINGBUFFER_WRITE_MESSAGE(tls::tls_close, to_enclave, (size_t)id);
         return false;
+      }
 
       sockets.emplace(id, s);
       return true;
