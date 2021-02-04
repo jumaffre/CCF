@@ -20,6 +20,31 @@ struct MapTypes
   using StringNum = kv::Map<std::string, size_t>;
 };
 
+struct MyMapV1
+{
+  size_t value;
+};
+
+DECLARE_JSON_TYPE(MyMapV1);
+DECLARE_JSON_REQUIRED_FIELDS(MyMapV1, value);
+
+struct MyMapV2
+{
+  size_t value;
+  std::string name;
+};
+
+DECLARE_JSON_TYPE(MyMapV2);
+DECLARE_JSON_REQUIRED_FIELDS(MyMapV2, value, name);
+
+TEST_CASE("Compatiblity")
+{
+  auto consensus = std::make_shared<kv::StubConsensus>();
+  kv::Store kv_store(consensus);
+
+  kv::Store kv_store_target;
+}
+
 TEST_CASE(
   "Serialise/deserialise public map only" *
   doctest::test_suite("serialisation"))
