@@ -322,7 +322,7 @@ struct CustomClassV2
   std::string s;
   size_t n;
 
-  bool b = false; // New field
+  bool b = false; // New field: needs to be added as optional
 
   // This macro allows the default msgpack serialiser to be used
   MSGPACK_DEFINE(s, n, b);
@@ -330,8 +330,9 @@ struct CustomClassV2
 // SNIPPET_END: CustomClass definition
 
 // These macros allow the default nlohmann JSON serialiser to be used
-DECLARE_JSON_TYPE(CustomClassV2);
-DECLARE_JSON_REQUIRED_FIELDS(CustomClassV2, s, n, b);
+DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CustomClassV2);
+DECLARE_JSON_REQUIRED_FIELDS(CustomClassV2, s, n);
+DECLARE_JSON_OPTIONAL_FIELDS(CustomClassV2, b);
 
 // Not really intended to be extended, but lets us use the BlitSerialiser for
 // this specific type
@@ -527,10 +528,10 @@ TEST_CASE("Versioning")
   kv::Store kv_store_v1(consensus_v1);
   kv::Store kv_store_v2(consensus_v2);
 
-  using DefaultSerialisedMapV1 = kv::Map<size_t, CustomClass>;
+  using DefaultSerialisedMapV1 = kv::JsonSerialisedMap<size_t, CustomClass>;
   DefaultSerialisedMapV1 map("public:map");
 
-  using DefaultSerialisedMapV2 = kv::Map<size_t, CustomClassV2>;
+  using DefaultSerialisedMapV2 = kv::JsonSerialisedMap<size_t, CustomClassV2>;
   DefaultSerialisedMapV2 mapv2("public:map"); // Note: map would have same name
 
   // Issue transaction on old node
@@ -602,8 +603,9 @@ TEST_CASE("Versioning")
     REQUIRE(value->s == "value");
     REQUIRE(value->n == 2);
 
-    // REQUIRE(value->b == true); // Fails - the value of b was lost during the
-    // round trip
+    // REQUIRE(
+    //   value->b ==
+    //   true); // Fails - the value of b was lost during the round trip
   }
 }
 
