@@ -269,8 +269,14 @@ namespace http
     virtual void set_response_body(std::string&& body) override
     {
       response_body = std::vector<uint8_t>(body.begin(), body.end());
-      set_response_header(
-        http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
+      if (
+        response_headers.find(http::headers::CONTENT_TYPE) ==
+        response_headers.end())
+      {
+        // Convenient auto-set content type if none have been set yet
+        set_response_header(
+          http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
+      }
     }
 
     virtual void set_response_status(int status) override

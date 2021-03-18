@@ -19,6 +19,15 @@ import base64
 import re
 from typing import Union, Optional, List, Any
 
+from openapi_core import create_spec
+from openapi_core.validation.response.validators import ResponseValidator
+from openapi_core.contrib.requests import (
+    RequestsOpenAPIRequest,
+    RequestsOpenAPIResponse,
+)
+from openapi_core.unmarshalling.schemas import util
+
+
 import requests
 from loguru import logger as LOG  # type: ignore
 from requests_http_signature import HTTPSignatureAuth  # type: ignore
@@ -181,7 +190,7 @@ class Response:
 
     def __str__(self):
         versioned = (self.view, self.seqno) != (None, None)
-        status_color = "red" if self.status_code / 100 in (4, 5) else "green"
+        status_color = "red" if int(self.status_code / 100) in (4, 5) else "green"
         body_s = escape_loguru_tags(truncate(str(self.body)))
         # Body can't end with a \, or it will escape the loguru closing tag
         if len(body_s) > 0 and body_s[-1] == "\\":
@@ -455,14 +464,20 @@ class RequestClient:
                 extra_headers["content-type"] = content_type
 
         try:
-            response = self.session.request(
+            request_ = requests.Request(
                 request.http_verb,
                 url=f"https://{self.host}:{self.port}{request.path}",
                 auth=auth_value,
                 headers=extra_headers,
+                data=request_body,
+            )
+
+            prepared_request = self.session.prepare_request(request_)
+
+            response = self.session.send(
+                prepared_request,
                 allow_redirects=request.allow_redirects,
                 timeout=timeout,
-                data=request_body,
             )
         except requests.exceptions.ReadTimeout as exc:
             raise TimeoutError from exc
@@ -470,6 +485,19 @@ class RequestClient:
             raise CCFConnectionException from exc
         except Exception as exc:
             raise RuntimeError("Request client failed with unexpected error") from exc
+
+        frontend = str.split(request.path, "/")[1]
+        with open(f"/data/git/CCF/doc/schemas/{frontend}_openapi.json") as s:
+            spec = create_spec(json.loads(s.read()))
+
+        if not int(response.status_code / 100) in (4, 5):
+            openapi_request = RequestsOpenAPIRequest(request_)
+            openapi_response = RequestsOpenAPIResponse(response)
+            validator = ResponseValidator(spec)
+            result = validator.validate(openapi_request, openapi_response)
+            result.raise_for_errors()
+        else:
+            LOG.warning("Skipping OpenAPI spec verification")
 
         return Response.from_requests_response(response)
 

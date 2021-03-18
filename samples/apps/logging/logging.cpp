@@ -357,9 +357,9 @@ namespace loggingapp
         records_handle->put(in.id, log_line);
 
         args.rpc_ctx->set_response_status(HTTP_STATUS_OK);
+        args.rpc_ctx->set_response_body(nlohmann::json(true).dump());
         args.rpc_ctx->set_response_header(
           http::headers::CONTENT_TYPE, http::headervalues::contenttype::JSON);
-        args.rpc_ctx->set_response_body(nlohmann::json(true).dump());
       };
       make_endpoint(
         "log/private/prefix_cert",
@@ -563,6 +563,8 @@ namespace loggingapp
           caller_identity.name,
           caller_identity.age);
         ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
+        ctx.rpc_ctx->set_response_header(
+          http::headers::CONTENT_TYPE, http::headervalues::contenttype::JSON);
         ctx.rpc_ctx->set_response_body(response.dump(2));
       };
       auto custom_policy = std::make_shared<CustomAuthPolicy>();

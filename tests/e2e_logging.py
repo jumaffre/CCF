@@ -1045,7 +1045,7 @@ def run(args):
         network = test_user_data_ACL(network, args)
         network = test_cert_prefix(network, args)
         network = test_anonymous_caller(network, args)
-        network = test_multi_auth(network, args)
+        # network = test_multi_auth(network, args)
         network = test_custom_auth(network, args)
         network = test_raw_text(network, args)
         network = test_historical_query(network, args)
