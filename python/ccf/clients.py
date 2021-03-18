@@ -486,6 +486,13 @@ class RequestClient:
         except Exception as exc:
             raise RuntimeError("Request client failed with unexpected error") from exc
 
+        # TODO:
+        # We should have this as a static map [frontend -> spec] in the CCFClient
+        # This map can be populated on the CCFClient when a test starts
+        # We should only activate this on a few tests for now (e2e_logging, governance)
+        # Issues:
+        #   - Query strings
+        #   - Signatures don't work
         frontend = str.split(request.path, "/")[1]
         with open(f"/data/git/CCF/doc/schemas/{frontend}_openapi.json") as s:
             spec = create_spec(json.loads(s.read()))
