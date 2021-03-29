@@ -18,22 +18,29 @@ const actions = new Map([
       },
 
       function (args) {
-        console.log("Set member data apply!");
-
         let member_id = ccf.strToBuf(args.member_id);
         let members_info = ccf.kv["public:ccf.gov.members.info"];
         let member_info = members_info.get(member_id);
-        console.log("here!");
         if (member_info === undefined) {
           console.log("Member " + args.member_id + " does not exist");
           return false;
         }
         let mi = ccf.bufToJsonCompatible(member_info);
-        console.log("Before " + JSON.stringify(mi));
         mi.member_data = args.member_data;
-        console.log("All good! " + JSON.stringify(mi));
         members_info.set(member_id, ccf.jsonCompatibleToBuf(mi));
-        console.log("Done");
+        return true;
+      }
+    ),
+  ],
+  [
+    "rekey_ledger",
+    new Action(
+      function (args) {
+        return true; // TODO: Check that args is null?
+      },
+
+      function (args) {
+        ccf.node.rekeyLedger();
         return true;
       }
     ),
@@ -164,69 +171,74 @@ function validate(input) {
 function resolve(proposal, proposer_id, votes) {
   const actions_ = JSON.parse(proposal)["actions"];
   if (actions_.length === 1) {
-    // if (actions[0].name === "always_accept_noop") {
-    //   return "Accepted";
-    // }
-    // if (actions[0].name === "always_reject_noop") {
-    //   return "Rejected";
-    // }
-    // if (
-    //   actions[0].name === "always_accept_with_one_vote" &&
-    //   votes.length === 1 &&
-    //   votes[0].vote === true
-    // ) {
-    //   return "Accepted";
-    // }
-    // if (
-    //   actions[0].name === "always_reject_with_one_vote" &&
-    //   votes.length === 1 &&
-    //   votes[0].vote === false
-    // ) {
-    //   return "Rejected";
-    // }
-    // if (actions[0].name === "always_accept_if_voted_by_operator") {
-    //   for (const vote of votes) {
-    //     const mi = ccf.kv["public:ccf.gov.members.info"].get(
-    //       ccf.strToBuf(vote.member_id)
-    //     );
-    //     if (mi && ccf.bufToJsonCompatible(mi).member_data.is_operator) {
-    //       return "Accepted";
-    //     }
-    //   }
-    // }
-    // if (actions[0].name === "always_accept_if_proposed_by_operator") {
-    //   const mi = ccf.kv["public:ccf.gov.members.info"].get(
-    //     ccf.strToBuf(proposer_id)
-    //   );
-    //   if (mi && ccf.bufToJsonCompatible(mi).member_data.is_operator) {
-    //     return "Accepted";
-    //   }
-    // }
-    // if (
-    //   actions[0].name === "always_accept_with_two_votes" &&
-    //   votes.length === 2 &&
-    //   votes[0].vote === true &&
-    //   votes[1].vote === true
-    // ) {
-    //   return "Accepted";
-    // }
-    // if (
-    //   actions[0].name === "always_reject_with_two_votes" &&
-    //   votes.length === 2 &&
-    //   votes[0].vote === false &&
-    //   votes[1].vote === false
-    // ) {
-    //   return "Rejected";
-    // }
+    if (actions[0].name === "always_accept_noop") {
+      return "Accepted";
+    }
+    if (actions[0].name === "always_reject_noop") {
+      return "Rejected";
+    }
+    if (
+      actions[0].name === "always_accept_with_one_vote" &&
+      votes.length === 1 &&
+      votes[0].vote === true
+    ) {
+      return "Accepted";
+    }
+    if (
+      actions[0].name === "always_reject_with_one_vote" &&
+      votes.length === 1 &&
+      votes[0].vote === false
+    ) {
+      return "Rejected";
+    }
+    if (actions[0].name === "always_accept_if_voted_by_operator") {
+      for (const vote of votes) {
+        const mi = ccf.kv["public:ccf.gov.members.info"].get(
+          ccf.strToBuf(vote.member_id)
+        );
+        if (mi && ccf.bufToJsonCompatible(mi).member_data.is_operator) {
+          return "Accepted";
+        }
+      }
+    }
+    if (actions[0].name === "always_accept_if_proposed_by_operator") {
+      const mi = ccf.kv["public:ccf.gov.members.info"].get(
+        ccf.strToBuf(proposer_id)
+      );
+      if (mi && ccf.bufToJsonCompatible(mi).member_data.is_operator) {
+        return "Accepted";
+      }
+    }
+    if (
+      actions[0].name === "always_accept_with_two_votes" &&
+      votes.length === 2 &&
+      votes[0].vote === true &&
+      votes[1].vote === true
+    ) {
+      return "Accepted";
+    }
+    if (
+      actions[0].name === "always_reject_with_two_votes" &&
+      votes.length === 2 &&
+      votes[0].vote === false &&
+      votes[1].vote === false
+    ) {
+      return "Rejected";
+    }
     if (actions_[0].name == "set_member_data") {
-      console.log("Set member data!");
-      console.log("Action: " + actions.get("set_member_data").apply);
       try {
         actions.get("set_member_data").apply(actions_[0].args);
       } catch (err) {
         console.log("Error: " + err.message);
       }
-      console.log("Set member data complete");
+      return "Accepted";
+    }
+    if (actions_[0].name == "rekey_ledger") {
+      try {
+        actions.get("rekey_ledger").apply(actions_[0].args);
+      } catch (err) {
+        console.log("Error: " + err.message);
+      }
       return "Accepted";
     }
   }

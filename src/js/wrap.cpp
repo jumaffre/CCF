@@ -347,7 +347,15 @@ namespace js
     auto node = static_cast<ccf::AbstractNodeState*>(
       JS_GetOpaque(this_val, node_class_id));
 
-    auto tx_ptr = static_cast<kv::Tx*>(JS_GetOpaque(this_val, kv_class_id));
+    auto global_obj = JS_GetGlobalObject(ctx);
+    auto ccf = JS_GetPropertyStr(ctx, global_obj, "ccf");
+    auto kv = JS_GetPropertyStr(ctx, ccf, "kv");
+
+    auto tx_ptr = static_cast<kv::Tx*>(JS_GetOpaque(kv, kv_class_id));
+
+    JS_FreeValue(ctx, kv);
+    JS_FreeValue(ctx, ccf);
+    JS_FreeValue(ctx, global_obj);
 
     bool result = node->rekey_ledger(*tx_ptr);
 
@@ -606,11 +614,14 @@ namespace js
     }
 
     // Node state
-    // TODO: App shouldn't have access to this!
     if (node_state != nullptr)
     {
-      auto node = JS_NewObjectClass(ctx, node_class_id);
+      if (tx == nullptr)
+      {
+        throw std::logic_error("Tx should be set to set node context");
+      }
 
+      auto node = JS_NewObjectClass(ctx, node_class_id);
       JS_SetOpaque(node, node_state);
       JS_SetPropertyStr(ctx, ccf, "node", node);
       JS_SetPropertyStr(
@@ -627,7 +638,7 @@ namespace js
     kv::Tx* tx,
     const std::optional<kv::TxID>& transaction_id,
     ccf::historical::TxReceiptPtr receipt,
-    ccf::AbstractNodeState* node_state, // TODO: Change to smartptr?
+    ccf::AbstractNodeState* node_state,
     JSContext* ctx)
   {
     auto global_obj = JS_GetGlobalObject(ctx);
