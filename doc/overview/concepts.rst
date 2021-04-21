@@ -33,7 +33,7 @@ Nodes are run and maintained by :term:`Operators`. However, nodes must be truste
 Application
 ~~~~~~~~~~~
 
-Each node runs the same application, written in JavaScript or C++. An application is a collection of endpoints that can be triggered by trusted :term:`Users`' HTTP commands over :term:`TLS`.
+Each node runs the same application, written in JavaScript/TypeScript or C++. An application is a collection of endpoints that can be triggered by trusted :term:`Users`' HTTP commands over :term:`TLS`.
 
 Each endpoint can mutate or read the in-enclave-memory Key-Value Store that is replicated across all nodes in the network. Changes to the Key-Value Store must be agreed by a variable number of nodes, depending on the consensus algorithm selected (either CFT or BFT), before being applied.
 

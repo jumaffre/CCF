@@ -99,7 +99,7 @@ Summary Diagram
 
         Note over Node 2, Node 3: Operators have restarted a public-only service
 
-        Member 0->>+Node 2: Propose accept_recovery
+        Member 0->>+Node 2: Propose transition_service_to_open
         Node 2-->>Member 0: Proposal ID
         Member 1->>+Node 2: Vote for Proposal ID
         Node 2-->>Member 1: State: ACCEPTED

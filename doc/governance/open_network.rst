@@ -90,7 +90,7 @@ Members configure this permission with ``set_user_data`` proposals:
             "text": "tables, args = ...; return Calls:call(\"set_user_data\", args)"
         },
         "parameter": {
-            "user_id": 0,
+            "user_id": "f30db4b4d40d8c495d0c25e920d839876c8dc12e3e561cc9b337ab768e60e06a",
             "user_data": {
                 "isAdmin": true
             }
