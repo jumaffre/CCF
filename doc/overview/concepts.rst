@@ -17,7 +17,7 @@ CCF is based on web technologies: clients interact with CCF JavaScript applicati
 Core Concepts
 -------------
 
-The following diagram shows a basic CCF network made of 3 nodes. All nodes run the same application inside an enclave. The effects of user and member transactions are eventually committed to a replicated encrypted ledger. A consortium of members is in charge of governing the network.
+The following diagram shows a basic CCF network made of 3 nodes. All nodes, operated by one or multiple operators, run the same application inside an enclave. The effects of user and member transactions are eventually committed to a replicated encrypted ledger. A consortium of members is in charge of governing the network.
 
 .. image:: ../img/ccf_concepts.svg
 
