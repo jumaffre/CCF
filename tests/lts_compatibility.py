@@ -397,6 +397,9 @@ if __name__ == "__main__":
     # Cheeky! We reuse cimetrics env as a reliable way to retrieve the
     # current branch on any environment (either local checkout or CI run)
     env = cimetrics.env.get_env()
+    branch_or_tag = "ccf-1.0.5" #env.branch
+
+    LOG.info(f"Local checkout branch or tag name: {env.branch}")
 
     if args.dry_run:
         LOG.warning("Dry run: no compatibility check")
@@ -404,9 +407,9 @@ if __name__ == "__main__":
     compatibility_report = {}
     compatibility_report["version"] = args.ccf_version
     compatibility_report["live compatibility"] = {}
-    latest_lts_version = run_live_compatibility_with_latest(args, repo, env.branch)
+    latest_lts_version = run_live_compatibility_with_latest(args, repo, branch_or_tag)
     following_lts_version = run_live_compatibility_with_following(
-        args, repo, env.branch
+        args, repo, branch_or_tag
     )
     compatibility_report["live compatibility"].update(
         {"with latest": latest_lts_version}
@@ -418,13 +421,13 @@ if __name__ == "__main__":
     if args.check_ledger_compatibility:
         compatibility_report["data compatibility"] = {}
         lts_versions = run_ledger_compatibility_since_first(
-            args, env.branch, use_snapshot=False
+            args, branch_or_tag, use_snapshot=False
         )
         compatibility_report["data compatibility"].update(
             {"with previous ledger": lts_versions}
         )
         lts_versions = run_ledger_compatibility_since_first(
-            args, env.branch, use_snapshot=True
+            args, branch_or_tag, use_snapshot=True
         )
         compatibility_report["data compatibility"].update(
             {"with previous snapshots": lts_versions}

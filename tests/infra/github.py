@@ -67,6 +67,12 @@ def get_release_branch_from_branch_name(branch_name):
 
 def get_major_version_from_branch_name(branch_name):
     # Returns major version number from branch name, or None if the branch isn't a release branch
+    if is_release_branch(branch_name):
+        return get_major_version_from_release_branch_name(branch_name)
+    elif is_release_tag(branch_name):
+        return get_version_from_tag_name(branch_name)[0]
+    else:
+        return None
     return (
         get_major_version_from_release_branch_name(branch_name)
         if is_release_branch(branch_name)
@@ -219,6 +225,9 @@ class Repository:
                 except ValueError as e:  # No previous release branch
                     LOG.warning(f"{e}. Skipping compatibility test with previous")
                     return None
+        elif is_release_tag(branch):
+            LOG.debug(f"{branch} is release tag")
+
         else:
             LOG.debug(f"{branch} is development branch")
             latest_release_branch = self.get_release_branches_names()[0]
