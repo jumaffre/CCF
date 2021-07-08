@@ -513,15 +513,53 @@ def run_join_old_snapshot(args):
             except infra.network.StartupSnapshotIsOld:
                 pass
 
+def run_snapshot_issue(args):
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        args.perf_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_join(args)
+
+        # TODO:
+        # 1. 4 nodes to start with, start service
+        # 2. Kill primary
+        # 3. Add a new node from snapshot
+
+        old_primary, _ = network.find_primary()
+        old_primary_snapshot_dir = old_primary.get_snapshots()
+        old_primary.stop()
+        network.wait_for_new_primary(old_primary)
+
+        # test_add_node_from_snapshot(network, args)
+        # Add node from snapshot created by the old primary
+        new_node = network.create_node("local://localhost")
+        network.join_node(
+            new_node,
+            args.package,
+            args,
+            snapshot_dir=old_primary_snapshot_dir,
+        )
+        network.trust_node(new_node, args)
+
+        network.wait_for_node_commit_sync()
+
+
 
 if __name__ == "__main__":
 
     args = infra.e2e_args.cli_args()
     args.package = "liblogging"
-    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.nodes = infra.e2e_args.min_nodes(args, f=2)
     args.initial_user_count = 1
 
-    run(args)
+    # run(args)
 
-    if args.consensus != "bft":
-        run_join_old_snapshot(args)
+    run_snapshot_issue(args)
+
+    # if args.consensus != "bft":
+        # run_join_old_snapshot(args)
