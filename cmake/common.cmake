@@ -398,7 +398,7 @@ function(add_e2e_test)
   cmake_parse_arguments(
     PARSE_ARGV 0 PARSED_ARGS ""
     "NAME;PYTHON_SCRIPT;LABEL;CURL_CLIENT;CONSENSUS;"
-    "CONSTITUTION;ADDITIONAL_ARGS;CONFIGURATIONS"
+    "CONSTITUTION;ADDITIONAL_ARGS;CONFIGURATIONS;SUDO"
   )
 
   if(NOT PARSED_ARGS_CONSTITUTION)
@@ -421,12 +421,41 @@ function(add_e2e_test)
       set(PYTHON_WRAPPER ${PYTHON})
     endif()
 
+    # if(PARSED_ARGS_SUDO) set(PYTHON_WRAPPER sudo bash -c "source
+    # /home/jumaffre/ccf_env/bin/activate" ${PYTHON_WRAPPER} ) endif()
+
+
+    # TODO:
+    # 1. Pass location of venv as env var
+    # 2. Forward TEST_ENCLAVE=virtual envvar - probably not possible?
+    # 3. Change file permissions
+
+    set(END_TO_END_TEST_CMD
+        ${PYTHON_WRAPPER}
+        ${PARSED_ARGS_PYTHON_SCRIPT}
+        -b
+        .
+        --label
+        ${PARSED_ARGS_NAME}
+        ${CCF_NETWORK_TEST_ARGS}
+        ${PARSED_ARGS_CONSTITUTION}
+        --consensus
+        ${PARSED_ARGS_CONSENSUS}
+        ${PARSED_ARGS_ADDITIONAL_ARGS}
+    )
+    string(JOIN " " END_TO_END_TEST_CMD_STR ${END_TO_END_TEST_CMD})
+
+    # if (DEFINED ENV{CCF_TEST_VENV_PATH})
+    #   set(TEST_VENV_PATH ENV{CCF_TEST_VENV_PATH})
+    # else()
+    #   set(TEST_VENV_PATH "./env")
+    # endif()
+
     add_test(
       NAME ${PARSED_ARGS_NAME}
       COMMAND
-        ${PYTHON_WRAPPER} ${PARSED_ARGS_PYTHON_SCRIPT} -b . --label
-        ${PARSED_ARGS_NAME} ${CCF_NETWORK_TEST_ARGS} ${PARSED_ARGS_CONSTITUTION}
-        --consensus ${PARSED_ARGS_CONSENSUS} ${PARSED_ARGS_ADDITIONAL_ARGS}
+        sudo bash -c
+        "source ${CCF_TEST_VENV_PATH:-./env}/bin/activate && ${END_TO_END_TEST_CMD_STR}"
       CONFIGURATIONS ${PARSED_ARGS_CONFIGURATIONS}
     )
 
