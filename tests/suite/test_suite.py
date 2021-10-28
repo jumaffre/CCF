@@ -99,7 +99,7 @@ all_tests_suite = [
     reconfiguration.test_add_as_many_pending_nodes,
     reconfiguration.test_retire_backup,
     # recovery:
-    recovery.test,
+    recovery.test_recover_service,
     # rekey:
     e2e_logging.test_rekey,
     # election:
