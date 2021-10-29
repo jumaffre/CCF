@@ -511,6 +511,7 @@ namespace ccf
             {
               last_recovered_signed_idx =
                 resp.network_info->last_recovered_signed_idx;
+              ledger_truncate(last_recovered_signed_idx, true);
               setup_recovery_hook();
               snapshotter->set_snapshot_generation(false);
             }
@@ -1047,6 +1048,10 @@ namespace ccf
         // Shares for the new ledger secret can only be issued now, once the
         // previous ledger secrets have been recovered
         share_manager.issue_recovery_shares(tx);
+
+        // TODO: This transaction should mark all recovery ledger chunks as
+        // non-recovery
+
         GenesisGenerator g(network, tx);
         if (!g.open_service())
         {

@@ -893,7 +893,7 @@ namespace asynchost
       TimeBoundLogger log_if_slow(
         fmt::format("Reading ledger entry at {}", idx));
 
-      // TODO: Get consider_recovery_files from enclave
+      // TODO: Get consider_recovery_files from enclave?
       auto f = get_file_from_idx(idx, is_in_recovery_state);
       if (f == nullptr)
       {
