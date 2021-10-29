@@ -54,7 +54,9 @@ DECLARE_RINGBUFFER_MESSAGE_PAYLOAD(
   bool /* force chunk */,
   std::vector<uint8_t>);
 DECLARE_RINGBUFFER_MESSAGE_PAYLOAD(
-  consensus::ledger_truncate, consensus::Index);
+  consensus::ledger_truncate,
+  consensus::Index,
+  bool /* commit truncated files */);
 DECLARE_RINGBUFFER_MESSAGE_PAYLOAD(consensus::ledger_commit, consensus::Index);
 DECLARE_RINGBUFFER_MESSAGE_PAYLOAD(
   consensus::snapshot,

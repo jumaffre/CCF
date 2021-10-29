@@ -29,6 +29,7 @@ namespace asynchost
   static constexpr auto ledger_start_idx_delimiter = "_";
   static constexpr auto ledger_last_idx_delimiter = "-";
   static constexpr auto ledger_corrupt_file_suffix = "corrupted";
+  static constexpr auto ledger_temporary_recovery_file_suffix = "recovery";
 
   static inline bool is_ledger_file_committed(const std::string& file_name)
   {
@@ -71,8 +72,13 @@ namespace asynchost
     return nonstd::ends_with(file_name, ledger_corrupt_file_suffix);
   }
 
+  static inline bool is_ledger_file_name_recovery(const std::string& file_name)
+  {
+    return nonstd::ends_with(file_name, ledger_temporary_recovery_file_suffix);
+  }
+
   std::optional<std::string> get_file_name_with_idx(
-    const std::string& dir, size_t idx)
+    const std::string& dir, size_t idx, bool consider_recovery_files = false)
   {
     std::optional<std::string> match = std::nullopt;
     for (auto const& f : fs::directory_iterator(dir))
@@ -81,7 +87,9 @@ namespace asynchost
       // (i.e. those with a last idx) and non-corrupted files are considered
       // here.
       auto f_name = f.path().filename();
-      if (is_ledger_file_name_corrupted(f_name))
+      if (
+        is_ledger_file_name_corrupted(f_name) ||
+        (!consider_recovery_files && is_ledger_file_name_recovery(f_name)))
       {
         continue;
       }
@@ -130,11 +138,20 @@ namespace asynchost
 
   public:
     // Used when creating a new (empty) ledger file
-    LedgerFile(const std::string& dir, size_t start_idx) :
+    LedgerFile(
+      const std::string& dir,
+      size_t start_idx,
+      bool temporary_recovery_file = false) :
       dir(dir),
-      file_name(fmt::format("{}_{}", file_name_prefix, start_idx)),
       start_idx(start_idx)
     {
+      file_name = fmt::format("{}_{}", file_name_prefix, start_idx);
+      if (temporary_recovery_file)
+      {
+        file_name = fmt::format(
+          "{}.{}", file_name, ledger_temporary_recovery_file_suffix);
+      }
+
       auto file_path = fs::path(dir) / fs::path(file_name);
       file = fopen(file_path.c_str(), "w+b");
       if (!file)
@@ -445,9 +462,11 @@ namespace asynchost
 
     bool commit(size_t idx)
     {
+      // TODO: Also preserve .recovery suffix is recovery is in progress
       if (!completed || committed || (idx != get_last_idx()))
       {
         // No effect if commit idx is not last idx
+        LOG_FAIL_FMT("Try to commit at {} but file is not yet complete", idx);
         return false;
       }
 
@@ -457,12 +476,18 @@ namespace asynchost
           fmt::format("Failed to flush ledger file: {}", strerror(errno)));
       }
 
-      const auto committed_file_name = fmt::format(
+      auto committed_file_name = fmt::format(
         "{}_{}-{}.{}",
         file_name_prefix,
         start_idx,
         get_last_idx(),
         ledger_committed_suffix);
+
+      if (is_ledger_file_name_recovery(file_name))
+      {
+        committed_file_name = fmt::format(
+          "{}.{}", committed_file_name, ledger_temporary_recovery_file_suffix);
+      }
 
       auto file_path = fs::path(dir) / fs::path(file_name);
       auto committed_file_path = fs::path(dir) / fs::path(committed_file_name);
@@ -518,6 +543,8 @@ namespace asynchost
     // True if a new file should be created when writing an entry
     bool require_new_file;
 
+    bool is_in_recovery_state = false;
+
     auto get_it_contains_idx(size_t idx) const
     {
       if (idx == 0)
@@ -536,7 +563,8 @@ namespace asynchost
       return f;
     }
 
-    std::shared_ptr<LedgerFile> get_file_from_cache(size_t idx)
+    std::shared_ptr<LedgerFile> get_file_from_cache(
+      size_t idx, bool consider_recovery_files = false)
     {
       if (idx == 0)
       {
@@ -555,7 +583,8 @@ namespace asynchost
       // If the file is not in the cache, find the file from the ledger
       // directories, inspecting the main ledger directory first
       std::string ledger_dir_;
-      auto match = get_file_name_with_idx(ledger_dir, idx);
+      auto match =
+        get_file_name_with_idx(ledger_dir, idx, consider_recovery_files);
       if (match.has_value())
       {
         ledger_dir_ = ledger_dir;
@@ -591,7 +620,8 @@ namespace asynchost
       return match_file;
     }
 
-    std::shared_ptr<LedgerFile> get_file_from_idx(size_t idx)
+    std::shared_ptr<LedgerFile> get_file_from_idx(
+      size_t idx, bool consider_recovery_files = false)
     {
       if (idx == 0)
       {
@@ -613,7 +643,7 @@ namespace asynchost
       }
 
       // Otherwise, return file from read cache
-      return get_file_from_cache(idx);
+      return get_file_from_cache(idx, consider_recovery_files);
     }
 
     std::shared_ptr<LedgerFile> get_latest_file() const
@@ -657,14 +687,26 @@ namespace asynchost
 
         for (auto const& f : fs::directory_iterator(read_dir))
         {
-          auto last_idx_ = get_last_idx_from_file_name(f.path().filename());
+          auto file_name = f.path().filename();
+          // TODO: Wait for Eddy's PR to ignore non-committed files here
+          // But in the meantime, ignore recovery files
+          if (is_ledger_file_name_recovery(file_name))
+          {
+            LOG_INFO_FMT("Ignoring file {}", file_name);
+            continue;
+          }
+
+          auto last_idx_ = get_last_idx_from_file_name(file_name);
           if (!last_idx_.has_value())
           {
             LOG_DEBUG_FMT(
               "Read-only ledger file {} is ignored as not committed",
-              f.path().filename());
+              file_name);
             continue;
           }
+
+          LOG_DEBUG_FMT(
+            "Recovering file from read-only ledger directory: {}", file_name);
 
           if (last_idx_.value() > last_idx)
           {
@@ -692,9 +734,11 @@ namespace asynchost
         for (auto const& f : fs::directory_iterator(ledger_dir))
         {
           auto file_name = f.path().filename();
-          if (is_ledger_file_name_corrupted(file_name))
+          if (
+            is_ledger_file_name_corrupted(file_name) ||
+            is_ledger_file_name_recovery(file_name))
           {
-            LOG_INFO_FMT("Ignoring corrupted ledger file {}", file_name);
+            LOG_INFO_FMT("Ignoring ledger file {}", file_name);
             continue;
           }
 
@@ -843,12 +887,14 @@ namespace asynchost
       return last_idx;
     }
 
-    std::optional<std::vector<uint8_t>> read_entry(size_t idx)
+    std::optional<std::vector<uint8_t>> read_entry(
+      size_t idx, bool consider_recovery_files = false)
     {
       TimeBoundLogger log_if_slow(
         fmt::format("Reading ledger entry at {}", idx));
 
-      auto f = get_file_from_idx(idx);
+      // TODO: Get consider_recovery_files from enclave
+      auto f = get_file_from_idx(idx, is_in_recovery_state);
       if (f == nullptr)
       {
         return std::nullopt;
@@ -905,7 +951,8 @@ namespace asynchost
 
       if (require_new_file)
       {
-        files.push_back(std::make_shared<LedgerFile>(ledger_dir, last_idx + 1));
+        files.push_back(std::make_shared<LedgerFile>(
+          ledger_dir, last_idx + 1, is_in_recovery_state));
         require_new_file = false;
       }
       auto f = get_latest_file();
@@ -969,15 +1016,22 @@ namespace asynchost
       last_idx = idx;
     }
 
-    void commit(size_t idx)
+    void commit(size_t idx, bool force_complete_files = false)
     {
       TimeBoundLogger log_if_slow(
         fmt::format("Committing ledger entry {}", idx));
 
       LOG_DEBUG_FMT("Ledger commit: {}/{}", idx, last_idx);
 
+      // TODO: Can we remove this branch, assuming that the rest of the function
+      // would be no-op?
       if (idx <= committed_idx)
       {
+        if (force_complete_files)
+        {
+          require_new_file = true;
+          is_in_recovery_state = true;
+        }
         return;
       }
 
@@ -990,10 +1044,16 @@ namespace asynchost
       {
         // Commit all previous file to their latest index while the latest
         // file is committed to the committed index
-        auto commit_idx = (it == f_to) ? idx : (*it)->get_last_idx();
-        if (
-          (*it)->commit(commit_idx) &&
-          (it != f_to || (idx == (*it)->get_last_idx())))
+        auto& f = *it;
+        // TODO: Also complete file!
+        if (force_complete_files)
+        {
+          f->complete();
+          LOG_FAIL_FMT("Completed file");
+        }
+
+        auto commit_idx = (it == f_to) ? idx : f->get_last_idx();
+        if (f->commit(commit_idx) && (it != f_to || (idx == f->get_last_idx())))
         {
           auto it_ = it;
           it++;
@@ -1003,6 +1063,13 @@ namespace asynchost
         {
           it++;
         }
+      }
+
+      // TODO: Also require new file!
+      if (force_complete_files)
+      {
+        require_new_file = true;
+        is_in_recovery_state = true;
       }
 
       committed_idx = idx;
@@ -1031,7 +1098,12 @@ namespace asynchost
         consensus::ledger_truncate,
         [this](const uint8_t* data, size_t size) {
           auto idx = serialized::read<consensus::Index>(data, size);
+          auto commit_files = serialized::read<bool>(data, size);
           truncate(idx);
+          if (commit_files)
+          {
+            commit(idx, true);
+          }
         });
 
       DISPATCHER_SET_MESSAGE_HANDLER(

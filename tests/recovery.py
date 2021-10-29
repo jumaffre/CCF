@@ -54,6 +54,9 @@ def test_recover_service(network, args, from_snapshot=False, split_ledger=False)
     if from_snapshot:
         snapshot_dir = network.get_committed_snapshots(old_primary)
 
+    # TODO: Delete
+    network.consortium.activate(old_primary)
+    network.consortium.activate(old_primary)
     network.stop_all_nodes()
 
     current_ledger_dir, committed_ledger_dir = old_primary.get_ledger(
@@ -174,6 +177,8 @@ def test_recover_service_after_abort(network, args, from_snapshot=False):
     LOG.info("Issue write transactions on to-be-aborted recovery network")
     primary, _ = aborted_recovered_network.find_primary()
     aborted_recovered_network.consortium.activate(primary)
+    aborted_recovered_network.consortium.activate(primary)
+    aborted_recovered_network.consortium.activate(primary)
 
     aborted_recovered_network.stop_all_nodes(skip_verification=True)
 
@@ -194,6 +199,11 @@ def test_recover_service_after_abort(network, args, from_snapshot=False):
         committed_ledger_dir=committed_ledger_dir,
         snapshot_dir=snapshot_dir,
     )
+    primary, _ = recovered_network.find_primary()
+    recovered_network.consortium.activate(primary)
+    recovered_network.consortium.activate(primary)
+    recovered_network.consortium.activate(primary)
+
     recovered_network.recover(args)
 
     return recovered_network
@@ -231,6 +241,7 @@ def run(args):
         #         network, args, from_snapshot=False, split_ledger=True
         #     )
         recovered_network = test_recover_service_after_abort(network, args)
+        recovered_network.stop_all_nodes()
         # recovered_network = test_recover_service(network, args)
         network = recovered_network
         LOG.success("Recovery complete on all nodes")
@@ -258,7 +269,7 @@ checked. Note that the key for each logging message is unique (per table).
 
     args = infra.e2e_args.cli_args(add)
     args.package = "samples/apps/logging/liblogging"
-    args.nodes = infra.e2e_args.max_nodes(args, f=0)  # TODO: Change back to 3
+    args.nodes = infra.e2e_args.min_nodes(args, f=0)  # TODO: Change back to 3
 
     # Test-specific values so that it is likely that ledger files contain
     # at least two signatures, so that they can be split at the first one

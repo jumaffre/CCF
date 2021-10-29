@@ -730,7 +730,7 @@ class Ledger:
                 if (
                     os.path.isfile(chunk)
                     and not path.endswith(".corrupted")
-                    and not path.endswith(".ignored")
+                    and not path.endswith(".recovery")
                     and not any(os.path.basename(chunk) in f for f in ledger_files)
                 ):
                     ledger_files.append(chunk)

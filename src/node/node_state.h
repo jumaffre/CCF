@@ -888,7 +888,10 @@ namespace ccf
       // Note: KV term must be set before the first Tx is committed
       network.tables->rollback(
         {last_recovered_term, last_recovered_signed_idx}, new_term);
-      ledger_truncate(last_recovered_signed_idx);
+
+      // TODO:
+      // 1. Complete and commit file(s) on truncation
+      ledger_truncate(last_recovered_signed_idx, true);
       snapshotter->rollback(last_recovered_signed_idx);
 
       LOG_INFO_FMT(
@@ -914,16 +917,15 @@ namespace ccf
 
       kv::Version index = 0;
       kv::Term view = 0;
-      kv::Version global_commit = 0;
+      kv::Version commit_seqno = 0;
 
-      // auto ls = g.get_last_signature();
       auto ls = tx.ro(network.signatures)->get();
       if (ls.has_value())
       {
         auto s = ls.value();
         index = s.seqno;
         view = s.view;
-        global_commit = s.commit_seqno;
+        commit_seqno = s.commit_seqno;
       }
 
       auto h = dynamic_cast<MerkleTxHistory*>(history.get());
@@ -941,10 +943,10 @@ namespace ccf
       auto_refresh_jwt_keys();
 
       LOG_DEBUG_FMT(
-        "Restarting consensus at view: {} seqno: {} commit_seqno {}",
+        "Restarting consensus at view: {} seqno: {} commit_seqno: {}",
         view,
         index,
-        global_commit);
+        commit_seqno);
 
       consensus->force_become_primary(index, view, view_history, index);
 
@@ -2088,9 +2090,10 @@ namespace ccf
         consensus::LedgerRequestPurpose::Recovery);
     }
 
-    void ledger_truncate(consensus::Index idx)
+    void ledger_truncate(consensus::Index idx, bool commit_file = false)
     {
-      RINGBUFFER_WRITE_MESSAGE(consensus::ledger_truncate, to_host, idx);
+      RINGBUFFER_WRITE_MESSAGE(
+        consensus::ledger_truncate, to_host, idx, commit_file);
     }
   };
 }
