@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "../champ_map.h"
+#include "../rb_map.h"
 
 #include <doctest/doctest.h>
 #include <random>
@@ -23,6 +24,9 @@ using V = uint64_t;
 
 // using H = std::hash<K>;
 using H = CollisionHash<K>;
+
+// using MapImpl = champ::Map<K, V, H>;
+using MapImpl = RBMap<K, V>;
 
 class Model
 {
@@ -56,8 +60,8 @@ public:
 struct Op
 {
   virtual ~Op() = default;
-  virtual pair<const Model, const champ::Map<K, V, H>> apply(
-    const Model& a, const champ::Map<K, V, H>& b) = 0;
+  virtual pair<const Model, const MapImpl> apply(
+    const Model& a, const MapImpl& b) = 0;
   virtual string str() = 0;
 };
 
@@ -68,8 +72,7 @@ struct Put : public Op
 
   Put(K k_, V v_) : k(k_), v(v_) {}
 
-  pair<const Model, const champ::Map<K, V, H>> apply(
-    const Model& a, const champ::Map<K, V, H>& b)
+  pair<const Model, const MapImpl> apply(const Model& a, const MapImpl& b)
   {
     return make_pair(a.put(k, v), b.put(k, v));
   }
@@ -88,10 +91,9 @@ struct Remove : public Op
 
   Remove(K k_) : k(k_) {}
 
-  pair<const Model, const champ::Map<K, V, H>> apply(
-    const Model& a, const champ::Map<K, V, H>& b)
+  pair<const Model, const MapImpl> apply(const Model& a, const MapImpl& b)
   {
-    return make_pair(a.remove(k), b.remove(k));
+    return make_pair(a.remove(k), b.put(k, 0)); // TODO: Add support for put
   }
 
   string str()
@@ -105,10 +107,11 @@ struct Remove : public Op
 vector<unique_ptr<Op>> gen_ops(size_t n)
 {
   random_device rand_dev;
-  auto seed = rand_dev();
+  // auto seed = rand_dev();
+  auto seed = 42;
   std::cout << "seed: " << seed << std::endl;
   mt19937 gen(seed);
-  uniform_int_distribution<> gen_op(0, 3);
+  uniform_int_distribution<> gen_op(0, 2); // TODO: Include remove too
 
   vector<unique_ptr<Op>> ops;
   vector<K> keys;
@@ -157,57 +160,58 @@ vector<unique_ptr<Op>> gen_ops(size_t n)
 TEST_CASE("persistent map operations")
 {
   Model model;
-  champ::Map<K, V, H> champ;
+  MapImpl map;
 
   auto ops = gen_ops(500);
   for (auto& op : ops)
   {
     std::cout << op->str() << std::endl;
-    auto r = op->apply(model, champ);
+    auto r = op->apply(model, map);
     auto model_new = r.first;
-    auto champ_new = r.second;
+    auto map_new = r.second;
 
     INFO("check consistency of persistent maps");
     {
       size_t n = 0;
-      champ_new.foreach([&](const auto& k, const auto& v) {
+      map_new.foreach([&](const auto& k, const auto& v) {
         n++;
         auto model_value = model_new.get(k);
         REQUIRE(model_value.has_value());
         REQUIRE(model_value.value() == v);
         return true;
       });
-      REQUIRE(n == champ_new.size());
+      REQUIRE(n == map_new.size());
     }
 
     INFO("check persistence of previous versions");
     {
       size_t n = 0;
-      champ.foreach([&](const auto& k, const auto& v) {
+      map.foreach([&](const auto& k, const auto& v) {
         n++;
         auto model_value = model.get(k);
         REQUIRE(model_value.has_value());
         REQUIRE(model_value.value() == v);
         return true;
       });
-      REQUIRE(n == champ.size());
+      REQUIRE(n == map.size());
     }
 
     model = model_new;
-    champ = champ_new;
+    map = map_new;
   }
 }
 
-static const champ::Map<K, V, H> gen_map(size_t size)
-{
-  champ::Map<K, V, H> map;
-  for (size_t i = 0; i < size; ++i)
-  {
-    map = map.put(i, i);
-  }
-  return map;
-}
+// static const champ::Map<K, V, H> gen_map(size_t size)
+// {
+//   champ::Map<K, V, H> map;
+//   for (size_t i = 0; i < size; ++i)
+//   {
+//     map = map.put(i, i);
+//   }
+//   return map;
+// }
 
+/*
 TEST_CASE("serialize map")
 {
   struct pair
@@ -304,4 +308,21 @@ TEST_CASE("serialize map")
     std::vector<uint8_t> s(map.get_serialized_size());
     snapshot.serialize(s.data());
   }
+}
+*/
+
+TEST_CASE("Map experiment")
+{
+  RBMap<K, V> map;
+
+  map = map.put(10, 0);
+  map = map.put(8, 0);
+  map = map.put(7, 0);
+  // map = map.put(10, 1);
+  map.dump();
+  std::cout << map.size() << std::endl;
+  REQUIRE(map.size() == 3);
+  map = map.put(7, 3);
+  map.dump();
+  REQUIRE(map.size() == 3);
 }

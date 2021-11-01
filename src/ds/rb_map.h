@@ -18,6 +18,8 @@ private:
 
   struct Node
   {
+    // TODO: Keep track of size in node?? to avoid the std::optional<size_t> in
+    // RBMap ctor>
     Node(
       Color c,
       const std::shared_ptr<const Node>& lft,
@@ -38,12 +40,20 @@ private:
     std::shared_ptr<const Node> _rgt;
   };
 
-  explicit RBMap(std::shared_ptr<const Node> const& node) : _root(node) {}
+  explicit RBMap(const std::shared_ptr<const Node>& node) : _root(node) {}
 
   RBMap(
-    Color c, const RBMap& lft, const K& key, const V& val, const RBMap& rgt) :
-    _root(std::make_shared<const Node>(c, lft._root, key, val, rgt._root))
+    Color c,
+    const RBMap& lft,
+    const K& key,
+    const V& val,
+    const RBMap& rgt,
+    const std::optional<size_t>& size = std::nullopt) :
+    _root(std::make_shared<const Node>(c, lft._root, key, val, rgt._root)),
+    map_size(size.value_or(lft.size() + rgt.size() + 1))
   {
+    std::cout << "Created new map of size: " << lft.size() << " + "
+              << rgt.size() << " + 1 = " << map_size << std::endl;
     assert(lft.empty() || lft.rootKey() < key);
     assert(rgt.empty() || key < rgt.rootKey());
   }
@@ -81,11 +91,21 @@ public:
       return &rootValue();
   }
 
+  size_t size() const
+  {
+    return map_size;
+  }
+
   RBMap put(const K& key, const V& value) const
   {
     RBMap t = insert(key, value);
-    return RBMap(B, t.left(), t.rootKey(), t.rootValue(), t.right());
+    return RBMap(B, t.left(), t.rootKey(), t.rootValue(), t.right(), t.size());
   }
+
+  // RBMap remove(const K& key)
+  // {
+
+  // }
 
   template <class F>
   void foreach(F&& f) const
@@ -98,8 +118,17 @@ public:
     }
   }
 
+  void dump() const
+  {
+    std::cout << "Dump:" << std::endl;
+    foreach([](const K& k, const V& v) {
+      std::cout << "k: " << k << ", v:" << v << std::endl;
+    });
+  }
+
 private:
   std::shared_ptr<const Node> _root;
+  size_t map_size = 0;
 
   Color rootColor() const
   {
@@ -142,7 +171,7 @@ private:
       else if (y < x)
         return balance(left(), y, yv, right().insert(x, v));
       else
-        return RBMap(c, left(), y, v, right());
+        return RBMap(c, left(), y, v, right()); // TODO: No insertion were done
     }
     else
     {
@@ -160,13 +189,16 @@ private:
     const RBMap& lft, const K& x, const V& v, const RBMap& rgt)
   {
     if (lft.doubledLeft())
+    {
       return RBMap(
         R,
         lft.left().paint(B),
         lft.rootKey(),
         lft.rootValue(),
         RBMap(B, lft.right(), x, v, rgt));
+    }
     else if (lft.doubledRight())
+    {
       return RBMap(
         R,
         RBMap(
@@ -174,7 +206,9 @@ private:
         lft.right().rootKey(),
         lft.right().rootValue(),
         RBMap(B, lft.right().right(), x, v, rgt));
+    }
     else if (rgt.doubledLeft())
+    {
       return RBMap(
         R,
         RBMap(B, lft, x, v, rgt.left().left()),
@@ -182,15 +216,20 @@ private:
         rgt.left().rootValue(),
         RBMap(
           B, rgt.left().right(), rgt.rootKey(), rgt.rootValue(), rgt.right()));
+    }
     else if (rgt.doubledRight())
+    {
       return RBMap(
         R,
         RBMap(B, lft, x, v, rgt.left()),
         rgt.rootKey(),
         rgt.rootValue(),
         rgt.right().paint(B));
+    }
     else
+    {
       return RBMap(B, lft, x, v, rgt);
+    }
   }
 
   bool doubledLeft() const

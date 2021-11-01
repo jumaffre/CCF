@@ -73,8 +73,8 @@ static void benchmark_put(picobench::state& s)
     if constexpr (
       std::is_same_v<M, champ::Map<K, V>> || std::is_same_v<M, RBMap<K, V>>)
     {
-      auto res = map.put(size, v);
-      do_not_optimize(res); // TODO: Required?
+      map.put(size, v);
+      // do_not_optimize(res); // TODO: Required?
     }
     else
     {
@@ -157,7 +157,7 @@ static void benchmark_foreach(picobench::state& s)
   s.stop_timer();
 }
 
-const std::vector<int> sizes = {32, 32 << 2, 32 << 4, 32 << 6, 32 << 8};
+const std::vector<int> sizes = {32 << 6};
 
 PICOBENCH_SUITE("put");
 auto bench_rb_map_put = benchmark_put<RBMap<K, V>>;
@@ -189,7 +189,7 @@ PICOBENCH(bench_rb_map_getp).iterations(sizes).samples(10).baseline();
 auto bench_champ_map_getp = benchmark_getp<champ::Map<K, V>>;
 PICOBENCH(bench_champ_map_getp).iterations(sizes).samples(10);
 
-const std::vector<int> for_sizes = {32 << 4, 32 << 5, 32 << 6};
+const std::vector<int> for_sizes = {32 << 6};
 
 PICOBENCH_SUITE("foreach");
 auto bench_rb_map_foreach = benchmark_foreach<RBMap<K, V>>;
