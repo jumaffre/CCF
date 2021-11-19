@@ -5,7 +5,7 @@
 #include "ccf_assert.h"
 #include "serialized.h"
 
-namespace champ
+namespace champ // TODO: change namespace name
 {
   using Version = uint64_t;
   using DeletableVersion = int64_t;

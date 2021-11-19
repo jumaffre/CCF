@@ -4,7 +4,7 @@
 
 #include "ds/buffer.h"
 #include "ds/ccf_assert.h"
-#include "ds/champ_map_serializers.h"
+#include "ds/map_serializers.h"
 
 #include <algorithm>
 #include <array>
@@ -94,6 +94,7 @@ namespace champ
     }
   };
 
+  // TODO: Move to map_serializers.h
   uint32_t static get_padding(uint32_t size)
   {
     uint32_t padding = size % sizeof(uintptr_t);
@@ -104,6 +105,7 @@ namespace champ
     return padding;
   }
 
+  // TODO: Move to map_serializers.h
   template <class K, class V>
   size_t static get_size_with_padding(const K& k, const V& v)
   {
