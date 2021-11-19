@@ -73,8 +73,8 @@ static void benchmark_put(picobench::state& s)
     if constexpr (
       std::is_same_v<M, champ::Map<K, V>> || std::is_same_v<M, RBMap<K, V>>)
     {
-      map.put(size, v);
-      // do_not_optimize(res); // TODO: Required?
+      auto res = map.put(size, v);
+      do_not_optimize(res);
     }
     else
     {

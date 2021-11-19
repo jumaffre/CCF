@@ -18,8 +18,6 @@ private:
 
   struct Node
   {
-    // TODO: Keep track of size in node?? to avoid the std::optional<size_t> in
-    // RBMap ctor>
     Node(
       Color c,
       const std::shared_ptr<const Node>& lft,
@@ -43,17 +41,9 @@ private:
   explicit RBMap(const std::shared_ptr<const Node>& node) : _root(node) {}
 
   RBMap(
-    Color c,
-    const RBMap& lft,
-    const K& key,
-    const V& val,
-    const RBMap& rgt,
-    const std::optional<size_t>& size = std::nullopt) :
-    _root(std::make_shared<const Node>(c, lft._root, key, val, rgt._root)),
-    map_size(size.value_or(lft.size() + rgt.size() + 1))
+    Color c, const RBMap& lft, const K& key, const V& val, const RBMap& rgt) :
+    _root(std::make_shared<const Node>(c, lft._root, key, val, rgt._root))
   {
-    std::cout << "Created new map of size: " << lft.size() << " + "
-              << rgt.size() << " + 1 = " << map_size << std::endl;
     assert(lft.empty() || lft.rootKey() < key);
     assert(rgt.empty() || key < rgt.rootKey());
   }
@@ -91,21 +81,11 @@ public:
       return &rootValue();
   }
 
-  size_t size() const
-  {
-    return map_size;
-  }
-
   RBMap put(const K& key, const V& value) const
   {
     RBMap t = insert(key, value);
-    return RBMap(B, t.left(), t.rootKey(), t.rootValue(), t.right(), t.size());
+    return RBMap(B, t.left(), t.rootKey(), t.rootValue(), t.right());
   }
-
-  // RBMap remove(const K& key)
-  // {
-
-  // }
 
   template <class F>
   void foreach(F&& f) const
@@ -118,17 +98,8 @@ public:
     }
   }
 
-  void dump() const
-  {
-    std::cout << "Dump:" << std::endl;
-    foreach([](const K& k, const V& v) {
-      std::cout << "k: " << k << ", v:" << v << std::endl;
-    });
-  }
-
 private:
   std::shared_ptr<const Node> _root;
-  size_t map_size = 0;
 
   Color rootColor() const
   {
@@ -171,7 +142,7 @@ private:
       else if (y < x)
         return balance(left(), y, yv, right().insert(x, v));
       else
-        return RBMap(c, left(), y, v, right()); // TODO: No insertion were done
+        return RBMap(c, left(), y, v, right());
     }
     else
     {
