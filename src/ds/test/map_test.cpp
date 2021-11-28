@@ -442,3 +442,10 @@ TEST_CASE_TEMPLATE("Foreach", M, RBMap, ChampMap)
   auto map = gen_map<M>(size);
   forall_threshold(map, threshold);
 }
+
+TEST_CASE("RB experiments")
+{
+  size_t size = 10;
+  auto map = gen_map<RBMap>(size);
+  map.dump();
+}

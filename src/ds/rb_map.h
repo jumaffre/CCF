@@ -30,12 +30,14 @@ namespace rb
         const std::shared_ptr<const Node>& lft,
         const K& key,
         const V& val,
-        const std::shared_ptr<const Node>& rgt) :
+        const std::shared_ptr<const Node>& rgt,
+        const std::shared_ptr<const Node>& parent = nullptr) :
         _c(c),
         _lft(lft),
         _key(key),
         _val(val),
-        _rgt(rgt)
+        _rgt(rgt),
+        _parent(parent)
       {
         total_size = 1;
         total_serialized_size = map::get_size_with_padding(key, val);
@@ -52,10 +54,11 @@ namespace rb
       }
 
       Color _c;
-      std::shared_ptr<const Node> _lft;
+      std::shared_ptr<const Node> _lft = nullptr;
       K _key;
       V _val;
-      std::shared_ptr<const Node> _rgt;
+      std::shared_ptr<const Node> _rgt = nullptr;
+      std::shared_ptr<const Node> _parent = nullptr;
       size_t total_size = 0;
       size_t total_serialized_size = 0;
 
@@ -72,13 +75,7 @@ namespace rb
 
     explicit Map(std::shared_ptr<const Node> const& node) : _root(node) {}
 
-    Map(
-      Color c,
-      const Map& lft,
-      const K& key,
-      const V& val,
-      const Map& rgt,
-      std::optional<size_t> size = std::nullopt) :
+    Map(Color c, const Map& lft, const K& key, const V& val, const Map& rgt) :
       _root(std::make_shared<const Node>(c, lft._root, key, val, rgt._root))
     {
       assert(lft.empty() || lft.rootKey() < key);
@@ -134,7 +131,7 @@ namespace rb
     Map put(const K& key, const V& value) const
     {
       Map t = insert(key, value);
-      return Map(B, t.left(), t.rootKey(), t.rootValue(), t.right(), t.size());
+      return Map(B, t.left(), t.rootKey(), t.rootValue(), t.right());
     }
 
     Map remove(const K& key) const
@@ -168,8 +165,30 @@ namespace rb
       return std::make_unique<Snapshot<K, V>>(*this);
     }
 
+    // TODO: Only enabled in debug?
+    void dump() const
+    {
+      std::cout << "RBMap [" << size() << "]:" << std::endl;
+      _dump(_root, false);
+    }
+
   private:
-    std::shared_ptr<const Node> _root;
+    std::shared_ptr<const Node> _root = nullptr;
+
+    void _dump(
+      const std::shared_ptr<const Node>& node,
+      bool is_left,
+      const std::string& prefix = "") const
+    {
+      if (node != nullptr)
+      {
+        std::cout << prefix << (is_left ? "├──" : "└──");
+        std::cout << node->_key << ": " << node->_val << std::endl;
+
+        _dump(node->_lft, true, prefix + (is_left ? "│   " : "    "));
+        _dump(node->_rgt, false, prefix + (is_left ? "│   " : "    "));
+      }
+    }
 
     Color rootColor() const
     {
