@@ -31,7 +31,7 @@ namespace rb
         const K& key,
         const V& val,
         const std::shared_ptr<const Node>& rgt,
-        const std::shared_ptr<const Node>& parent = nullptr) :
+        const std::shared_ptr<const Node>& parent) :
         _c(c),
         _lft(lft),
         _key(key),
@@ -75,8 +75,15 @@ namespace rb
 
     explicit Map(std::shared_ptr<const Node> const& node) : _root(node) {}
 
-    Map(Color c, const Map& lft, const K& key, const V& val, const Map& rgt) :
-      _root(std::make_shared<const Node>(c, lft._root, key, val, rgt._root))
+    Map(
+      Color c,
+      const Map& lft,
+      const K& key,
+      const V& val,
+      const Map& rgt,
+      const Map& par) :
+      _root(std::make_shared<const Node>(
+        c, lft._root, key, val, rgt._root, par._root))
     {
       assert(lft.empty() || lft.rootKey() < key);
       assert(rgt.empty() || key < rgt.rootKey());
@@ -169,7 +176,8 @@ namespace rb
     Map put(const K& key, const V& value) const
     {
       Map t = insert(key, value);
-      return Map(B, t.left(), t.rootKey(), t.rootValue(), t.right());
+      return Map(
+        B, t.left(), t.rootKey(), t.rootValue(), t.right(), t.parent());
     }
 
     Map remove(const K& key) const
@@ -221,7 +229,10 @@ namespace rb
       if (node != nullptr)
       {
         std::cout << prefix << (is_left ? "├──" : "└──");
-        std::cout << node->_key << ": " << node->_val << std::endl;
+        std::cout << node->_key << " (" << node.get() << " - "
+                  << node.use_count() << ") ["
+                  << (node->_parent ? node->_parent->_key : 0) << "]"
+                  << std::endl;
 
         _dump(node->_lft, true, prefix + (is_left ? "│   " : "    "));
         _dump(node->_rgt, false, prefix + (is_left ? "│   " : "    "));
@@ -253,10 +264,18 @@ namespace rb
       return Map(_root->_rgt);
     }
 
+    Map parent() const
+    {
+      return Map(_root->_parent);
+    }
+
     Map insert(const K& x, const V& v) const
     {
       if (empty())
-        return Map(R, Map(), x, v, Map());
+      {
+        // TODO: Fix parent!
+        return Map(R, Map(), x, v, Map(), Map());
+      }
 
       const K& y = rootKey();
       const V& yv = rootValue();
@@ -265,45 +284,58 @@ namespace rb
       if (rootColor() == B)
       {
         if (x < y)
-          return balance(left().insert(x, v), y, yv, right());
+          return balance(left().insert(x, v), y, yv, right(), parent());
         else if (y < x)
-          return balance(left(), y, yv, right().insert(x, v));
+          return balance(left(), y, yv, right().insert(x, v), *this);
         else
-          return Map(c, left(), y, v, right());
+          return Map(c, left(), y, v, right(), parent());
       }
       else
       {
         if (x < y)
-          return Map(c, left().insert(x, v), y, yv, right());
+          return Map(c, left().insert(x, v), y, yv, right(), parent());
         else if (y < x)
-          return Map(c, left(), y, yv, right().insert(x, v));
+          return Map(c, left(), y, yv, right().insert(x, v), parent());
         else
-          return Map(c, left(), y, v, right());
+          return Map(c, left(), y, v, right(), parent());
       }
     }
 
     // Called only when parent is black
-    static Map balance(const Map& lft, const K& x, const V& v, const Map& rgt)
+    static Map balance(
+      const Map& lft, const K& x, const V& v, const Map& rgt, const Map& par)
     {
       if (lft.doubledLeft())
+      {
         return Map(
           R,
           lft.left().paint(B),
           lft.rootKey(),
           lft.rootValue(),
-          Map(B, lft.right(), x, v, rgt));
+          Map(B, lft.right(), x, v, rgt, par),
+          par);
+      }
       else if (lft.doubledRight())
+      {
         return Map(
           R,
           Map(
-            B, lft.left(), lft.rootKey(), lft.rootValue(), lft.right().left()),
+            B,
+            lft.left(),
+            lft.rootKey(),
+            lft.rootValue(),
+            lft.right().left(),
+            par),
           lft.right().rootKey(),
           lft.right().rootValue(),
-          Map(B, lft.right().right(), x, v, rgt));
+          Map(B, lft.right().right(), x, v, rgt, par),
+          par);
+      }
       else if (rgt.doubledLeft())
+      {
         return Map(
           R,
-          Map(B, lft, x, v, rgt.left().left()),
+          Map(B, lft, x, v, rgt.left().left(), par),
           rgt.left().rootKey(),
           rgt.left().rootValue(),
           Map(
@@ -311,16 +343,24 @@ namespace rb
             rgt.left().right(),
             rgt.rootKey(),
             rgt.rootValue(),
-            rgt.right()));
+            rgt.right(),
+            par),
+          par);
+      }
       else if (rgt.doubledRight())
+      {
         return Map(
           R,
-          Map(B, lft, x, v, rgt.left()),
+          Map(B, lft, x, v, rgt.left(), par),
           rgt.rootKey(),
           rgt.rootValue(),
-          rgt.right().paint(B));
+          rgt.right().paint(B),
+          par);
+      }
       else
-        return Map(B, lft, x, v, rgt);
+      {
+        return Map(B, lft, x, v, rgt, par);
+      }
     }
 
     bool doubledLeft() const
@@ -337,7 +377,7 @@ namespace rb
 
     Map paint(Color c) const
     {
-      return Map(c, left(), rootKey(), rootValue(), right());
+      return Map(c, left(), rootKey(), rootValue(), right(), parent());
     }
   };
 

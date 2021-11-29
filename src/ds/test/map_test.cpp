@@ -247,7 +247,7 @@ template <class M>
 static const M gen_map(size_t size)
 {
   M map;
-  for (size_t i = 0; i < size; ++i)
+  for (size_t i = 1; i <= size; ++i)
   {
     map = map.put(i, i);
   }
@@ -465,11 +465,16 @@ static const std::pair<RBMap, RBModel> gen_map_random(size_t size)
 
 TEST_CASE("RB experiments")
 {
-  size_t size = 100;
-  auto [map, model] = gen_map_random(size);
+  size_t size = 2;
+  // auto [map, model] = gen_map_random(size);
+  auto map = gen_map<RBMap>(size);
+
+  auto map2 = map.put(size + 1, 0);
+
   map.dump();
+  map2.dump();
 
   auto begin = map.begin();
-  REQUIRE(begin->_key == model.begin()->first);
+  // REQUIRE(begin->_key == model.begin()->first);
   // REQUIRE(map.begin())
 }
