@@ -41,6 +41,7 @@ using ChampMap = UntypedChampMap<K, V>;
 template <typename Key, typename Value>
 using UntypedRBMap = rb::Map<Key, Value>;
 using RBMap = UntypedRBMap<K, V>;
+using RBModel = std::map<K, V>;
 
 class Model
 {
@@ -443,9 +444,32 @@ TEST_CASE_TEMPLATE("Foreach", M, RBMap, ChampMap)
   forall_threshold(map, threshold);
 }
 
+static const std::pair<RBMap, RBModel> gen_map_random(size_t size)
+{
+  std::random_device rand_dev;
+  auto seed = rand_dev();
+  LOG_INFO_FMT("Seed: {}", seed);
+  std::mt19937 gen(seed);
+  std::uniform_int_distribution<> gen_op(0, size * 10);
+
+  RBMap map;
+  RBModel model;
+  for (size_t i = 0; i < size; ++i)
+  {
+    auto key = gen_op(gen);
+    map = map.put(key, i);
+    model[key] = i;
+  }
+  return std::make_pair(map, model);
+}
+
 TEST_CASE("RB experiments")
 {
-  size_t size = 10;
-  auto map = gen_map<RBMap>(size);
+  size_t size = 100;
+  auto [map, model] = gen_map_random(size);
   map.dump();
+
+  auto begin = map.begin();
+  REQUIRE(begin->_key == model.begin()->first);
+  // REQUIRE(map.begin())
 }

@@ -86,6 +86,44 @@ namespace rb
     using KeyType = K;
     using ValueType = V;
 
+    // TODO: Should always be const!
+    class Iterator
+    {
+    private:
+      // TODO: Ref here or not? How do we detect iterator invalidation?
+      std::shared_ptr<const Node> node = nullptr;
+
+    public:
+      Iterator(const std::shared_ptr<const Node>& node_) : node(node_) {}
+
+      void operator=(const std::shared_ptr<const Node>& node_)
+      {
+        node = node_;
+      }
+
+      void operator++()
+      {
+        // TODO: Implement
+      }
+
+      const std::shared_ptr<const Node>& operator->() const
+      {
+        return node;
+      }
+    };
+
+    Iterator begin() const
+    {
+      Iterator it = _root;
+      while (it->_lft != nullptr)
+      {
+        it = it->_lft;
+      }
+      return it;
+    }
+
+    // Iterator end() const {}
+
     Map() {}
 
     bool empty() const
