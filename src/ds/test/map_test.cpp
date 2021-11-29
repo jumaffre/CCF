@@ -465,16 +465,27 @@ static const std::pair<RBMap, RBModel> gen_map_random(size_t size)
 
 TEST_CASE("RB experiments")
 {
-  size_t size = 2;
+  // size_t size = 2;
   // auto [map, model] = gen_map_random(size);
-  auto map = gen_map<RBMap>(size);
-
-  auto map2 = map.put(size + 1, 0);
-
+  // auto map = gen_map<RBMap>(size);
+  RBMap map;
+  map = map.put(1, 0);
   map.dump();
-  map2.dump();
+  map = map.put(2, 0);
+  map.dump();
+  map = map.put(0, 0);
+  map.dump();
 
-  auto begin = map.begin();
+  // TODO: Doesn't work from here onwards because of tree balancing
+  map = map.put(3, 0);
+  map.dump();
+
+  // auto map2 = map.put(size + 1, 0);
+
+  // map.dump();
+  // map2.dump();
+
+  // auto begin = map.begin();
   // REQUIRE(begin->_key == model.begin()->first);
   // REQUIRE(map.begin())
 }
