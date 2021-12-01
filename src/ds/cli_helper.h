@@ -149,7 +149,7 @@ namespace cli
 
     explicit AsTimeValue() : CLI::AsNumberWithUnit(get_mapping())
     {
-      description("TIME [ns, us, ms, s, min(=60s), h]");
+      description("TIME [us, ms, s, min(=60s), h]");
     }
 
   private:
@@ -181,11 +181,11 @@ namespace cli
     return ret;
   }
 
-  inline static size_t convert_time_string(std::string input)
+  inline static std::chrono::microseconds convert_time_string(std::string input)
   {
     size_t ret = 0;
     AsTimeValue()(input);
     assert(CLI::detail::integral_conversion(input, ret));
-    return ret;
+    return std::chrono::microseconds(ret);
   }
 }

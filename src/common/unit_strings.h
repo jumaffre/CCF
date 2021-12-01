@@ -30,21 +30,22 @@ inline void to_json(nlohmann::json& j, const SizeString& str)
 
 struct TimeString
 {
-  size_t value_us;
+  std::chrono::microseconds value_us;
 
   TimeString() = default;
+
+  template <typename Rep, typename Period>
+  TimeString(const std::chrono::duration<Rep, Period>& duration) :
+    value_us(duration)
+  {}
+
   TimeString(size_t value_us_) : value_us(value_us_) {}
 
   bool operator==(const TimeString&) const = default;
 
-  inline operator size_t() const
-  {
-    return value_us;
-  }
-
   inline operator std::chrono::microseconds() const
   {
-    return std::chrono::microseconds(value_us);
+    return value_us;
   }
 };
 
@@ -52,8 +53,5 @@ struct TimeString
 inline void from_json(const nlohmann::json& j, TimeString& str);
 inline void to_json(nlohmann::json& j, const TimeString& str)
 {
-  j = str.value_us;
+  j = str.value_us.count();
 }
-
-// using SizeString = UnitString<cli::SizeStringConverter>;
-// using TimeString = UnitString<cli::TimeStringConverter>;

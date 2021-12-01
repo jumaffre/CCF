@@ -84,12 +84,12 @@ namespace threading
     struct TimerEntry
     {
       TimerEntry() : time_offset(0), counter(0) {}
-      TimerEntry(std::chrono::milliseconds time_offset_, uint64_t counter_) :
+      TimerEntry(std::chrono::microseconds time_offset_, uint64_t counter_) :
         time_offset(time_offset_),
         counter(counter_)
       {}
 
-      std::chrono::milliseconds time_offset;
+      std::chrono::microseconds time_offset;
       uint64_t counter;
     };
 
@@ -107,7 +107,7 @@ namespace threading
     };
 
     TimerEntry add_task_after(
-      std::unique_ptr<ThreadMsg> item, std::chrono::milliseconds ms)
+      std::unique_ptr<ThreadMsg> item, std::chrono::microseconds ms)
     {
       TimerEntry entry = {time_offset + ms, time_entry_counter++};
       if (timer_map.empty() || entry.time_offset <= next_time_offset)
@@ -130,7 +130,7 @@ namespace threading
       return num_erased != 0;
     }
 
-    void tick(std::chrono::milliseconds elapsed)
+    void tick(std::chrono::microseconds elapsed)
     {
       time_offset += elapsed;
 
@@ -154,17 +154,17 @@ namespace threading
       }
     }
 
-    std::chrono::milliseconds get_current_time_offset()
+    std::chrono::microseconds get_current_time_offset()
     {
       return time_offset;
     }
 
   private:
-    std::chrono::milliseconds time_offset = std::chrono::milliseconds(0);
+    std::chrono::microseconds time_offset = std::chrono::microseconds(0);
     uint64_t time_entry_counter = 0;
     std::map<TimerEntry, std::unique_ptr<ThreadMsg>, TimerEntryCompare>
       timer_map;
-    std::chrono::milliseconds next_time_offset;
+    std::chrono::microseconds next_time_offset;
 
     void reverse_local_messages()
     {
@@ -280,7 +280,7 @@ namespace threading
 
     template <typename Payload>
     Task::TimerEntry add_task_after(
-      std::unique_ptr<Tmsg<Payload>> msg, std::chrono::milliseconds ms)
+      std::unique_ptr<Tmsg<Payload>> msg, std::chrono::microseconds ms)
     {
       Task& task = get_task(get_current_thread_id());
       return task.add_task_after(std::move(msg), ms);
@@ -292,7 +292,7 @@ namespace threading
       return task.cancel_timer_task(timer_entry);
     }
 
-    std::chrono::milliseconds get_current_time_offset()
+    std::chrono::microseconds get_current_time_offset()
     {
       Task& task = get_task(get_current_thread_id());
       return task.get_current_time_offset();
@@ -300,12 +300,12 @@ namespace threading
 
     struct TickMsg
     {
-      TickMsg(std::chrono::milliseconds elapsed_, Task& task_) :
+      TickMsg(std::chrono::microseconds elapsed_, Task& task_) :
         elapsed(elapsed_),
         task(task_)
       {}
 
-      std::chrono::milliseconds elapsed;
+      std::chrono::microseconds elapsed;
       Task& task;
     };
 
@@ -314,7 +314,7 @@ namespace threading
       msg->data.task.tick(msg->data.elapsed);
     }
 
-    void tick(std::chrono::milliseconds elapsed)
+    void tick(std::chrono::microseconds elapsed)
     {
       for (auto i = 0; i < thread_count; ++i)
       {

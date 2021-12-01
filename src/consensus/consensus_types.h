@@ -7,6 +7,12 @@
 
 #include <stdint.h>
 
+// TODO: Move elsewhere!
+inline void from_json(const nlohmann::json& j, TimeString& str)
+{
+  str = j.get<TimeString>();
+}
+
 namespace consensus
 {
   struct Configuration

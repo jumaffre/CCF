@@ -224,7 +224,7 @@ Interval (milliseconds) at which the enclave time will be updated by the host. D
 ``io_logging_threshold_ns``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Maximum duration (nanoseconds) of I/O operations (ledger and snapshots) after which slow operations will be logged to node's log. Default value: ``10000000`` ns.
+Maximum duration (microseconds) of I/O operations (ledger and snapshots) after which slow operations will be logged to node's log. Default value: ``10000000`` ns.
 
 ``node_client_interface``
 ~~~~~~~~~~~~~~~~~~~~~~~~~

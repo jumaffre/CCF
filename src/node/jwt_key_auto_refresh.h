@@ -17,7 +17,7 @@ namespace ccf
   class JwtKeyAutoRefresh
   {
   private:
-    size_t refresh_interval_s;
+    std::chrono::microseconds refresh_interval;
     NetworkState& network;
     std::shared_ptr<kv::Consensus> consensus;
     std::shared_ptr<enclave::RPCSessions> rpcsessions;
@@ -27,7 +27,7 @@ namespace ccf
 
   public:
     JwtKeyAutoRefresh(
-      size_t refresh_interval_s,
+      std::chrono::microseconds refresh_interval,
       NetworkState& network,
       const std::shared_ptr<kv::Consensus>& consensus,
       const std::shared_ptr<enclave::RPCSessions>& rpcsessions,
@@ -65,18 +65,17 @@ namespace ccf
           }
           LOG_DEBUG_FMT(
             "JWT key auto-refresh: Scheduling in {}s",
-            msg->data.self.refresh_interval_s);
-          auto delay = std::chrono::seconds(msg->data.self.refresh_interval_s);
+            msg->data.self.refresh_intervals.count() / 1'000'000);
           threading::ThreadMessaging::thread_messaging.add_task_after(
-            std::move(msg), delay);
+            std::move(msg), msg->data.self.refresh_interval);
         },
         *this);
 
       LOG_DEBUG_FMT(
-        "JWT key auto-refresh: Scheduling in {}s", refresh_interval_s);
-      auto delay = std::chrono::seconds(refresh_interval_s);
+        "JWT key auto-refresh: Scheduling in {}s",
+        refresh_interval.count() / 1'000'000);
       threading::ThreadMessaging::thread_messaging.add_task_after(
-        std::move(refresh_msg), delay);
+        std::move(refresh_msg), refresh_interval);
     }
 
     void schedule_once()

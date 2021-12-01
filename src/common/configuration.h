@@ -82,7 +82,7 @@ struct CCFConfig
   struct Intervals
   {
     size_t signature_interval_size = 5000;
-    TimeString signature_interval_duration = 1000; // TODO: ms
+    TimeString signature_interval_duration = std::chrono::milliseconds(1'000);
 
     bool operator==(const Intervals&) const = default;
   };
@@ -90,7 +90,7 @@ struct CCFConfig
 
   struct JWT
   {
-    TimeString key_refresh_interval = 1800;
+    TimeString key_refresh_interval = std::chrono::minutes(30);
 
     bool operator==(const JWT&) const = default;
   };
@@ -143,7 +143,7 @@ struct StartupConfig : CCFConfig
   struct Join
   {
     ccf::NodeInfoNetwork_v2::NetAddress target_rpc_address;
-    size_t timer_ms = 1000;
+    size_t timer_ms = 1000; // TODO: Make TimeString?
     std::vector<uint8_t> network_cert = {};
   };
   Join join = {};

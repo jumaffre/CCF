@@ -15,13 +15,9 @@ namespace asynchost
     using TClock = std::chrono::steady_clock;
     static std::string human_time(const TClock::duration& d)
     {
-      // TODO: Fix!
-      const auto ns =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(d).count();
-      if (ns < 1000)
-        return fmt::format("{}ns", ns);
+      const auto us =
+        std::chrono::duration_cast<std::chrono::microseconds>(d).count();
 
-      const auto us = ns / 1000.0f;
       if (us < 1000)
         return fmt::format("{:>7.03f}us", us);
 
@@ -33,7 +29,7 @@ namespace asynchost
       return fmt::format("{:>7.03f}s", s);
     }
 
-    static std::chrono::nanoseconds default_max_time;
+    static std::chrono::microseconds default_max_time;
 
     std::string message;
     TClock::duration max_time;
