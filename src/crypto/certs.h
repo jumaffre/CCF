@@ -49,7 +49,7 @@ namespace crypto
     const Pem& csr,
     const std::string& valid_from,
     size_t validity_period_days,
-    const Pem& issuer_key_pair,
+    const Pem& issuer_key_pair, // TODO: Type seems wrong here!
     const Pem& issuer_cert)
   {
     return create_endorsed_cert(

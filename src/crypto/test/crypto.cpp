@@ -55,11 +55,11 @@ static constexpr CurveID supported_curves[] = {
   CurveID::SECP384R1, CurveID::SECP256R1};
 
 static constexpr char const* labels[] = {"secp384r1", "secp256r1"};
-constexpr size_t certificate_validity_period_days = 365;
 
 crypto::Pem generate_self_signed_cert(
   const KeyPairPtr& kp, const std::string& name)
 {
+  constexpr size_t certificate_validity_period_days = 365;
   auto valid_from =
     crypto::OpenSSL::to_x509_time_string(std::chrono::system_clock::to_time_t(
       std::chrono::system_clock::now())); // now
