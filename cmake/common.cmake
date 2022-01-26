@@ -30,13 +30,6 @@ if(VERBOSE_LOGGING)
   set(TEST_HOST_LOGGING_LEVEL "debug")
 endif()
 
-option(NO_STRICT_TLS_CIPHERSUITES
-       "Disable strict list of valid TLS ciphersuites" OFF
-)
-if(NO_STRICT_TLS_CIPHERSUITES)
-  add_compile_definitions(NO_STRICT_TLS_CIPHERSUITES)
-endif()
-
 option(USE_NULL_ENCRYPTOR "Turn off encryption of ledger updates - debug only"
        OFF
 )
@@ -50,22 +43,26 @@ option(BUILD_END_TO_END_TESTS "Build end to end tests" ON)
 option(COVERAGE "Enable coverage mapping" OFF)
 option(SHUFFLE_SUITE "Shuffle end to end test suite" OFF)
 option(LONG_TESTS "Enable long end-to-end tests" OFF)
+option(KV_STATE_RB "Enable RBMap as underlying KV state implementation" OFF)
+if(KV_STATE_RB)
+  add_compile_definitions(KV_STATE_RB)
+endif()
+option(ENABLE_HTTP2 "Enable experimental support for HTTP2" OFF)
+if(ENABLE_HTTP2)
+  message(STATUS "Enabling experimental support for HTTP2")
+  add_compile_definitions(ENABLE_HTTP2)
+endif()
 
 option(ENABLE_BFT "Enable experimental BFT consensus at compile time" OFF)
 if(ENABLE_BFT)
   add_compile_definitions(ENABLE_BFT)
 endif()
 
-option(DEBUG_CONFIG "Enable non-production options options to aid debugging"
+option(ENABLE_2TX_RECONFIG "Enable experimental 2-transaction reconfiguration"
        OFF
 )
-if(DEBUG_CONFIG)
-  add_compile_definitions(DEBUG_CONFIG)
-endif()
-
-option(USE_NLJSON_KV_SERIALISER "Use nlohmann JSON as the KV serialiser" OFF)
-if(USE_NLJSON_KV_SERIALISER)
-  add_compile_definitions(USE_NLJSON_KV_SERIALISER)
+if(ENABLE_2TX_RECONFIG)
+  add_compile_definitions(ENABLE_2TX_RECONFIG)
 endif()
 
 enable_language(ASM)
@@ -79,11 +76,6 @@ set(CCF_3RD_PARTY_INTERNAL_DIR "${CCF_DIR}/3rdparty/internal")
 
 include_directories(SYSTEM ${CCF_3RD_PARTY_EXPORTED_DIR})
 include_directories(SYSTEM ${CCF_3RD_PARTY_INTERNAL_DIR})
-
-find_package(MbedTLS REQUIRED)
-
-set(CLIENT_MBEDTLS_INCLUDE_DIR "${MBEDTLS_INCLUDE_DIRS}")
-set(CLIENT_MBEDTLS_LIBRARIES "${MBEDTLS_LIBRARIES}")
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/tools.cmake)
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/cmake/tools.cmake DESTINATION cmake)
@@ -122,7 +114,7 @@ endforeach()
 
 # Copy utilities from tests directory
 set(CCF_TEST_UTILITIES tests.sh cimetrics_env.sh upload_pico_metrics.py
-                       test_install.sh test_python_cli.sh docker_wrap.sh
+                       test_install.sh docker_wrap.sh config.jinja
 )
 foreach(UTILITY ${CCF_TEST_UTILITIES})
   configure_file(
@@ -132,6 +124,7 @@ endforeach()
 
 # Install additional utilities
 install(PROGRAMS ${CCF_DIR}/tests/sgxinfo.sh DESTINATION bin)
+install(FILES ${CCF_DIR}/tests/config.jinja DESTINATION bin)
 
 # Install getting_started scripts for VM creation and setup
 install(
@@ -167,6 +160,7 @@ set(CCF_ENDPOINTS_SOURCES
 )
 
 find_library(CRYPTO_LIBRARY crypto)
+find_library(TLS_LIBRARY ssl)
 
 list(APPEND COMPILE_LIBCXX -stdlib=libc++)
 if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 9)
@@ -179,6 +173,9 @@ endif()
 include(${CCF_DIR}/cmake/crypto.cmake)
 include(${CCF_DIR}/cmake/quickjs.cmake)
 include(${CCF_DIR}/cmake/sss.cmake)
+if(ENABLE_HTTP2)
+  include(${CCF_DIR}/cmake/nghttp2.cmake)
+endif()
 
 # Unit test wrapper
 function(add_unit_test name)
@@ -226,6 +223,7 @@ if("sgx" IN_LIST COMPILE_TARGETS)
     cchost
     PRIVATE uv
             ${CRYPTO_LIBRARY}
+            ${TLS_LIBRARY}
             ${CMAKE_DL_LIBS}
             ${CMAKE_THREAD_LIBS_INIT}
             ${LINK_LIBCXX}
@@ -272,6 +270,7 @@ if("virtual" IN_LIST COMPILE_TARGETS)
     PRIVATE uv
             ${SNMALLOC_LIB}
             ${CRYPTO_LIBRARY}
+            ${TLS_LIBRARY}
             ${CMAKE_DL_LIBS}
             ${CMAKE_THREAD_LIBS_INIT}
             ${LINK_LIBCXX}
@@ -299,12 +298,14 @@ endif()
 install(TARGETS scenario_perf_client DESTINATION bin)
 
 # HTTP parser
-add_enclave_library_c(http_parser.enclave "${HTTP_PARSER_SOURCES}")
-install(
-  TARGETS http_parser.enclave
-  EXPORT ccf
-  DESTINATION lib
-)
+if("sgx" IN_LIST COMPILE_TARGETS)
+  add_enclave_library_c(http_parser.enclave "${HTTP_PARSER_SOURCES}")
+  install(
+    TARGETS http_parser.enclave
+    EXPORT ccf
+    DESTINATION lib
+  )
+endif()
 add_library(http_parser.host "${HTTP_PARSER_SOURCES}")
 set_property(TARGET http_parser.host PROPERTY POSITION_INDEPENDENT_CODE ON)
 install(
@@ -314,16 +315,16 @@ install(
 )
 
 # CCF endpoints libs
-add_enclave_library(ccf_endpoints.enclave "${CCF_ENDPOINTS_SOURCES}")
-use_oe_mbedtls(ccf_endpoints.enclave)
-add_warning_checks(ccf_endpoints.enclave)
-install(
-  TARGETS ccf_endpoints.enclave
-  EXPORT ccf
-  DESTINATION lib
-)
+if("sgx" IN_LIST COMPILE_TARGETS)
+  add_enclave_library(ccf_endpoints.enclave "${CCF_ENDPOINTS_SOURCES}")
+  add_warning_checks(ccf_endpoints.enclave)
+  install(
+    TARGETS ccf_endpoints.enclave
+    EXPORT ccf
+    DESTINATION lib
+  )
+endif()
 add_host_library(ccf_endpoints.host "${CCF_ENDPOINTS_SOURCES}")
-use_client_mbedtls(ccf_endpoints.host)
 add_san(ccf_endpoints.host)
 add_warning_checks(ccf_endpoints.host)
 install(
@@ -340,13 +341,13 @@ set(WORKER_THREADS
 
 set(CCF_NETWORK_TEST_DEFAULT_CONSTITUTION
     --constitution
-    ${CCF_DIR}/src/runtime_config/default/actions.js
+    ${CCF_DIR}/samples/constitutions/default/actions.js
     --constitution
-    ${CCF_DIR}/src/runtime_config/default/validate.js
+    ${CCF_DIR}/samples/constitutions/default/validate.js
     --constitution
-    ${CCF_DIR}/src/runtime_config/default/resolve.js
+    ${CCF_DIR}/samples/constitutions/default/resolve.js
     --constitution
-    ${CCF_DIR}/src/runtime_config/default/apply.js
+    ${CCF_DIR}/samples/constitutions/default/apply.js
 )
 set(CCF_NETWORK_TEST_ARGS -l ${TEST_HOST_LOGGING_LEVEL} --worker-threads
                           ${WORKER_THREADS}
@@ -354,7 +355,6 @@ set(CCF_NETWORK_TEST_ARGS -l ${TEST_HOST_LOGGING_LEVEL} --worker-threads
 
 if("sgx" IN_LIST COMPILE_TARGETS)
   add_enclave_library(js_openenclave.enclave ${CCF_DIR}/src/js/openenclave.cpp)
-  use_oe_mbedtls(js_openenclave.enclave)
   target_link_libraries(js_openenclave.enclave PUBLIC ccf.enclave)
   add_lvi_mitigations(js_openenclave.enclave)
   install(
@@ -375,7 +375,6 @@ if("virtual" IN_LIST COMPILE_TARGETS)
   set_property(
     TARGET js_openenclave.virtual PROPERTY POSITION_INDEPENDENT_CODE ON
   )
-  use_client_mbedtls(js_openenclave.virtual)
   install(
     TARGETS js_openenclave.virtual
     EXPORT ccf
@@ -387,7 +386,6 @@ if("sgx" IN_LIST COMPILE_TARGETS)
   add_enclave_library(
     js_generic_base.enclave ${CCF_DIR}/src/apps/js_generic/js_generic_base.cpp
   )
-  use_oe_mbedtls(js_generic_base.enclave)
   target_link_libraries(js_generic_base.enclave PUBLIC ccf.enclave)
   add_lvi_mitigations(js_generic_base.enclave)
   install(
@@ -412,7 +410,6 @@ if("virtual" IN_LIST COMPILE_TARGETS)
   set_property(
     TARGET js_generic_base.virtual PROPERTY POSITION_INDEPENDENT_CODE ON
   )
-  use_client_mbedtls(js_generic_base.virtual)
   install(
     TARGETS js_generic_base.virtual
     EXPORT ccf
@@ -432,6 +429,8 @@ sign_app_library(
   ${CMAKE_CURRENT_BINARY_DIR}/signing_key.pem INSTALL_LIBS ON
 )
 # SNIPPET_END: JS generic application
+
+include(${CCF_DIR}/cmake/js_v8.cmake)
 
 install(DIRECTORY ${CCF_DIR}/samples/apps/logging/js
         DESTINATION samples/logging
@@ -485,12 +484,13 @@ function(add_e2e_test)
       set(PYTHON_WRAPPER ${PYTHON})
     endif()
 
+    string(TOUPPER ${PARSED_ARGS_CONSENSUS} CONSENSUS)
     add_test(
       NAME ${PARSED_ARGS_NAME}
       COMMAND
         ${PYTHON_WRAPPER} ${PARSED_ARGS_PYTHON_SCRIPT} -b . --label
         ${PARSED_ARGS_NAME} ${CCF_NETWORK_TEST_ARGS} ${PARSED_ARGS_CONSTITUTION}
-        --consensus ${PARSED_ARGS_CONSENSUS} ${PARSED_ARGS_ADDITIONAL_ARGS}
+        --consensus ${CONSENSUS} ${PARSED_ARGS_ADDITIONAL_ARGS}
       CONFIGURATIONS ${PARSED_ARGS_CONFIGURATIONS}
     )
 
@@ -559,59 +559,6 @@ function(add_e2e_test)
   endif()
 endfunction()
 
-# Helper for building end-to-end function tests using the sandbox
-function(add_e2e_sandbox_test)
-  cmake_parse_arguments(
-    PARSE_ARGV 0 PARSED_ARGS "" "NAME;SCRIPT;LABEL;CONSENSUS;"
-    "ADDITIONAL_ARGS;CONFIGURATIONS"
-  )
-
-  if(BUILD_END_TO_END_TESTS)
-    add_test(NAME ${PARSED_ARGS_NAME} COMMAND ${PARSED_ARGS_SCRIPT})
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY LABELS e2e
-    )
-
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY LABELS e2e
-    )
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY LABELS ${PARSED_ARGS_LABEL}
-    )
-
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT "CONSENSUS=${PARSED_ARGS_CONSENSUS}"
-    )
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY LABELS ${PARSED_ARGS_CONSENSUS}
-    )
-
-    if(DEFINED DEFAULT_ENCLAVE_TYPE)
-      set_property(
-        TEST ${PARSED_ARGS_NAME}
-        APPEND
-        PROPERTY ENVIRONMENT "ENCLAVE_TYPE=${DEFAULT_ENCLAVE_TYPE}"
-      )
-    else()
-      set_property(
-        TEST ${PARSED_ARGS_NAME}
-        APPEND
-        PROPERTY ENVIRONMENT "ENCLAVE_TYPE=release"
-      )
-    endif()
-  endif()
-endfunction()
-
 # Helper for building end-to-end perf tests using the python infrastucture
 function(add_perf_test)
 
@@ -653,11 +600,12 @@ function(add_perf_test)
     set(LABEL_ARG "${TEST_NAME}^")
   endif()
 
+  string(TOUPPER ${PARSED_ARGS_CONSENSUS} CONSENSUS)
   add_test(
     NAME "${PARSED_ARGS_NAME}${TESTS_SUFFIX}"
     COMMAND
       ${PYTHON} ${PARSED_ARGS_PYTHON_SCRIPT} -b . -c ${PARSED_ARGS_CLIENT_BIN}
-      ${CCF_NETWORK_TEST_ARGS} --consensus ${PARSED_ARGS_CONSENSUS}
+      ${CCF_NETWORK_TEST_ARGS} --consensus ${CONSENSUS}
       ${PARSED_ARGS_CONSTITUTION} --write-tx-times ${VERIFICATION_ARG} --label
       ${LABEL_ARG} --snapshot-tx-interval 10000 ${PARSED_ARGS_ADDITIONAL_ARGS}
       ${NODES}

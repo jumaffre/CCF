@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 #include "backup_signatures.h"
-#include "certs.h"
+#include "cert_bundles.h"
 #include "client_signatures.h"
 #include "code_id.h"
 #include "config.h"
@@ -16,7 +16,6 @@
 #include "kv/store.h"
 #include "members.h"
 #include "modules.h"
-#include "network_configurations.h"
 #include "nodes.h"
 #include "proposals.h"
 #include "resharing.h"
@@ -29,6 +28,7 @@
 #include "snapshot_evidence.h"
 #include "submitted_shares.h"
 #include "users.h"
+#include "view_change.h"
 
 #include <memory>
 #include <tuple>
@@ -50,7 +50,7 @@ namespace ccf
     // Governance tables
     //
     MemberCerts member_certs;
-    MmeberPublicEncryptionKeys member_encryption_public_keys;
+    MemberPublicEncryptionKeys member_encryption_public_keys;
     MemberInfo member_info;
 
     Modules modules;
@@ -80,7 +80,6 @@ namespace ccf
     // Node table
     //
     Nodes nodes;
-    NetworkConfigurations network_configurations;
     NodeEndorsedCertificates node_endorsed_certificates;
 
     //
@@ -130,7 +129,6 @@ namespace ccf
       user_certs(Tables::USER_CERTS),
       user_info(Tables::USER_INFO),
       nodes(Tables::NODES),
-      network_configurations(Tables::NODES_CONFIGURATIONS),
       node_endorsed_certificates(Tables::NODE_ENDORSED_CERTIFICATES),
       service(Tables::SERVICE),
       secrets(Tables::ENCRYPTED_LEDGER_SECRETS),

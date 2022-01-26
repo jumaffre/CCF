@@ -6,15 +6,19 @@ from enum import Enum, auto
 import infra.crypto
 import infra.remote
 import infra.remote_shim
+from datetime import datetime, timedelta
 import infra.net
 import infra.path
-import ccf.clients
+import infra.interfaces
+import infra.clients
 import ccf.ledger
 import os
 import socket
 import re
 import ipaddress
 import ssl
+import copy
+import json
 
 # pylint: disable=import-error, no-name-in-module
 from setuptools.extern.packaging.version import Version  # type: ignore
@@ -87,7 +91,7 @@ class Node:
         library_dir=".",
         debug=False,
         perf=False,
-        node_port=None,
+        node_port=0,
         version=None,
     ):
         self.local_node_id = local_node_id
@@ -101,7 +105,9 @@ class Node:
         self.suspended = False
         self.node_id = None
         self.node_client_host = None
-        self.interfaces = []
+        # Note: Do not modify host argument as it may be passed to multiple
+        # nodes or networks
+        self.host = copy.deepcopy(host)
         self.version = version
         self.major_version = (
             Version(strip_version(self.version)).release[0]
@@ -109,48 +115,48 @@ class Node:
             else None
         )
         self.consensus = None
+        self.certificate_valid_from = None
+        self.certificate_validity_days = None
 
         if os.getenv("CONTAINER_NODES"):
             self.remote_shim = infra.remote_shim.DockerShim
         else:
             self.remote_shim = infra.remote_shim.PassThroughShim
 
-        if isinstance(host, str):
-            host = infra.e2e_args.HostSpec.from_str(host)
+        if isinstance(self.host, str):
+            self.host = infra.interfaces.HostSpec.from_str(self.host)
 
-        if host.protocol == "local":
-            self.remote_impl = infra.remote.LocalRemote
-            # Node client address does not currently work with DockerShim
-            if self.remote_shim != infra.remote_shim.DockerShim:
-                if not self.major_version or self.major_version > 1:
-                    self.node_client_host = str(
-                        ipaddress.ip_address(BASE_NODE_CLIENT_HOST) + self.local_node_id
-                    )
-        elif host.protocol == "ssh":
-            self.remote_impl = infra.remote.SSHRemote
-        else:
-            assert False, f"{host} does not start with 'local://' or 'ssh://'"
+        for interface_name, rpc_interface in self.host.rpc_interfaces.items():
+            # Main RPC interface determines remote implementation
+            if interface_name == infra.interfaces.PRIMARY_RPC_INTERFACE:
+                if rpc_interface.protocol == "local":
+                    self.remote_impl = infra.remote.LocalRemote
+                    # Node client address does not currently work with DockerShim
+                    if self.remote_shim != infra.remote_shim.DockerShim:
+                        if not self.major_version or self.major_version > 1:
+                            self.node_client_host = str(
+                                ipaddress.ip_address(BASE_NODE_CLIENT_HOST)
+                                + self.local_node_id
+                            )
+                elif rpc_interface.protocol == "ssh":
+                    self.remote_impl = infra.remote.SSHRemote
+                else:
+                    assert (
+                        False
+                    ), f"{rpc_interface.protocol} is not 'local://' or 'ssh://'"
 
-        host_ = host.rpchost
-        self.rpc_host, *port = host_.split(":")
-        self.rpc_port = int(port[0]) if port else None
-        if self.rpc_host == "localhost":
-            self.rpc_host = infra.net.expand_localhost()
+            if rpc_interface.host == "localhost":
+                rpc_interface.host = infra.net.expand_localhost()
 
-        pubhost_ = host.public_rpchost
-        if pubhost_:
-            self.pubhost, *pubport = pubhost_.split(":")
-            self.pubport = int(pubport[0]) if pubport else self.rpc_port
-        else:
-            self.pubhost = self.rpc_host
-            self.pubport = self.rpc_port
+            if rpc_interface.public_host is None:
+                rpc_interface.public_host = rpc_interface.host
+                rpc_interface.public_port = rpc_interface.port
 
-        self.node_host = self.rpc_host
-        self.node_port = node_port
-
-        self.max_open_sessions = host.max_open_sessions
-        self.max_open_sessions_hard = host.max_open_sessions_hard
-        self.additional_raw_node_args = host.additional_raw_node_args
+            # Default node address host to same host as main RPC interface
+            if interface_name == infra.interfaces.PRIMARY_RPC_INTERFACE:
+                self.n2n_interface = infra.interfaces.Interface(
+                    host=rpc_interface.host, port=node_port
+                )
 
     def __hash__(self):
         return self.local_node_id
@@ -169,7 +175,7 @@ class Node:
         **kwargs,
     ):
         self._start(
-            infra.remote.StartType.new,
+            infra.remote.StartType.start,
             lib_name,
             enclave_type,
             workspace,
@@ -187,8 +193,6 @@ class Node:
         workspace,
         label,
         common_dir,
-        target_rpc_address,
-        snapshot_dir,
         **kwargs,
     ):
         self._start(
@@ -198,8 +202,6 @@ class Node:
             workspace,
             label,
             common_dir,
-            target_rpc_address=target_rpc_address,
-            snapshot_dir=snapshot_dir,
             **kwargs,
         )
 
@@ -226,8 +228,6 @@ class Node:
         workspace,
         label,
         common_dir,
-        target_rpc_address=None,
-        snapshot_dir=None,
         members_info=None,
         **kwargs,
     ):
@@ -241,11 +241,8 @@ class Node:
         lib_path = infra.path.build_lib_path(
             lib_name, enclave_type, library_dir=self.library_dir
         )
-        if self.max_open_sessions:
-            kwargs["max_open_sessions"] = self.max_open_sessions
-        if self.max_open_sessions_hard:
-            kwargs["max_open_sessions_hard"] = self.max_open_sessions_hard
         self.common_dir = common_dir
+        members_info = members_info or []
 
         self.remote = self.remote_shim(
             start_type,
@@ -254,20 +251,18 @@ class Node:
             self.remote_impl,
             workspace,
             common_dir,
+            binary_dir=self.binary_dir,
             label=label,
             local_node_id=self.local_node_id,
-            rpc_host=self.rpc_host,
-            node_host=self.node_host,
-            pub_host=self.pubhost,
-            node_port=self.node_port,
-            rpc_port=self.rpc_port,
-            node_client_host=self.node_client_host,
-            target_rpc_address=target_rpc_address,
+            host=self.host,
+            node_address=infra.interfaces.make_address(
+                self.n2n_interface.host, self.n2n_interface.port
+            ),
+            node_address_port=self.n2n_interface.port,
+            node_client_interface=self.node_client_host,
             members_info=members_info,
-            snapshot_dir=snapshot_dir,
-            binary_dir=self.binary_dir,
-            additional_raw_node_args=self.additional_raw_node_args,
             version=self.version,
+            major_version=self.major_version,
             **kwargs,
         )
         self.remote.setup()
@@ -276,13 +271,13 @@ class Node:
             with open("/tmp/vscode-gdb.sh", "a", encoding="utf-8") as f:
                 f.write(f"if [ $1 -eq {self.remote.local_node_id} ]; then\n")
                 f.write(f"cd {self.remote.remote.root}\n")
-                f.write(f"{' '.join(self.remote.remote.cmd)}\n")
+                f.write(f"exec {' '.join(self.remote.remote.cmd)}\n")
                 f.write("fi\n")
 
             print("")
             print(
                 "================= Please run the below command on "
-                + self.rpc_host
+                + self.get_public_rpc_host()
                 + " and press enter to continue ================="
             )
             print("")
@@ -304,50 +299,93 @@ class Node:
         self.consensus = kwargs.get("consensus")
 
         with open(
-            os.path.join(self.common_dir, f"{self.local_node_id}.pem"), encoding="utf-8"
+            os.path.join(self.common_dir, self.remote.pem), encoding="utf-8"
         ) as f:
             self.node_id = infra.crypto.compute_public_key_der_hash_hex_from_pem(
                 f.read()
             )
 
         self._read_ports()
+        self.certificate_validity_days = kwargs.get("initial_node_cert_validity_days")
         LOG.info(f"Node {self.local_node_id} started: {self.node_id}")
 
-    def _read_ports(self):
-        node_address_path = os.path.join(self.common_dir, self.remote.node_address_path)
-        with open(node_address_path, "r", encoding="utf-8") as f:
-            node_host, node_port = f.read().splitlines()
-            node_port = int(node_port)
+    def _resolve_address(self, address_file_path, interfaces):
+        with open(address_file_path, "r", encoding="utf-8") as f:
+            addresses = json.load(f)
+
+        for interface_name, resolved_address in addresses.items():
+            host, port = infra.interfaces.split_address(resolved_address)
+            interface = interfaces[interface_name]
             if self.remote_shim != infra.remote_shim.DockerShim:
                 assert (
-                    node_host == self.node_host
-                ), f"Unexpected change in node address from {self.node_host} to {node_host}"
-            if self.node_port is None and self.node_port != 0:
-                self.node_port = node_port
+                    host == interface.host
+                ), f"Unexpected change in address from {interface.host} to {host} in {address_file_path}"
+            if interface.port != 0:
                 assert (
-                    node_port == self.node_port
-                ), f"Unexpected change in node port from {self.node_port} to {node_port}"
-            self.node_port = node_port
+                    port == interface.port
+                ), f"Unexpected change in node port from {interface.port} to {port} in {address_file_path}"
+            interface.port = port
 
-        rpc_address_path = os.path.join(self.common_dir, self.remote.rpc_address_path)
-        with open(rpc_address_path, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-            it = [iter(lines)] * 2
-            for i, (rpc_host, rpc_port) in enumerate(zip(*it)):
-                rpc_port = int(rpc_port)
-                if i == 0:
+    def _read_ports(self):
+        if self.major_version is None or self.major_version > 1:
+            if self.remote.node_address_file is not None:
+                node_address_file = os.path.join(
+                    self.common_dir, self.remote.node_address_file
+                )
+                self._resolve_address(
+                    node_address_file,
+                    {infra.interfaces.NODE_TO_NODE_INTERFACE_NAME: self.n2n_interface},
+                )
+
+            if self.remote.rpc_addresses_file is not None:
+                rpc_address_file = os.path.join(
+                    self.common_dir, self.remote.rpc_addresses_file
+                )
+                self._resolve_address(rpc_address_file, self.host.rpc_interfaces)
+                #  In the infra, public RPC port is always the same as local RPC port
+                for _, interface in self.host.rpc_interfaces.items():
+                    interface.public_port = interface.port
+        else:
+            # Legacy 1.x nodes
+            if self.remote.node_address_file is not None:
+                node_address_file = os.path.join(
+                    self.common_dir, self.remote.node_address_file
+                )
+                with open(node_address_file, "r", encoding="utf-8") as f:
+                    node_host, node_port = f.read().splitlines()
+                    node_port = int(node_port)
                     if self.remote_shim != infra.remote_shim.DockerShim:
                         assert (
-                            rpc_host == self.rpc_host
-                        ), f"Unexpected change in RPC address from {self.rpc_host} to {rpc_host}"
-                    if self.rpc_port is not None and self.rpc_port != 0:
+                            node_host == self.n2n_interface.host
+                        ), f"Unexpected change in node address from {self.n2n_interface.host} to {node_host}"
+                    if self.n2n_interface.port != 0:
                         assert (
-                            rpc_port == self.rpc_port
-                        ), f"Unexpected change in RPC port from {self.rpc_port} to {rpc_port}"
-                    self.rpc_port = rpc_port
-                    if self.pubport is None:
-                        self.pubport = self.rpc_port
-                self.interfaces.append((rpc_host, rpc_port))
+                            node_port == self.n2n_interface.port
+                        ), f"Unexpected change in node port from {self.n2n_interface.port} to {node_port}"
+                    self.n2n_interface.port = node_port
+
+            if self.remote.rpc_addresses_file is not None:
+                rpc_address_file = os.path.join(
+                    self.common_dir, self.remote.rpc_addresses_file
+                )
+                with open(rpc_address_file, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                    it = [iter(lines)] * 2
+                for (rpc_host, rpc_port), (_, rpc_interface) in zip(
+                    zip(*it), self.host.rpc_interfaces.items()
+                ):
+                    rpc_port = int(rpc_port)
+                    if self.remote_shim != infra.remote_shim.DockerShim:
+                        assert (
+                            rpc_host == rpc_interface.host
+                        ), f"Unexpected change in RPC address from {rpc_interface.host} to {rpc_host}"
+                    if rpc_interface.port != 0:
+                        assert (
+                            rpc_port == rpc_interface.port
+                        ), f"Unexpected change in RPC port from {rpc_interface.port} to {rpc_port}"
+                    rpc_interface.port = int(rpc_port)
+                    # In the infra, public RPC port is always the same as local RPC port
+                    rpc_interface.public_port = rpc_interface.port
 
     def stop(self):
         if self.remote and self.network_state is not NodeNetworkState.stopped:
@@ -370,7 +408,7 @@ class Node:
         joined a network and that it is part of the consensus.
         """
         # Until the node has joined, the SSL handshake will fail as the node
-        # is not yet endorsed by the network certificate
+        # is not yet endorsed by the service certificate
 
         try:
             with self.client(connection_timeout=timeout) as nc:
@@ -379,7 +417,7 @@ class Node:
                     rep.status_code == 200
                 ), f"An error occured after node {self.local_node_id} joined the network: {rep.body}"
                 self.network_state = infra.node.NodeNetworkState.joined
-        except ccf.clients.CCFConnectionException as e:
+        except infra.clients.CCFConnectionException as e:
             raise TimeoutError(
                 f"Node {self.local_node_id} failed to join the network"
             ) from e
@@ -395,12 +433,12 @@ class Node:
         assert ledger.last_committed_chunk_range[1] >= seqno
         return ledger.get_latest_public_state()
 
-    def get_ledger(self, include_read_only_dirs=False):
+    def get_ledger(self):
         """
         Triage committed and un-committed (i.e. current) ledger files
         """
         main_ledger_dir, read_only_ledger_dirs = self.remote.get_ledger(
-            f"{self.local_node_id}.ledger", include_read_only_dirs
+            f"{self.local_node_id}.ledger"
         )
 
         current_ledger_dir = os.path.join(
@@ -424,7 +462,7 @@ class Node:
                 if is_file_committed(f):
                     infra.path.copy_dir(os.path.join(ro_dir, f), committed_ledger_dir)
 
-        return current_ledger_dir, committed_ledger_dir
+        return current_ledger_dir, [committed_ledger_dir]
 
     def get_snapshots(self):
         return self.remote.get_snapshots()
@@ -434,17 +472,14 @@ class Node:
 
     def identity(self, name=None):
         if name is not None:
-            return ccf.clients.Identity(
+            return infra.clients.Identity(
                 os.path.join(self.common_dir, f"{name}_privk.pem"),
                 os.path.join(self.common_dir, f"{name}_cert.pem"),
                 name,
             )
 
     def session_auth(self, name=None):
-        return {
-            "session_auth": self.identity(name),
-            "ca": os.path.join(self.common_dir, "networkcert.pem"),
-        }
+        return {"session_auth": self.identity(name)}
 
     def signing_auth(self, name=None):
         return {"signing_auth": self.identity(name)}
@@ -452,14 +487,30 @@ class Node:
     def get_public_rpc_host(self):
         return self.remote.get_host()
 
+    def get_public_rpc_port(self):
+        return self.host.get_primary_interface().port
+
+    def session_ca(self, self_signed_ok):
+        if self_signed_ok:
+            return {"ca": ""}
+        else:
+            return {"ca": os.path.join(self.common_dir, "service_cert.pem")}
+
     def client(
-        self, identity=None, signing_identity=None, interface_idx=None, **kwargs
+        self,
+        identity=None,
+        signing_identity=None,
+        interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE,
+        self_signed_ok=False,
+        **kwargs,
     ):
         if self.network_state == NodeNetworkState.stopped:
             raise RuntimeError(
                 f"Cannot create client for node {self.local_node_id} as node is stopped"
             )
-        akwargs = self.session_auth(identity)
+
+        akwargs = self.session_ca(self_signed_ok)
+        akwargs.update(self.session_auth(identity))
         akwargs.update(self.signing_auth(signing_identity))
         akwargs[
             "description"
@@ -469,26 +520,21 @@ class Node:
         if self.curl:
             akwargs["curl"] = True
 
-        if interface_idx is None:
-            return ccf.clients.client(
-                self.get_public_rpc_host(), self.pubport, **akwargs
+        try:
+            rpc_interface = self.host.rpc_interfaces[interface_name]
+        except KeyError:
+            LOG.error(
+                f'Cannot create client on interface "{interface_name}" - available interfaces: {self.host.rpc_interfaces.keys()}'
             )
-        else:
-            try:
-                host, port = self.interfaces[interface_idx]
-            except IndexError:
-                LOG.error(
-                    f"Cannot create client on interface {interface_idx} - this node only has {len(self.interfaces)} interfaces"
-                )
-                raise
-            return ccf.clients.client(host, port, **akwargs)
+            raise
 
-    def get_tls_certificate_pem(self, use_public_rpc_host=True):
+        return infra.clients.client(
+            rpc_interface.public_host, rpc_interface.public_port, **akwargs
+        )
+
+    def get_tls_certificate_pem(self):
         return ssl.get_server_certificate(
-            (
-                self.get_public_rpc_host() if use_public_rpc_host else self.rpc_host,
-                self.rpc_port,
-            )
+            (self.get_public_rpc_host(), self.get_public_rpc_port())
         )
 
     def suspend(self):
@@ -502,6 +548,56 @@ class Node:
         self.suspended = False
         self.remote.resume()
         LOG.info(f"Node {self.local_node_id} has resumed from suspension.")
+
+    def set_certificate_validity_period(self, valid_from, validity_period_days):
+        self.certificate_valid_from = valid_from
+        self.certificate_validity_days = validity_period_days
+
+    def verify_certificate_validity_period(
+        self, expected_validity_period_days=None, ignore_proposal_valid_from=False
+    ):
+        node_tls_cert = self.get_tls_certificate_pem()
+        assert (
+            infra.crypto.compute_public_key_der_hash_hex_from_pem(node_tls_cert)
+            == self.node_id
+        )
+
+        valid_from, valid_to = infra.crypto.get_validity_period_from_pem_cert(
+            node_tls_cert
+        )
+
+        if ignore_proposal_valid_from or self.certificate_valid_from is None:
+            # If the node certificate has not been renewed, assume that certificate has
+            # been issued within this test run
+            expected_valid_from = datetime.utcnow() - timedelta(hours=1)
+            if valid_from < expected_valid_from:
+                raise ValueError(
+                    f'Node {self.local_node_id} certificate is too old: valid from "{valid_from}" older than expected "{expected_valid_from}"'
+                )
+        else:
+            if (
+                infra.crypto.datetime_to_X509time(valid_from)
+                != self.certificate_valid_from
+            ):
+                raise ValueError(
+                    f'Validity period for node {self.local_node_id} certificate is not as expected: valid from "{infra.crypto.datetime_to_X509time(valid_from)}", but expected "{self.certificate_valid_from}"'
+                )
+
+        # Note: CCF substracts one second from validity period since x509 specifies
+        # that validity dates are inclusive.
+        expected_valid_to = valid_from + timedelta(
+            days=expected_validity_period_days or self.certificate_validity_days,
+            seconds=-1,
+        )
+        if valid_to != expected_valid_to:
+            raise ValueError(
+                f'Validity period for node {self.local_node_id} certiticate is not as expected: valid to "{valid_to}" but expected "{expected_valid_to}"'
+            )
+
+        validity_period = valid_to - valid_from + timedelta(seconds=1)
+        LOG.info(
+            f"Certificate validity period for node {self.local_node_id} successfully verified: {valid_from} - {valid_to} (for {validity_period})"
+        )
 
 
 @contextmanager

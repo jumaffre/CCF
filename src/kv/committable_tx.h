@@ -6,6 +6,7 @@
 #include "ccf/tx.h"
 #include "kv_serialiser.h"
 #include "kv_types.h"
+#include "node/rpc/claims.h"
 
 #include <list>
 
@@ -19,30 +20,11 @@ namespace kv
 
     Version version = NoVersion;
 
-    // The transaction engine supports producing a transaction's dependencies.
-    // This is materialized by providing a sequence number after which the
-    // current transaction must be run and required that transaction execution
-    // is started in the total order.  The current use case for dependency
-    // tracking is to enable parallel execution of transactions on the backup,
-    // and as such dependencies are tracked when running with the BFT consensus
-    // protocol. The backup will also calculate the dependencies to ensure there
-    // is no linearizability violation created by a malicious primary sending an
-    // incorrect transaction dependency order.
-    //
-    // Dependency tracking follows the following pseudocode
-    //
-    // OnTxCommit:
-    //   MaxSeenReadVersion = NoVersion
-    //   foreach Accessed Key-Value pair:
-    //     MaxSeenReadVersion = max(MaxSeenReadVersion, pair.last_read_version)
-    //     pair.last_read_version = pair.seqno
-    //
-    //   TxSerialize(pairs, MaxSeenReadVersion)
-    Version max_conflict_version = NoVersion;
-
     kv::TxHistory::RequestID req_id;
 
-    std::vector<uint8_t> serialise(bool include_reads = false)
+    std::vector<uint8_t> serialise(
+      const ccf::ClaimsDigest& claims_digest = ccf::no_claims(),
+      bool include_reads = false)
     {
       if (!committed)
         throw std::logic_error("Transaction not yet committed");
@@ -61,14 +43,15 @@ namespace kv
         return {};
       }
 
-      if (max_conflict_version == NoVersion)
-      {
-        max_conflict_version = version - 1;
-      }
-
       auto e = store->get_encryptor();
+      auto entry_type = claims_digest.empty() ? EntryType::WriteSet :
+                                                EntryType::WriteSetWithClaims;
+      LOG_TRACE_FMT(
+        "Serialising claim digest {} {}",
+        claims_digest.value(),
+        claims_digest.empty());
       KvStoreSerialiser replicated_serialiser(
-        e, {commit_view, version}, max_conflict_version);
+        e, {commit_view, version}, entry_type, claims_digest);
 
       // Process in security domain order
       for (auto domain : {SecurityDomain::PUBLIC, SecurityDomain::PRIVATE})
@@ -107,10 +90,12 @@ namespace kv
      * @return transaction outcome
      */
     CommitResult commit(
+      const ccf::ClaimsDigest& claims = ccf::no_claims(),
       bool track_read_versions = false,
       std::function<std::tuple<Version, Version>(bool has_new_map)>
         version_resolver = nullptr,
-      kv::Version replicated_max_conflict_version = kv::NoVersion)
+      std::function<void(const std::vector<uint8_t>& write_set)>
+        write_set_observer = nullptr)
     {
       if (committed)
         throw std::logic_error("Transaction already committed");
@@ -156,39 +141,7 @@ namespace kv
       else
       {
         committed = true;
-        std::tie(version, max_conflict_version) = c.value();
-
-        if (track_read_versions)
-        {
-          // This is executed on the backup and deals with the case
-          // that for any set of transactions there may be several valid
-          // serializations that do not violate the linearizability guarantees
-          // of the total order. This check validates that this tx does not read
-          // a key at a higher version than its version (i.e. does not break
-          // linearizability). After ensuring linearizability is maintained
-          // max_conflict_version is set to the same value as the one specified
-          // so that when it is inserted into the Merkle tree the same root will
-          // exist on the primary and backup.
-          if (
-            version > max_conflict_version &&
-            version > replicated_max_conflict_version &&
-            replicated_max_conflict_version != kv::NoVersion)
-          {
-            max_conflict_version = replicated_max_conflict_version;
-          }
-
-          // Check if a linearizability violation occurred
-          if (max_conflict_version > version && version != 0)
-          {
-            LOG_INFO_FMT(
-              "Detected linearizability violation - version:{}, "
-              "max_conflict_version:{}, replicated_max_conflict_version:{}",
-              version,
-              max_conflict_version,
-              replicated_max_conflict_version);
-            return CommitResult::FAIL_CONFLICT;
-          }
-        }
+        version = c.value();
 
         if (version == NoVersion)
         {
@@ -201,16 +154,24 @@ namespace kv
         // recover.
         try
         {
-          auto data = serialise();
+          auto data = serialise(claims);
 
           if (data.empty())
           {
             return CommitResult::SUCCESS;
           }
 
+          if (write_set_observer != nullptr)
+          {
+            write_set_observer(data);
+          }
+
+          auto claims_ = claims;
+
           return store->commit(
             {commit_view, version},
-            std::make_unique<MovePendingTx>(std::move(data), std::move(hooks)),
+            std::make_unique<MovePendingTx>(
+              std::move(data), std::move(claims_), std::move(hooks)),
             false);
         }
         catch (const std::exception& e)
@@ -270,11 +231,6 @@ namespace kv
     Version get_version()
     {
       return version;
-    }
-
-    Version get_max_conflict_version()
-    {
-      return max_conflict_version;
     }
 
     std::optional<TxID> get_txid()
@@ -384,7 +340,8 @@ namespace kv
         throw std::logic_error("Failed to commit reserved transaction");
 
       committed = true;
-      return {CommitResult::SUCCESS, serialise(), std::move(hooks)};
+      return {
+        CommitResult::SUCCESS, serialise(), ccf::no_claims(), std::move(hooks)};
     }
   };
 }

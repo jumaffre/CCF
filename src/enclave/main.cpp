@@ -16,11 +16,11 @@
 static std::mutex create_lock;
 static std::atomic<enclave::Enclave*> e;
 
-#ifdef DEBUG_CONFIG
-static uint8_t* reserved_memory;
-#endif
+#ifdef INSIDE_ENCLAVE
 std::atomic<std::chrono::microseconds> logger::config::us =
   std::chrono::microseconds::zero();
+#endif
+
 std::atomic<uint16_t> num_pending_threads = 0;
 std::atomic<uint16_t> num_complete_threads = 0;
 
@@ -39,9 +39,9 @@ extern "C"
     uint8_t* node_cert,
     size_t node_cert_size,
     size_t* node_cert_len,
-    uint8_t* network_cert,
-    size_t network_cert_size,
-    size_t* network_cert_len,
+    uint8_t* service_cert,
+    size_t service_cert_size,
+    size_t* service_cert_len,
     uint8_t* enclave_version,
     size_t enclave_version_size,
     size_t* enclave_version_len,
@@ -56,66 +56,96 @@ extern "C"
       return CreateNodeStatus::NodeAlreadyCreated;
     }
 
-    // Report enclave version to host
-    auto ccf_version_string = std::string(ccf::ccf_version);
-    if (ccf_version_string.size() > enclave_version_size)
-    {
-      return CreateNodeStatus::InternalError;
-    }
-
-    ::memcpy(
-      enclave_version, ccf_version_string.data(), ccf_version_string.size());
-    *enclave_version_len = ccf_version_string.size();
-
-    num_pending_threads = (uint16_t)num_worker_threads + 1;
-
-    if (
-      num_pending_threads >
-      threading::ThreadMessaging::thread_messaging.max_num_threads)
-    {
-      return CreateNodeStatus::TooManyThreads;
-    }
-
-    // Check that where we expect arguments to be in host-memory, they really
-    // are. lfence after these checks to prevent speculative execution
-    if (!oe_is_outside_enclave(time_location, sizeof(enclave::host_time)))
-    {
-      return CreateNodeStatus::MemoryNotOutsideEnclave;
-    }
-
-    enclave::host_time =
-      static_cast<decltype(enclave::host_time)>(time_location);
-
-    if (!oe_is_outside_enclave(enclave_config, sizeof(EnclaveConfig)))
-    {
-      return CreateNodeStatus::MemoryNotOutsideEnclave;
-    }
-
     EnclaveConfig ec = *static_cast<EnclaveConfig*>(enclave_config);
 
+    // Setup logger to allow enclave logs to reach the host before node is
+    // actually created
+    auto circuit = std::make_unique<ringbuffer::Circuit>(
+      ringbuffer::BufferDef{
+        ec.to_enclave_buffer_start,
+        ec.to_enclave_buffer_size,
+        ec.to_enclave_buffer_offsets},
+      ringbuffer::BufferDef{
+        ec.from_enclave_buffer_start,
+        ec.from_enclave_buffer_size,
+        ec.from_enclave_buffer_offsets});
+    auto basic_writer_factory =
+      std::make_unique<ringbuffer::WriterFactory>(*circuit);
+    auto writer_factory = std::make_unique<oversized::WriterFactory>(
+      *basic_writer_factory, ec.writer_config);
+
+    logger::config::msg() = AdminMessage::log_msg;
+    logger::config::writer() = writer_factory->create_writer_to_outside();
+
     {
+      // Report enclave version to host
+      auto ccf_version_string = std::string(ccf::ccf_version);
+      if (ccf_version_string.size() > enclave_version_size)
+      {
+        LOG_FAIL_FMT(
+          "Version mismatch: host {}, enclave {}",
+          ccf_version_string,
+          enclave_version);
+        return CreateNodeStatus::VersionMismatch;
+      }
+
+      ::memcpy(
+        enclave_version, ccf_version_string.data(), ccf_version_string.size());
+      *enclave_version_len = ccf_version_string.size();
+
+      num_pending_threads = (uint16_t)num_worker_threads + 1;
+
+      if (
+        num_pending_threads >
+        threading::ThreadMessaging::thread_messaging.max_num_threads)
+      {
+        LOG_FAIL_FMT("Too many threads: {}", num_pending_threads);
+        return CreateNodeStatus::TooManyThreads;
+      }
+
+      // Check that where we expect arguments to be in host-memory, they really
+      // are. lfence after these checks to prevent speculative execution
+      if (!oe_is_outside_enclave(time_location, sizeof(enclave::host_time)))
+      {
+        LOG_FAIL_FMT("Memory outside enclave: time_location");
+        return CreateNodeStatus::MemoryNotOutsideEnclave;
+      }
+
+      enclave::host_time =
+        static_cast<decltype(enclave::host_time)>(time_location);
+
+      if (!oe_is_outside_enclave(enclave_config, sizeof(EnclaveConfig)))
+      {
+        LOG_FAIL_FMT("Memory outside enclave: enclave_config");
+        return CreateNodeStatus::MemoryNotOutsideEnclave;
+      }
+
       // Check that ringbuffer memory ranges are entirely outside of the enclave
       if (!oe_is_outside_enclave(
             ec.to_enclave_buffer_start, ec.to_enclave_buffer_size))
       {
+        LOG_FAIL_FMT("Memory outside enclave: to_enclave buffer start");
         return CreateNodeStatus::MemoryNotOutsideEnclave;
       }
 
       if (!oe_is_outside_enclave(
             ec.from_enclave_buffer_start, ec.from_enclave_buffer_size))
       {
+        LOG_FAIL_FMT("Memory outside enclave: from_enclave buffer start");
         return CreateNodeStatus::MemoryNotOutsideEnclave;
       }
 
       if (!oe_is_outside_enclave(
             ec.to_enclave_buffer_offsets, sizeof(ringbuffer::Offsets)))
       {
+        LOG_FAIL_FMT("Memory outside enclave: to_enclave buffer offset");
         return CreateNodeStatus::MemoryNotOutsideEnclave;
       }
 
       if (!oe_is_outside_enclave(
             ec.from_enclave_buffer_offsets, sizeof(ringbuffer::Offsets)))
       {
+        LOG_FAIL_FMT("Memory outside enclave: from_enclave buffer offset");
         return CreateNodeStatus::MemoryNotOutsideEnclave;
       }
 
@@ -124,32 +154,52 @@ extern "C"
 
     if (!oe_is_outside_enclave(ccf_config, ccf_config_size))
     {
+      LOG_FAIL_FMT("Memory outside enclave: ccf_config");
       return CreateNodeStatus::MemoryNotOutsideEnclave;
     }
 
     oe_lfence();
 
-    CCFConfig cc =
+    StartupConfig cc =
       nlohmann::json::parse(ccf_config, ccf_config + ccf_config_size);
 
 #ifndef ENABLE_BFT
     // As BFT consensus is currently experimental, disable it in release
     // enclaves
-    if (cc.consensus_config.consensus_type != ConsensusType::CFT)
+    if (cc.consensus.type != ConsensusType::CFT)
     {
+      LOG_FAIL_FMT("BFT consensus disabled in release mode");
       return CreateNodeStatus::ConsensusNotAllowed;
     }
 #endif
 
-#ifdef DEBUG_CONFIG
-    reserved_memory = new uint8_t[ec->debug_config.memory_reserve_startup];
+#ifndef ENABLE_2TX_RECONFIG
+    // 2-tx reconfiguration is currently experimental, disable it in release
+    // enclaves
+    if (
+      cc.start.service_configuration.reconfiguration_type.has_value() &&
+      cc.start.service_configuration.reconfiguration_type.value() !=
+        ReconfigurationType::ONE_TRANSACTION)
+    {
+      LOG_FAIL_FMT(
+        "2TX reconfiguration is experimental, disabled in release mode");
+      return CreateNodeStatus::ReconfigurationMethodNotSupported;
+    }
 #endif
+
     enclave::Enclave* enclave;
 
     try
     {
       enclave = new enclave::Enclave(
-        ec, cc.signature_intervals, cc.consensus_config, cc.curve_id);
+        ec,
+        std::move(circuit),
+        std::move(basic_writer_factory),
+        std::move(writer_factory),
+        cc.ledger_signatures.tx_count,
+        cc.ledger_signatures.delay.count_ms(),
+        cc.consensus,
+        cc.node_certificate.curve_id);
     }
     catch (const ccf::ccf_oe_attester_init_error&)
     {
@@ -168,17 +218,19 @@ extern "C"
       return CreateNodeStatus::EnclaveInitFailed;
     }
 
-    if (!enclave->create_new_node(
-          start_type,
-          std::move(cc),
-          node_cert,
-          node_cert_size,
-          node_cert_len,
-          network_cert,
-          network_cert_size,
-          network_cert_len))
+    auto status = enclave->create_new_node(
+      start_type,
+      std::move(cc),
+      node_cert,
+      node_cert_size,
+      node_cert_len,
+      service_cert,
+      service_cert_size,
+      service_cert_len);
+
+    if (status != CreateNodeStatus::OK)
     {
-      return CreateNodeStatus::InternalError;
+      return status;
     }
 
     e.store(enclave);

@@ -2,11 +2,13 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/claims_digest.h"
 #include "ccf/tx_id.h"
 #include "http/http_builder.h"
 #include "http/http_consts.h"
 #include "node/client_signatures.h"
 #include "node/entities.h"
+#include "node/node_info_network.h"
 #include "node/rpc/error.h"
 
 #include <llhttp/llhttp.h>
@@ -99,6 +101,7 @@ namespace ccf
 namespace enclave
 {
   static constexpr size_t InvalidSessionId = std::numeric_limits<size_t>::max();
+  using ListenInterfaceID = ccf::NodeInfoNetwork::RpcInterfaceID;
 
   struct SessionContext
   {
@@ -107,19 +110,25 @@ namespace enclave
     std::vector<uint8_t> caller_cert = {};
     bool is_forwarding = false;
 
+    // Only set for RPC sessions (i.e. non-forwarded and non-internal)
+    std::optional<ListenInterfaceID> interface_id = std::nullopt;
+
     //
     // Only set in the case of a forwarded RPC
     //
     bool is_forwarded = false;
 
     SessionContext(
-      size_t client_session_id_, const std::vector<uint8_t>& caller_cert_) :
+      size_t client_session_id_,
+      const std::vector<uint8_t>& caller_cert_,
+      const std::optional<ListenInterfaceID>& interface_id_ = std::nullopt) :
       client_session_id(client_session_id_),
-      caller_cert(caller_cert_)
+      caller_cert(caller_cert_),
+      interface_id(interface_id_)
     {}
   };
 
-  using PathParams = std::map<std::string, std::string>;
+  using PathParams = std::map<std::string, std::string, std::less<>>;
 
   class RpcContext
   {
@@ -133,6 +142,8 @@ namespace enclave
 
     bool is_create_request = false;
     bool execute_on_node = false;
+
+    ccf::ClaimsDigest claims;
 
     RpcContext(std::shared_ptr<SessionContext> s) : session(s) {}
 
@@ -203,5 +214,10 @@ namespace enclave
     virtual void reset_response() = 0;
 
     virtual std::vector<uint8_t> serialise_response() const = 0;
+
+    virtual void set_claims_digest(ccf::ClaimsDigest::Digest&& digest)
+    {
+      claims.set(std::move(digest));
+    }
   };
 }

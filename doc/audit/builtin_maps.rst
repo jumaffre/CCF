@@ -115,19 +115,6 @@ Identity, status and attestations (endorsed quotes) of the nodes hosting the net
 
 **Value** Node service-endorsed certificate, represented as a PEM-encoded string.
 
-``nodes.network.configurations``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-The currently valid and in-flight network configurations of the network. The entry at 0 contains a dummy configuration that holds the largest ID used so far.
-
-**Key** Reconfiguration ID: a unique identifier of a configuration, represented as a little-endian 64-bit unsigned integer.
-
-**Value** A set of node IDs of the nodes in the respective configuration, represented as a JSON array.
-
-.. doxygenstruct:: kv::NetworkConfiguration
-   :project: CCF
-   :members:
-
 ``nodes.code_ids``
 ~~~~~~~~~~~~~~~~~~
 
@@ -344,7 +331,7 @@ While the contents themselves are encrypted, the table is public so as to be acc
 ``encrypted_ledger_secrets``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Used to broadcast ledger secrets between nodes during a recovery.
+Used to broadcast ledger secrets between nodes during a recovery and ledger rekey.
 
 While the contents themselves are encrypted, the table is public so as to be accessible by a node bootstrapping a recovery service.
 

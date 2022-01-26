@@ -11,6 +11,7 @@ import versionifier
 
 PACKAGE_NAME = "ccf"
 UTILITIES_PATH = "utils"
+TEMPLATES_PATH = path.join(PACKAGE_NAME, "templates")
 
 path_here = path.abspath(path.dirname(__file__))
 
@@ -38,10 +39,10 @@ setup(
     python_requires=">=3.8",
     install_requires=requirements,
     scripts=[
-        path.join(PACKAGE_NAME, "proposal_generator.py"),
         path.join(PACKAGE_NAME, "read_ledger.py"),
         path.join(PACKAGE_NAME, "ledger_viz.py"),
         path.join(PACKAGE_NAME, "split_ledger.py"),
+        path.join(PACKAGE_NAME, "migrate_1_x_config.py"),
         path.join(UTILITIES_PATH, "keygenerator.sh"),
         path.join(UTILITIES_PATH, "scurl.sh"),
         path.join(UTILITIES_PATH, "submit_recovery_share.sh"),

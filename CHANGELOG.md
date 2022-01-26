@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- Service certificate validity period is no longer hardcoded and can instead be set by operators and renewed by members (#3363):
+  - The new `service_certificate_initial_validity_days` (defaults to 1 day) configuration entry lets operators set the initial validity period for the service certificate (valid from the current system time).
+  - The new `maximum_service_certificate_validity_days` (defaults to 365 days) configuration entry sets the maximum validity period allowed for service certificate.
+  - The new `set_service_certificate_validity` proposal action allows members to renew the service certificate.
+- Service certificate output by first node default name is now `service_cert.pem` rather than `networkcert.pem` (#3363).
+- Retired nodes are now removed from the store/ledger as soon as their retirement is committed (#3409).
+
+### Removed
+
+- The `ccf` Python package no longer provides utilities to issue requests to a running CCF service. This is because CCF supports widely-used client-server protocols (TLS, HTTP) that should already be provided by libraries for all programming languages. The `ccf` Python package can still be used to audit the ledger and snapshot files (#3386).
+- The `proposal_generator` has been removed from the `ccf` Python package. The majority of proposals can be trivially constructed in existing client tooling, without needing to invoke Python. This also introduces parity between the default constitution and custom constitution actions - all should be constructed and called from the same governance client code. Some jinja templates are included in `samples/templates` for constructing careful ballots from existing proposals.
+
+## [2.0.0-dev8]
+
+### Added
+
+- Added `set_claims_digest()` API to `RpcContext`, see [documentation](https://microsoft.github.io/CCF/main/build_apps/logging_cpp.html#user-defined-claims-in-receipts) on how to use it to attach application-defined claims to transaction receipts.
+- Added a `GET /jwt_metrics` endpoint to monitor attempts and successes of key refresh for each issuer. See [documentation](https://microsoft.github.io/CCF/main/build_apps/auth/jwt.html#extracting-jwt-metrics) on how to use it.
+
+## [2.0.0-dev7]
+
+### Added
+
+- Added endpoint to obtain service configuration via `/node/service/configuration` (#3251)
+
+### Changed
+
+- Breaking change: Configuration for CCF node is now a JSON configuration file passed in to `cchost` via `--config /path/to/config/file/` CLI argument. Existing CLI arguments have been removed. The `migrate_1_x_config.py` script (included in `ccf` Python package) should be used to migrate existing `.ini` configuration files to `.json` format (#3209).
+- Format of node output RPC and node-to-node addresses files is now JSON (#3300).
+- Schema of `GET /network/nodes/{node_id}` and `GET /network/nodes` endpoints has been modified to include all RPC interfaces (#3300).
+
+### Renamed
+
+- `ccf::historical::AbstractStateCache::drop_requests()` renamed to `drop_cached_states()` (#3187).
+
+### Dependency
+
+- Upgrade OpenEnclave from 0.17.2 to 0.17.5
+
+## [2.0.0-dev6]
+
+### Added
+
+- Added experimental support for 2-transaction reconfiguration with CFT consensus (#3097), see [documentation](https://microsoft.github.io/CCF/main/overview/consensus/bft.html#two-transaction-reconfiguration). Note that mixing 1tx and 2tx nodes in the same network is unsupported and unsafe at this stage.
+
+### Changed
+
+- DNS resolution of client connections is now asynchronous.
+
+### Fixed
+
+- Fixed issue with join nodes which could get stuck if an election was triggered while catching up (#3169).
+
 ## [2.0.0-dev5]
 
 ### Added
@@ -13,6 +70,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - `get_metrics_v1` API to `BaseEndpointRegistry` for applications that do not make use of builtins and want to version or customise metrics output.
 - Slow ledger IO operations will now be logged at level FAIL. The threshold over which logging will activate can be adjusted by the `--io-logging-threshold` CLI argument to cchost (#3067).
 - Snapshot files now include receipt of evidence transaction. Nodes can now join or recover a service from a standalone snapshot file. 2.x nodes can still make use of snapshots created by a 1.x node, as long as the ledger suffix containing the proof of evidence is also specified at start-up (#2998).
+- Nodes certificates validity period is no longer hardcoded and can instead be set by operators and renewed by members (#2924):
+  - The new `--initial-node-cert-validity-days` (defaults to 1 day) CLI argument to cchost lets operators set the initial validity period for the node certificate (valid from the current system time).
+  - The new `--max-allowed-node-cert-validity-days` (defaults to 365 days) CLI argument to cchost sets the maximum validity period allowed for node certificates.
+  - The new `set_node_certificate_validity` proposal action allows members to renew a node certificate (or `set_all_nodes_certificate_validity` equivalent action to renew _all_ trusted nodes certificates).
+  - The existing `transition_node_to_trusted` proposal action now requires a new `valid_from` argument (and optional `validity_period_days`, which defaults to the value of ``--max-allowed-node-cert-validity-days`).
 - `ccf.historical.getStateRange` / `ccf.historical.dropCachedStates` JavaScript APIs to manually retrieve historical state in endpoints declared as `"mode": "readonly"` (#3033).
 - Log more detailed errors on early startup (#3116).
 - New `split_ledger.py` utility to split existing ledger files (#3129).
@@ -156,7 +218,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 The Confidential Consortium Framework CCF is an open-source framework for building a new category of secure, highly available, and performant applications that focus on multi-party compute and data.
 
-This is the first long term support release for CCF. The 1.0 branch will only receive security and critical bug fixes, please see our [release policy](https://microsoft.github.io/CCF/main/overview/release_policy.html) for more detail.
+This is the first long term support release for CCF. The 1.0 branch will only receive security and critical bug fixes, please see our [release policy](https://microsoft.github.io/CCF/main/build_apps/release_policy.html) for more detail.
 
 Active development will continue on the `main` branch, and regular development snapshots including new features will continue to be published.
 
@@ -197,7 +259,7 @@ Browse our [documentation](https://microsoft.github.io/CCF/main/index.html) to g
 
 ### Changed
 
-- The default constitution no longer contains `set_service_principal` or `remove_service_principal` since they are not used by the core framework. Instead any apps which wish to use these tables should add them to their own constitution. A [sample implementation](https://github.com/microsoft/CCF/tree/main/src/runtime_config/test/service_principals/actions.js) is available, and used in the CI tests.
+- The default constitution no longer contains `set_service_principal` or `remove_service_principal` since they are not used by the core framework. Instead any apps which wish to use these tables should add them to their own constitution. A [sample implementation](https://github.com/microsoft/CCF/tree/main/samples/constitutions/test/service_principals/actions.js) is available, and used in the CI tests.
 - Proposal status now includes a `final_votes` and `vote_failures` map, recording the outcome of each vote per member. `failure_reason` and `failure_trace` have been consolidated into a single `failure` object, which is also used for `vote_failures`.
 
 ## [0.99.1]
@@ -998,6 +1060,9 @@ Some discrepancies with the TR remain, and are being tracked under https://githu
 
 Initial pre-release
 
+[ccf-2.0.0-dev7]: https://github.com/microsoft/CCF/releases/tag/ccf-2.0.0-dev7
+[ccf-2.0.0-dev6]: https://github.com/microsoft/CCF/releases/tag/ccf-2.0.0-dev6
+[ccf-2.0.0-dev5]: https://github.com/microsoft/CCF/releases/tag/ccf-2.0.0-dev5
 [ccf-2.0.0-dev4]: https://github.com/microsoft/CCF/releases/tag/ccf-2.0.0-dev4
 [ccf-2.0.0-dev3]: https://github.com/microsoft/CCF/releases/tag/ccf-2.0.0-dev3
 [ccf-2.0.0-dev2]: https://github.com/microsoft/CCF/releases/tag/ccf-2.0.0-dev2

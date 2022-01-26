@@ -122,12 +122,9 @@ namespace ccf
       return {};
     }
 
-    crypto::Pem generate_endorsed_certificate(
-      const crypto::Pem& subject_csr,
-      const crypto::Pem& endorser_private_key,
-      const crypto::Pem& endorser_cert) override
+    size_t get_jwt_attempts() override
     {
-      throw std::logic_error("Unimplemented");
+      return 0;
     }
   };
 
@@ -200,7 +197,37 @@ namespace ccf
       return {};
     }
 
-    bool drop_request(historical::RequestHandle handle)
+    std::vector<historical::StorePtr> get_stores_for(
+      historical::RequestHandle handle,
+      const historical::SeqNoCollection& seqnos,
+      historical::ExpiryDuration seconds_until_expiry)
+    {
+      return {};
+    }
+
+    std::vector<historical::StorePtr> get_stores_for(
+      historical::RequestHandle handle,
+      const historical::SeqNoCollection& seqnos)
+    {
+      return {};
+    }
+
+    std::vector<historical::StatePtr> get_states_for(
+      historical::RequestHandle handle,
+      const historical::SeqNoCollection& seqnos,
+      historical::ExpiryDuration seconds_until_expiry)
+    {
+      return {};
+    }
+
+    std::vector<historical::StatePtr> get_states_for(
+      historical::RequestHandle handle,
+      const historical::SeqNoCollection& seqnos)
+    {
+      return {};
+    }
+
+    bool drop_cached_states(historical::RequestHandle handle)
     {
       return true;
     }
@@ -212,14 +239,19 @@ namespace ccf
     StubNodeState state = {};
     StubNodeStateCache cache = {};
 
-    ccf::historical::AbstractStateCache& get_historical_state()
+    ccf::historical::AbstractStateCache& get_historical_state() override
     {
       return cache;
     }
 
-    StubNodeState& get_node_state()
+    ccf::AbstractNodeState& get_node_state() override
     {
       return state;
+    }
+
+    ccf::indexing::IndexingStrategies& get_indexing_strategies() override
+    {
+      throw std::logic_error("Not implemented");
     }
   };
 

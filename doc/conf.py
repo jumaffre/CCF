@@ -22,8 +22,6 @@ import pathlib
 
 from docutils import nodes
 
-sys.path.insert(0, os.path.abspath("../python"))
-
 
 # -- Project information -----------------------------------------------------
 
@@ -60,6 +58,7 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinxcontrib.openapi",
     "sphinx_panels",
+    "sphinx.ext.extlinks",
 ]
 
 autosectionlabel_prefix_document = True
@@ -81,7 +80,7 @@ master_doc = "index"
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -198,13 +197,30 @@ breathe_default_project = "CCF"
 
 # Set up multiversion extension
 
-# Build tags from ccf-1.0.0
-smv_tag_whitelist = r"^ccf-(1\.\d+\.\d+|2.*)$"
+# Build tags from ccf-1.0.1x
+smv_tag_whitelist = r"^ccf-(1\.\d+\.1\d+|2.*)$"
 smv_branch_whitelist = r"^main$"
 smv_remote_whitelist = None
 smv_outputdir_format = "{ref.name}"
 
-# PyData theme options
+# Intercept command line arguments passed by sphinx-multiversion to retrieve doc version.
+# This is a little hacky with sphinx-multiversion 0.2.4 and the `SPHINX_MULTIVERSION_NAME`
+# envvar should be used for further versions (release pending).
+docs_version = "main"
+for arg in sys.argv:
+    if "smv_current_version=" in arg:
+        docs_version = arg.split("=")[1]
+
+
+# :ccf_repo: directive can be used to create a versioned link to GitHub repo
+extlinks = {
+    "ccf_repo": (
+        f"https://github.com/microsoft/CCF/tree/{docs_version}/%s",
+        "%s",
+    )
+}
+
+# Theme options
 
 html_logo = "_static/ccf.svg"
 html_favicon = "_static/favicon.ico"
@@ -296,7 +312,7 @@ def typedoc_role(
     pkg_name, *element_path = text_without_hash.split("/")
     typedoc_path = f"js/{pkg_name}"
     if not is_kind_package:
-        element_path = ".".join(element_path).lower()
+        element_path = ".".join(element_path)
         typedoc_path += f"/{kind_name}/{element_path}.html{url_hash}"
 
     # construct final url relative to current page
@@ -316,10 +332,10 @@ def typedoc_role(
 def config_inited(app, config):
     # anything that needs to access app.config goes here
 
-    srcdir = pathlib.Path(app.srcdir)
+    doc_dir = pathlib.Path(app.srcdir)
     outdir = pathlib.Path(app.outdir)
 
-    js_pkg_dir = srcdir / ".." / "js" / "ccf-app"
+    js_pkg_dir = doc_dir / ".." / "js" / "ccf-app"
     js_docs_dir = outdir / "js" / "ccf-app"
     if js_pkg_dir.exists():
         # make versions.json from sphinx-multiversion available
@@ -333,6 +349,11 @@ def config_inited(app, config):
         )
         subprocess.run(
             ["sed", "-i", 's/"\^14\.14\.35"/"14\.17\.27"/g', "package.json"],
+            cwd=js_pkg_dir,
+            check=True,
+        )
+        subprocess.run(
+            ["npm", "install", "--save-exact", "colors@1.4.0"],
             cwd=js_pkg_dir,
             check=True,
         )
@@ -362,9 +383,14 @@ def config_inited(app, config):
 def setup(app):
     app.connect("config-inited", config_inited)
 
-    srcdir = pathlib.Path(app.srcdir)
+    doc_dir = pathlib.Path(app.srcdir)  # CCF/doc/
+    root_dir = os.path.abspath(doc_dir / "..")  # CCF/
+
+    # import ccf python package to generate docs for this version
+    python_path = os.path.abspath(doc_dir / "../python")
+    sys.path.insert(0, python_path)
 
     # doxygen
-    breathe_projects["CCF"] = str(srcdir / breathe_projects["CCF"])
+    breathe_projects["CCF"] = str(doc_dir / breathe_projects["CCF"])
     if not os.environ.get("SKIP_DOXYGEN"):
-        subprocess.run(["doxygen"], cwd=srcdir / "..", check=True)
+        subprocess.run(["doxygen"], cwd=root_dir, check=True)

@@ -4,6 +4,7 @@
 #include "ccf/common_auth_policies.h"
 #include "ccf/common_endpoint_registry.h"
 #include "ccf/json_handler.h"
+#include "crypto/base64.h"
 #include "crypto/key_pair.h"
 #include "ds/nonstd.h"
 #include "frontend.h"
@@ -17,13 +18,13 @@
 #include "node/secret_share.h"
 #include "node/share_manager.h"
 #include "node_interface.h"
-#include "tls/base64.h"
 
 #include <charconv>
 #include <exception>
 #include <initializer_list>
 #include <map>
 #include <memory>
+#include <openssl/crypto.h>
 #include <set>
 #include <sstream>
 
@@ -54,6 +55,14 @@ namespace ccf
   };
   DECLARE_JSON_TYPE(JsBundle)
   DECLARE_JSON_REQUIRED_FIELDS(JsBundle, metadata, modules)
+
+  struct KeyIdInfo
+  {
+    JwtIssuer issuer;
+    crypto::Pem cert;
+  };
+  DECLARE_JSON_TYPE(KeyIdInfo)
+  DECLARE_JSON_REQUIRED_FIELDS(KeyIdInfo, issuer, cert)
 
   class MemberEndpoints : public CommonEndpointRegistry
   {
@@ -226,16 +235,12 @@ namespace ccf
           fmt::format(
             "public:ccf.gov.proposal_info[{}].ballots[{}]", proposal_id, mid));
 
-        JSValue argv[2];
-        auto prop = JS_NewStringLen(
-          context, (const char*)proposal.data(), proposal.size());
-        argv[0] = prop;
-        auto pid = JS_NewStringLen(
-          context, pi_->proposer_id.data(), pi_->proposer_id.size());
-        argv[1] = pid;
+        std::vector<js::JSWrappedValue> argv = {
+          context.new_string_len((const char*)proposal.data(), proposal.size()),
+          context.new_string_len(
+            pi_->proposer_id.data(), pi_->proposer_id.size())};
 
-        auto val =
-          context(JS_Call(context, ballot_func, JS_UNDEFINED, 2, argv));
+        auto val = context.call(ballot_func, argv);
         if (!JS_IsException(val))
         {
           votes.emplace_back(mid, JS_ToBool(context, val));
@@ -249,9 +254,6 @@ namespace ccf
           auto [reason, trace] = js::js_error_message(context);
           vote_failures.value()[mid] = ccf::jsgov::Failure{reason, trace};
         }
-        JS_FreeValue(context, ballot_func);
-        JS_FreeValue(context, prop);
-        JS_FreeValue(context, pid);
       }
 
       {
@@ -273,16 +275,15 @@ namespace ccf
           js_context);
         auto resolve_func = js_context.function(
           constitution, "resolve", "public:ccf.gov.constitution[0]");
-        JSValue argv[3];
-        auto prop = JS_NewStringLen(
-          js_context, (const char*)proposal.data(), proposal.size());
-        argv[0] = prop;
 
-        auto prop_id = JS_NewStringLen(
-          js_context, pi_->proposer_id.data(), pi_->proposer_id.size());
-        argv[1] = prop_id;
+        std::vector<js::JSWrappedValue> argv;
+        argv.push_back(js_context.new_string_len(
+          (const char*)proposal.data(), proposal.size()));
 
-        auto vs = JS_NewArray(js_context);
+        argv.push_back(js_context.new_string_len(
+          pi_->proposer_id.data(), pi_->proposer_id.size()));
+
+        auto vs = js_context.new_array();
         size_t index = 0;
         for (auto& [mid, vote] : votes)
         {
@@ -296,15 +297,9 @@ namespace ccf
           JS_DefinePropertyValueUint32(
             js_context, vs, index++, v, JS_PROP_C_W_E);
         }
-        argv[2] = vs;
+        argv.push_back(vs);
 
-        auto val =
-          js_context(JS_Call(js_context, resolve_func, JS_UNDEFINED, 3, argv));
-
-        JS_FreeValue(js_context, resolve_func);
-        JS_FreeValue(js_context, prop);
-        JS_FreeValue(js_context, prop_id);
-        JS_FreeValue(js_context, vs);
+        auto val = js_context.call(resolve_func, argv);
 
         std::optional<jsgov::Failure> failure = std::nullopt;
         if (JS_IsException(val))
@@ -316,9 +311,7 @@ namespace ccf
         }
         else if (JS_IsString(val))
         {
-          auto s = JS_ToCString(js_context, val);
-          std::string status(s);
-          JS_FreeCString(js_context, s);
+          auto status = js_context.to_str(val).value_or("");
           if (status == "Open")
           {
             pi_.value().state = ProposalState::OPEN;
@@ -388,21 +381,13 @@ namespace ccf
             auto apply_func = js_context.function(
               constitution, "apply", "public:ccf.gov.constitution[0]");
 
-            JSValue argv[2];
-            auto prop = JS_NewStringLen(
-              js_context, (const char*)proposal.data(), proposal.size());
-            argv[0] = prop;
+            std::vector<js::JSWrappedValue> argv = {
+              js_context.new_string_len(
+                (const char*)proposal.data(), proposal.size()),
+              js_context.new_string_len(
+                proposal_id.c_str(), proposal_id.size())};
 
-            auto prop_id = JS_NewStringLen(
-              js_context, proposal_id.c_str(), proposal_id.size());
-            argv[1] = prop_id;
-
-            auto val = js_context(
-              JS_Call(js_context, apply_func, JS_UNDEFINED, 2, argv));
-
-            JS_FreeValue(js_context, apply_func);
-            JS_FreeValue(js_context, prop);
-            JS_FreeValue(js_context, prop_id);
+            auto val = js_context.call(apply_func, argv);
 
             if (JS_IsException(val))
             {
@@ -491,7 +476,7 @@ namespace ccf
       openapi_info.description =
         "This API is used to submit and query proposals which affect CCF's "
         "public governance tables.";
-      openapi_info.document_version = "2.2.0";
+      openapi_info.document_version = "2.5.0";
     }
 
     static std::optional<MemberId> get_caller_member_id(
@@ -683,7 +668,7 @@ namespace ccf
         }
 
         return make_success(
-          GetRecoveryShare::Out{tls::b64_from_raw(encrypted_share.value())});
+          GetRecoveryShare::Out{crypto::b64_from_raw(encrypted_share.value())});
       };
       make_endpoint(
         "/recovery_share",
@@ -730,7 +715,8 @@ namespace ccf
         }
 
         const auto in = params.get<SubmitRecoveryShare::In>();
-        auto raw_recovery_share = tls::raw_from_b64(in.share);
+        auto raw_recovery_share = crypto::raw_from_b64(in.share);
+        OPENSSL_cleanse(const_cast<char*>(in.share.data()), in.share.size());
 
         size_t submitted_shares_count = 0;
         try
@@ -748,6 +734,7 @@ namespace ccf
             errors::InternalError,
             error_msg);
         }
+        OPENSSL_cleanse(raw_recovery_share.data(), raw_recovery_share.size());
 
         if (submitted_shares_count < g.get_recovery_threshold())
         {
@@ -797,16 +784,24 @@ namespace ccf
         .set_auto_schema<SubmitRecoveryShare>()
         .install();
 
-      using JWTKeyMap = std::map<JwtKeyId, crypto::Pem>;
+      using JWTKeyMap = std::map<JwtKeyId, KeyIdInfo>;
 
       auto get_jwt_keys = [this](auto& ctx, nlohmann::json&& body) {
-        auto keys = ctx.tx.template ro<JwtPublicSigningKeys>(
-          ccf::Tables::JWT_PUBLIC_SIGNING_KEYS);
+        auto keys = ctx.tx.ro(network.jwt_public_signing_keys);
+        auto keys_to_issuer = ctx.tx.ro(network.jwt_public_signing_key_issuer);
+
         JWTKeyMap kmap;
-        keys->foreach([&kmap](const auto& kid, const auto& kpem) {
-          kmap[kid] = crypto::cert_der_to_pem(kpem);
-          return false;
-        });
+        keys->foreach(
+          [&kmap, &keys_to_issuer](const auto& kid, const auto& kpem) {
+            auto issuer = keys_to_issuer->get(kid);
+            if (!issuer.has_value())
+            {
+              throw std::logic_error(fmt::format("kid {} has no issuer", kid));
+            }
+            kmap.emplace(
+              kid, KeyIdInfo{issuer.value(), crypto::cert_der_to_pem(kpem)});
+            return true;
+          });
 
         return make_success(kmap);
       };
@@ -906,14 +901,8 @@ namespace ccf
           reinterpret_cast<const char*>(ctx.rpc_ctx->get_request_body().data());
         auto body_len = ctx.rpc_ctx->get_request_body().size();
 
-        auto proposal = JS_NewStringLen(context, body, body_len);
-        JSValueConst* argv = (JSValueConst*)&proposal;
-
-        auto val =
-          context(JS_Call(context, validate_func, JS_UNDEFINED, 1, argv));
-
-        JS_FreeValue(context, proposal);
-        JS_FreeValue(context, validate_func);
+        auto proposal = context.new_string_len(body, body_len);
+        auto val = context.call(validate_func, {proposal});
 
         if (JS_IsException(val))
         {
@@ -938,9 +927,7 @@ namespace ccf
         auto desc = context(JS_GetPropertyStr(context, val, "description"));
         if (JS_IsString(desc))
         {
-          auto cstr = JS_ToCString(context, desc);
-          description = std::string(cstr);
-          JS_FreeCString(context, cstr);
+          description = context.to_str(desc).value_or("");
         }
 
         auto valid = context(JS_GetPropertyStr(context, val, "valid"));
@@ -982,19 +969,33 @@ namespace ccf
           proposal_id,
           ctx.rpc_ctx->get_request_body(),
           constitution.value());
-        pi->put(
-          proposal_id,
-          {caller_identity.member_id,
-           rv.state,
-           {},
-           {},
-           std::nullopt,
-           rv.failure});
 
-        ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
-        ctx.rpc_ctx->set_response_header(
-          http::headers::CONTENT_TYPE, http::headervalues::contenttype::JSON);
-        ctx.rpc_ctx->set_response_body(nlohmann::json(rv).dump());
+        if (rv.state == ProposalState::FAILED)
+        {
+          // If the proposal failed to apply, we want to discard the tx and not
+          // apply its side-effects to the KV state.
+          ctx.rpc_ctx->set_error(
+            HTTP_STATUS_INTERNAL_SERVER_ERROR,
+            ccf::errors::InternalError,
+            fmt::format("{}", rv.failure));
+          return;
+        }
+        else
+        {
+          pi->put(
+            proposal_id,
+            {caller_identity.member_id,
+             rv.state,
+             {},
+             {},
+             std::nullopt,
+             rv.failure});
+          ctx.rpc_ctx->set_response_header(
+            http::headers::CONTENT_TYPE, http::headervalues::contenttype::JSON);
+          ctx.rpc_ctx->set_response_body(nlohmann::json(rv).dump());
+          ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
+          return;
+        }
       };
 
       make_endpoint("/proposals", HTTP_POST, post_proposals_js, member_sig_only)
@@ -1194,17 +1195,16 @@ namespace ccf
         .set_auto_schema<void, jsgov::Proposal>()
         .install();
 
-      auto vote_js = [this](
-                       endpoints::EndpointContext& ctx,
-                       nlohmann::json&& params) {
+      auto vote_js = [this](ccf::endpoints::EndpointContext& ctx) {
         const auto& caller_identity =
           ctx.get_caller<ccf::MemberSignatureAuthnIdentity>();
         if (!check_member_active(ctx.tx, caller_identity.member_id))
         {
-          return make_error(
+          ctx.rpc_ctx->set_error(
             HTTP_STATUS_FORBIDDEN,
             ccf::errors::AuthorizationFailed,
             "Member is not active.");
+          return;
         }
 
         ProposalId proposal_id;
@@ -1212,17 +1212,21 @@ namespace ccf
         if (!get_proposal_id_from_path(
               ctx.rpc_ctx->get_request_path_params(), proposal_id, error))
         {
-          return make_error(
-            HTTP_STATUS_BAD_REQUEST, ccf::errors::InvalidResourceName, error);
+          ctx.rpc_ctx->set_error(
+            HTTP_STATUS_BAD_REQUEST,
+            ccf::errors::InvalidResourceName,
+            std::move(error));
+          return;
         }
 
         auto constitution = ctx.tx.ro(network.constitution)->get();
         if (!constitution.has_value())
         {
-          return make_error(
+          ctx.rpc_ctx->set_error(
             HTTP_STATUS_INTERNAL_SERVER_ERROR,
             ccf::errors::InternalError,
             "No constitution is set - proposals cannot be evaluated");
+          return;
         }
 
         auto pi =
@@ -1230,15 +1234,16 @@ namespace ccf
         auto pi_ = pi->get(proposal_id);
         if (!pi_)
         {
-          return make_error(
+          ctx.rpc_ctx->set_error(
             HTTP_STATUS_NOT_FOUND,
             ccf::errors::ProposalNotFound,
             fmt::format("Could not find proposal {}.", proposal_id));
+          return;
         }
 
         if (pi_.value().state != ProposalState::OPEN)
         {
-          return make_error(
+          ctx.rpc_ctx->set_error(
             HTTP_STATUS_BAD_REQUEST,
             ccf::errors::ProposalNotOpen,
             fmt::format(
@@ -1247,6 +1252,7 @@ namespace ccf
               proposal_id,
               pi_.value().state,
               ProposalState::OPEN));
+          return;
         }
 
         auto pm = ctx.tx.ro<ccf::jsgov::ProposalMap>(Tables::PROPOSALS);
@@ -1254,27 +1260,30 @@ namespace ccf
 
         if (!p)
         {
-          return make_error(
+          ctx.rpc_ctx->set_error(
             HTTP_STATUS_NOT_FOUND,
             ccf::errors::ProposalNotFound,
             fmt::format("Proposal {} does not exist.", proposal_id));
+          return;
         }
 
         if (pi_->ballots.find(caller_identity.member_id) != pi_->ballots.end())
         {
-          return make_error(
+          ctx.rpc_ctx->set_error(
             HTTP_STATUS_BAD_REQUEST,
             ccf::errors::VoteAlreadyExists,
             "Vote already submitted.");
+          return;
         }
         // Validate vote
+
+        auto params = nlohmann::json::parse(ctx.rpc_ctx->get_request_body());
 
         {
           js::Runtime rt;
           js::Context context(rt);
           auto ballot_func =
             context.function(params["ballot"], "vote", "body[\"ballot\"]");
-          JS_FreeValue(context, ballot_func);
         }
 
         pi_->ballots[caller_identity.member_id] = params["ballot"];
@@ -1286,18 +1295,32 @@ namespace ccf
 
         auto rv = resolve_proposal(
           ctx.tx, proposal_id, p.value(), constitution.value());
-        pi_.value().state = rv.state;
-        pi_.value().final_votes = rv.votes;
-        pi_.value().vote_failures = rv.vote_failures;
-        pi_.value().failure = rv.failure;
-        pi->put(proposal_id, pi_.value());
-        return make_success(rv);
+        if (rv.state == ProposalState::FAILED)
+        {
+          // If the proposal failed to apply, we want to discard the tx and not
+          // apply its side-effects to the KV state.
+          ctx.rpc_ctx->set_error(
+            HTTP_STATUS_INTERNAL_SERVER_ERROR,
+            ccf::errors::InternalError,
+            fmt::format("{}", rv.failure));
+          return;
+        }
+        else
+        {
+          pi_.value().state = rv.state;
+          pi_.value().final_votes = rv.votes;
+          pi_.value().vote_failures = rv.vote_failures;
+          pi_.value().failure = rv.failure;
+          pi->put(proposal_id, pi_.value());
+          ctx.rpc_ctx->set_response_header(
+            http::headers::CONTENT_TYPE, http::headervalues::contenttype::JSON);
+          ctx.rpc_ctx->set_response_body(nlohmann::json(rv).dump());
+          ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
+          return;
+        }
       };
       make_endpoint(
-        "/proposals/{proposal_id}/ballots",
-        HTTP_POST,
-        json_adapter(vote_js),
-        member_sig_only)
+        "/proposals/{proposal_id}/ballots", HTTP_POST, vote_js, member_sig_only)
         .set_auto_schema<jsgov::Ballot, jsgov::ProposalInfoSummary>()
         .install();
 

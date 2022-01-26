@@ -15,10 +15,6 @@ from setuptools.extern.packaging.version import Version  # type: ignore
 from loguru import logger as LOG
 
 
-# Optional. May be useful to avoid GitHub's low rate limits for unauthenticated clients
-# https://docs.github.com/en/rest/reference/rate-limit
-ENV_VAR_GITHUB_AUTH_TOKEN_NAME = "LTS_COMPATIBILITY_GH_TOKEN"
-
 REPOSITORY_NAME = "microsoft/CCF"
 REMOTE_URL = f"https://github.com/{REPOSITORY_NAME}"
 BRANCH_RELEASE_PREFIX = "release/"
@@ -29,6 +25,7 @@ DEBIAN_PACKAGE_EXTENSION = "_amd64.deb"
 INSTALL_DIRECTORY_PREFIX = "ccf_install_"
 INSTALL_DIRECTORY_SUB_PATH = "opt/ccf"
 DOWNLOAD_FOLDER_NAME = "downloads"
+INSTALL_SUCCESS_FILE = "test_github_infra_installed"
 
 # Note: Releases are identified by tag since releases are not necessarily named, but all
 # releases are tagged
@@ -96,7 +93,7 @@ def has_release_for_tag_name(tag_name):
 class Repository:
     """
     Helper class to verify CCF operations compatibility described at
-    https://microsoft.github.io/CCF/main/overview/release_policy.html#operations-compatibility
+    https://microsoft.github.io/CCF/main/build_apps/release_policy.html#operations-compatibility
     """
 
     def __init__(self):
@@ -194,7 +191,18 @@ class Repository:
     def install_release(self, tag):
         stripped_tag = strip_release_tag_name(tag)
         install_directory = f"{INSTALL_DIRECTORY_PREFIX}{stripped_tag}"
+        install_path = os.path.abspath(
+            os.path.join(install_directory, INSTALL_DIRECTORY_SUB_PATH)
+        )
         debian_package_url = get_debian_package_url_from_tag_name(tag)
+        installed_file_path = os.path.join(install_path, INSTALL_SUCCESS_FILE)
+
+        # Skip downloading release if it already exists
+        if os.path.isfile(installed_file_path):
+            LOG.info(
+                f"Using existing release {stripped_tag} already installed at {install_path}"
+            )
+            return stripped_tag, install_path
 
         debian_package_name = debian_package_url.split("/")[-1]
         download_path = os.path.join(DOWNLOAD_FOLDER_NAME, debian_package_name)
@@ -210,9 +218,9 @@ class Repository:
         install_cmd = ["dpkg-deb", "-R", download_path, install_directory]
         assert infra.proc.ccall(*install_cmd).returncode == 0, "Installation failed"
 
-        install_path = os.path.abspath(
-            os.path.join(install_directory, INSTALL_DIRECTORY_SUB_PATH)
-        )
+        # Write new file to avoid having to download install again
+        open(os.path.join(install_path, INSTALL_SUCCESS_FILE), "w+", encoding="utf-8")
+
         LOG.info(f"CCF release {stripped_tag} successfully installed at {install_path}")
         return stripped_tag, install_path
 

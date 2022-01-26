@@ -5,6 +5,7 @@
 #include "ds/buffer.h"
 #include "ds/ccf_assert.h"
 #include "kv_types.h"
+#include "node/rpc/claims.h"
 #include "serialised_entry.h"
 #include "serialised_entry_format.h"
 
@@ -23,8 +24,7 @@ namespace kv
     W private_writer;
     W* current_writer;
     TxID tx_id;
-    Version max_conflict_version;
-    bool is_snapshot;
+    EntryType entry_type;
 
     std::shared_ptr<AbstractTxEncryptor> crypto_util;
 
@@ -58,17 +58,21 @@ namespace kv
     GenericSerialiseWrapper(
       std::shared_ptr<AbstractTxEncryptor> e,
       const TxID& tx_id_,
-      const Version& max_conflict_version_,
-      bool is_snapshot_ = false) :
+      EntryType entry_type_ = EntryType::WriteSet,
+      const ccf::ClaimsDigest& claims_digest_ = ccf::no_claims()) :
       tx_id(tx_id_),
-      max_conflict_version(max_conflict_version_),
-      is_snapshot(is_snapshot_),
+      entry_type(entry_type_),
       crypto_util(e)
     {
       set_current_domain(SecurityDomain::PUBLIC);
-      serialise_internal(is_snapshot);
+      serialise_internal(entry_type);
       serialise_internal(tx_id.version);
-      serialise_internal(max_conflict_version);
+      if (entry_type == EntryType::WriteSetWithClaims)
+      {
+        serialise_internal(claims_digest_.value());
+      }
+      // Write a placeholder max_conflict_version for compatibility
+      serialise_internal((Version)0u);
     }
 
     void start_map(const std::string& name, SecurityDomain domain)
@@ -188,7 +192,7 @@ namespace kv
             serialised_hdr,
             encrypted_private_domain,
             tx_id,
-            is_snapshot))
+            entry_type))
       {
         throw KvSerialiserException(fmt::format(
           "Could not serialise transaction at seqno {}", tx_id.version));
@@ -223,9 +227,9 @@ namespace kv
     R private_reader;
     R* current_reader;
     std::vector<uint8_t> decrypted_buffer;
-    bool is_snapshot;
+    EntryType entry_type;
+    ccf::ClaimsDigest claims_digest = ccf::no_claims();
     Version version;
-    Version max_conflict_version;
     std::shared_ptr<AbstractTxEncryptor> crypto_util;
     std::optional<SecurityDomain> domain_restriction;
 
@@ -233,9 +237,18 @@ namespace kv
     // domain have been read
     void read_public_header()
     {
-      is_snapshot = public_reader.template read_next<bool>();
+      entry_type = public_reader.template read_next<EntryType>();
       version = public_reader.template read_next<Version>();
-      max_conflict_version = public_reader.template read_next<Version>();
+      if (entry_type == EntryType::WriteSetWithClaims)
+      {
+        auto digest_array =
+          public_reader
+            .template read_next<ccf::ClaimsDigest::Digest::Representation>();
+        claims_digest.set(std::move(digest_array));
+      }
+      // max_conflict_version is included for compatibility, but currently
+      // ignored
+      const auto _ = public_reader.template read_next<Version>();
     }
 
   public:
@@ -246,7 +259,12 @@ namespace kv
       domain_restriction(domain_restriction)
     {}
 
-    std::optional<std::tuple<Version, Version>> init(
+    ccf::ClaimsDigest&& consume_claims_digest()
+    {
+      return std::move(claims_digest);
+    }
+
+    std::optional<Version> init(
       const uint8_t* data,
       size_t size,
       kv::Term& term,
@@ -287,7 +305,7 @@ namespace kv
       {
         public_reader.init(data_, size_);
         read_public_header();
-        return std::make_tuple(version, max_conflict_version);
+        return version;
       }
 
       serialized::skip(data_, size_, crypto_util->get_header_length());
@@ -309,7 +327,7 @@ namespace kv
         term =
           crypto_util->get_term(gcm_hdr_data, crypto_util->get_header_length());
 
-        return std::make_tuple(version, max_conflict_version);
+        return version;
       }
 
       serialized::skip(data_, size_, public_domain_length);
@@ -328,7 +346,7 @@ namespace kv
       }
 
       private_reader.init(decrypted_buffer.data(), decrypted_buffer.size());
-      return std::make_tuple(version, max_conflict_version);
+      return version;
     }
 
     std::optional<std::string> start_map()

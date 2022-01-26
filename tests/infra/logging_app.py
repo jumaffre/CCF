@@ -6,8 +6,8 @@ import infra.jwt_issuer
 import time
 import http
 import random
-import ccf.clients
-import ccf.commit
+import infra.clients
+import infra.commit
 from collections import defaultdict
 from ccf.tx_id import TxID
 
@@ -79,6 +79,9 @@ class LoggingTxs:
         idx=None,
         wait_for_sync=True,
         log_capture=None,
+        send_private=True,
+        send_public=True,
+        record_claim=False,
     ):
         self.network = network
         remote_node, _ = network.find_primary(log_capture=log_capture)
@@ -100,42 +103,52 @@ class LoggingTxs:
                 if target_idx is None:
                     target_idx = self.idx
 
-                priv_msg = f"Private message at idx {target_idx} [{len(self.priv[target_idx])}]"
-                rep_priv = c.post(
-                    "/app/log/private",
-                    {
-                        "id": target_idx,
-                        "msg": priv_msg,
-                    },
-                    headers=self._get_headers_base(),
-                    log_capture=log_capture,
-                )
-                self.priv[target_idx].append(
-                    {"msg": priv_msg, "seqno": rep_priv.seqno, "view": rep_priv.view}
-                )
+                if send_private:
+                    priv_msg = f"Private message at idx {target_idx} [{len(self.priv[target_idx])}]"
+                    rep_priv = c.post(
+                        "/app/log/private",
+                        {
+                            "id": target_idx,
+                            "msg": priv_msg,
+                        },
+                        headers=self._get_headers_base(),
+                        log_capture=log_capture,
+                    )
+                    self.priv[target_idx].append(
+                        {
+                            "msg": priv_msg,
+                            "seqno": rep_priv.seqno,
+                            "view": rep_priv.view,
+                        }
+                    )
+                    wait_point = rep_priv
 
-                pub_msg = (
-                    f"Public message at idx {target_idx} [{len(self.pub[target_idx])}]"
-                )
-                rep_pub = c.post(
-                    "/app/log/public",
-                    {
+                if send_public:
+                    pub_msg = f"Public message at idx {target_idx} [{len(self.pub[target_idx])}]"
+                    payload = {
                         "id": target_idx,
                         "msg": pub_msg,
-                    },
-                    headers=self._get_headers_base(),
-                    log_capture=log_capture,
-                )
-                self.pub[target_idx].append(
-                    {"msg": pub_msg, "seqno": rep_pub.seqno, "view": rep_pub.view}
-                )
+                    }
+                    if record_claim:
+                        payload["record_claim"] = True
+                    rep_pub = c.post(
+                        "/app/log/public",
+                        payload,
+                        headers=self._get_headers_base(),
+                        log_capture=log_capture,
+                    )
+                    self.pub[target_idx].append(
+                        {"msg": pub_msg, "seqno": rep_pub.seqno, "view": rep_pub.view}
+                    )
+                    wait_point = rep_pub
             if number_txs and wait_for_sync:
-                check_commit(rep_pub, result=True)
+                check_commit(wait_point, result=True)
 
         if wait_for_sync:
             network.wait_for_all_nodes_to_commit(
-                tx_id=TxID(rep_pub.view, rep_pub.seqno)
+                tx_id=TxID(wait_point.view, wait_point.seqno)
             )
+        return TxID(wait_point.view, wait_point.seqno)
 
     def verify(
         self,
@@ -212,7 +225,7 @@ class LoggingTxs:
             cmd = "/app/log/private/historical"
             headers.update(
                 {
-                    ccf.clients.CCF_TX_ID_HEADER: f"{view}.{seqno}",
+                    infra.clients.CCF_TX_ID_HEADER: f"{view}.{seqno}",
                 }
             )
 
@@ -220,7 +233,7 @@ class LoggingTxs:
         start_time = time.time()
         while time.time() < (start_time + timeout):
             with node.client(self.user) as c:
-                ccf.commit.wait_for_commit(
+                infra.commit.wait_for_commit(
                     c, seqno, view, timeout, log_capture=log_capture
                 )
 
@@ -259,13 +272,13 @@ class LoggingTxs:
                 f"Unable to retrieve entry at TxID {view}.{seqno} (idx:{idx}) on node {node.local_node_id} after {timeout}s"
             )
 
-    def get_receipt(self, node, idx, seqno, view, timeout=3):
+    def get_receipt(self, node, idx, seqno, view, timeout=3, domain="private"):
 
-        cmd = "/app/log/private/historical_receipt"
+        cmd = f"/app/log/{domain}/historical_receipt"
         headers = self._get_headers_base()
         headers.update(
             {
-                ccf.clients.CCF_TX_ID_HEADER: f"{view}.{seqno}",
+                infra.clients.CCF_TX_ID_HEADER: f"{view}.{seqno}",
             }
         )
 
@@ -273,7 +286,7 @@ class LoggingTxs:
         start_time = time.time()
         while time.time() < (start_time + timeout):
             with node.client(self.user) as c:
-                ccf.commit.wait_for_commit(c, seqno, view, timeout)
+                infra.commit.wait_for_commit(c, seqno, view, timeout)
 
                 rep = c.get(f"{cmd}?id={idx}", headers=headers)
                 if rep.status_code == http.HTTPStatus.OK:

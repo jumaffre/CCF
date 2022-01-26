@@ -71,6 +71,8 @@ namespace ccf
     ERROR(NodeCannotHandleRequest)
     ERROR(TransactionPendingOrUnknown)
     ERROR(TransactionInvalid)
+    ERROR(PrimaryNotFound)
+    ERROR(RequestAlreadyForwarded)
 
     // node-to-node (/join and /create):
     ERROR(ConsensusTypeMismatch)

@@ -28,6 +28,41 @@ def test_refresh_jwt_issuer(network, args):
     return network
 
 
+@reqs.description("Multiple JWT issuers registered at once")
+def test_jwt_endpoint(network, args):
+    primary, _ = network.find_nodes()
+
+    keys = {
+        infra.jwt_issuer.JwtIssuer("issuer1"): ["issuer1_kid1", "issuer1_kid2"],
+        infra.jwt_issuer.JwtIssuer("issuer2"): ["issuer2_kid1", "issuer2_kid2"],
+    }
+
+    LOG.info("Register JWT issuer with multiple kids")
+    for issuer, kids in keys.items():
+        with tempfile.NamedTemporaryFile(prefix="ccf", mode="w+") as metadata_fp:
+            json.dump({"issuer": issuer.name}, metadata_fp)
+            metadata_fp.flush()
+            network.consortium.set_jwt_issuer(primary, metadata_fp.name)
+
+        with tempfile.NamedTemporaryFile(prefix="ccf", mode="w+") as jwks_fp:
+            json.dump(issuer.create_jwks_for_kids(kids), jwks_fp)
+            jwks_fp.flush()
+            network.consortium.set_jwt_public_signing_keys(
+                primary, issuer.name, jwks_fp.name
+            )
+
+    LOG.info("Check that JWT endpoint returns all keys and issuers")
+    with primary.client(network.consortium.get_any_active_member().local_id) as c:
+        r = c.get("/gov/jwt_keys/all")
+        assert r.status_code == 200, r
+        info = r.body.json()
+        for issuer, kids in keys.items():
+            for kid in kids:
+                assert kid in info, r
+                assert info[kid]["issuer"] == issuer.name
+                assert info[kid]["cert"] == issuer.cert_pem
+
+
 @reqs.description("JWT without key policy")
 def test_jwt_without_key_policy(network, args):
     primary, _ = network.find_nodes()
@@ -78,7 +113,7 @@ def test_jwt_without_key_policy(network, args):
         with primary.client(network.consortium.get_any_active_member().local_id) as c:
             r = c.get("/gov/jwt_keys/all")
             assert r.status_code == 200, r
-            stored_cert = r.body.json()[kid]
+            stored_cert = r.body.json()[kid]["cert"]
 
         assert infra.crypto.are_certs_equal(
             issuer.cert_pem, stored_cert
@@ -103,7 +138,7 @@ def test_jwt_without_key_policy(network, args):
         with primary.client(network.consortium.get_any_active_member().local_id) as c:
             r = c.get("/gov/jwt_keys/all")
             assert r.status_code == 200, r
-            stored_cert = r.body.json()[kid]
+            stored_cert = r.body.json()[kid]["cert"]
 
         assert infra.crypto.are_certs_equal(
             issuer.cert_pem, stored_cert
@@ -122,7 +157,16 @@ def make_attested_cert(network, args):
     pubk = os.path.join(network.common_dir, "attested_enc_pubk.pem")
     der = os.path.join(network.common_dir, "oe_cert.der")
     infra.proc.ccall(
-        oeutil, "generate-evidence", "-f", "cert", privk, pubk, "-o", der
+        oeutil,
+        "generate-evidence",
+        "-f",
+        "cert",
+        privk,
+        pubk,
+        "-o",
+        der,
+        # To ensure in-process attestation is always used, clear the env to unset the SGX_AESM_ADDR variable
+        env={},
     ).check_returncode()
     pem = os.path.join(network.common_dir, "oe_cert.pem")
     infra.proc.ccall(
@@ -284,7 +328,7 @@ def check_kv_jwt_key_matches(network, kid, cert_pem):
     if cert_pem is None:
         assert kid not in latest_jwt_signing_keys
     else:
-        stored_cert = latest_jwt_signing_keys[kid]
+        stored_cert = latest_jwt_signing_keys[kid]["cert"]
         assert infra.crypto.are_certs_equal(
             cert_pem, stored_cert
         ), "input cert is not equal to stored cert"
@@ -302,6 +346,13 @@ def get_jwt_refresh_endpoint_metrics(network) -> dict:
         assert m["errors"] == 0, m["errors"]  # not used in jwt refresh endpoint
         m["successes"] = m["calls"] - m["failures"]
         return m
+
+
+def get_jwt_metrics(network) -> dict:
+    primary, _ = network.find_nodes()
+    with primary.client(network.consortium.get_any_active_member().local_id) as c:
+        r = c.get("/node/jwt_metrics")
+        return r.body.json()
 
 
 @reqs.description("JWT with auto_refresh enabled")
@@ -347,6 +398,11 @@ def test_jwt_key_auto_refresh(network, args):
                 timeout=5,
             )
 
+        LOG.info("Check that JWT refresh has attempts and successes")
+        m = get_jwt_metrics(network)
+        assert m["attempts"] > 0, m["attempts"]
+        assert m["successes"] > 0, m["successes"]
+
         LOG.info("Check that JWT refresh endpoint has no failures")
         m = get_jwt_refresh_endpoint_metrics(network)
         assert m["failures"] == 0, m["failures"]
@@ -362,6 +418,10 @@ def test_jwt_key_auto_refresh(network, args):
             assert m["failures"] > 0, m["failures"]
 
         with_timeout(check_has_failures, timeout=5)
+
+        LOG.info("Check that JWT refresh has less successes than attempts")
+        m = get_jwt_metrics(network)
+        assert m["attempts"] > m["successes"], m["attempts"]
 
     LOG.info("Restart OpenID endpoint server with new keys")
     kid2 = "the_kid_2"
@@ -442,6 +502,7 @@ def run_auto(args):
         args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
     ) as network:
         network.start_and_join(args)
+        test_jwt_endpoint(network, args)
         test_jwt_without_key_policy(network, args)
         if args.enclave_type != "virtual":
             test_jwt_with_sgx_key_policy(network, args)

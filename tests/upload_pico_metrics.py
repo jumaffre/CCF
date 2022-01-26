@@ -46,13 +46,17 @@ benchmark_specs = {
             "Benchmark": "bench_champ_map_get",
             "D": "2048",
         },
-    ],
-    "digest_bench.csv": [
         {
-            "_name": "mbedtls sha256 (/s)^",
-            "Suite": "mbedtls_digest_sha256",
-            "Benchmark": "SHA-256",
-            "D": "524288",
+            "_name": "RB put (/s)^",
+            "Suite": "put",
+            "Benchmark": "bench_rb_map_put",
+            "D": "2048",
+        },
+        {
+            "_name": "RB get (/s)^",
+            "Suite": "get",
+            "Benchmark": "bench_rb_map_get",
+            "D": "2048",
         },
     ],
 }
@@ -86,6 +90,10 @@ if __name__ == "__main__":
                             found_metrics[name].append(
                                 float(format(ops_per_sec, ".2f"))
                             )
+        else:
+            LOG.warning(
+                f"Could not find file {filename}: skipping metrics publishing for this file"
+            )
 
     if found_metrics:
         with cimetrics.upload.metrics(complete=False) as metrics:

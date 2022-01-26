@@ -27,7 +27,7 @@ def minimum_number_of_local_nodes(args):
     """
     If we are using bft then we need to have 3 nodes. CFT will run with 1 nodes, unless it expects a backup
     """
-    if args.consensus == "bft":
+    if args.consensus == "BFT":
         return 3
 
     if args.send_tx_to == "backups":
@@ -63,8 +63,8 @@ def configure_remote_client(args, client_id, client_host, node, command_args):
             "client_" + str(client_id),
             client_host,
             args.client,
-            node.rpc_host,
-            node.rpc_port,
+            node.get_public_rpc_host(),
+            node.get_public_rpc_port(),
             args.workspace,
             args.label,
             args.config,
@@ -141,6 +141,7 @@ def run(get_command, args):
                 remote_client.start()
 
             hard_stop_timeout = 90
+            format_width = len(str(hard_stop_timeout)) + 3
 
             try:
                 with cimetrics.upload.metrics(complete=False) as metrics:
@@ -152,7 +153,7 @@ def run(get_command, args):
                             done = remote_client.check_done()
                             # all the clients need to be done
                             LOG.info(
-                                f"Client {i} has {'completed' if done else 'not completed'} running ({time.time() - start_time:.2f}s / {hard_stop_timeout}s)"
+                                f"Client {i} has {'completed' if done else 'not completed'} running ({time.time() - start_time:>{format_width}.2f}s / {hard_stop_timeout}s)"
                             )
                             stop_waiting = stop_waiting and done
                         if stop_waiting:

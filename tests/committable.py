@@ -5,7 +5,7 @@ import infra.network
 import infra.proc
 import time
 import http
-from ccf.tx_status import TxStatus
+from infra.tx_status import TxStatus
 
 from loguru import logger as LOG
 
@@ -79,7 +79,7 @@ def run(args):
                 )
 
         # Sleep long enough that this primary should be instantly replaced when nodes wake
-        sleep_time = 2 * args.raft_election_timeout_ms / 1000
+        sleep_time = 2 * args.election_timeout_ms / 1000
         LOG.info(f"Sleeping {sleep_time}s")
         time.sleep(sleep_time)
 

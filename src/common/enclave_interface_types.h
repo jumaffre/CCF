@@ -32,7 +32,13 @@ enum CreateNodeStatus
   OEAttesterInitFailed = 8,
 
   /** OpenSSL RDRAND Init Failed */
-  OpenSSLRDRANDInitFailed = 9
+  OpenSSLRDRANDInitFailed = 9,
+
+  /** The reconfiguration method is not supported */
+  ReconfigurationMethodNotSupported = 10,
+
+  /** Host and enclave versions must match */
+  VersionMismatch = 11
 };
 
 constexpr char const* create_node_result_to_str(CreateNodeStatus result)
@@ -79,6 +85,14 @@ constexpr char const* create_node_result_to_str(CreateNodeStatus result)
     {
       return "OpenSSLRDRANDInitFailed";
     }
+    case CreateNodeStatus::ReconfigurationMethodNotSupported:
+    {
+      return "ReconfigurationMethodNotSupported";
+    }
+    case CreateNodeStatus::VersionMismatch:
+    {
+      return "VersionMismatch";
+    }
     default:
     {
       return "Unknown CreateNodeStatus";
@@ -88,7 +102,22 @@ constexpr char const* create_node_result_to_str(CreateNodeStatus result)
 
 enum StartType
 {
-  New = 1,
+  Start = 1,
   Join = 2,
   Recover = 3,
 };
+
+constexpr char const* start_type_to_str(StartType type)
+{
+  switch (type)
+  {
+    case StartType::Start:
+      return "Start";
+    case StartType::Join:
+      return "Join";
+    case StartType::Recover:
+      return "Recover";
+    default:
+      return "Unknown StartType";
+  }
+}

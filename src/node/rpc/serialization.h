@@ -62,32 +62,26 @@ namespace ccf
   DECLARE_JSON_OPTIONAL_FIELDS(
     JoinNetworkNodeToNode::Out::NetworkInfo,
     service_status,
-    endorsed_certificate)
+    endorsed_certificate,
+    reconfiguration_type)
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(JoinNetworkNodeToNode::Out)
   DECLARE_JSON_REQUIRED_FIELDS(JoinNetworkNodeToNode::Out, node_status)
   DECLARE_JSON_OPTIONAL_FIELDS(
     JoinNetworkNodeToNode::Out, node_id, network_info)
-
-  DECLARE_JSON_TYPE(CreateNetworkNodeToNode::In::GenesisInfo)
-  DECLARE_JSON_REQUIRED_FIELDS(
-    CreateNetworkNodeToNode::In::GenesisInfo,
-    members_info,
-    constitution,
-    configuration)
 
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(CreateNetworkNodeToNode::In)
   DECLARE_JSON_REQUIRED_FIELDS(
     CreateNetworkNodeToNode::In,
     node_id,
     certificate_signing_request,
+    node_endorsed_certificate,
     public_key,
-    network_cert,
+    service_cert,
     quote_info,
     public_encryption_key,
     code_digest,
     node_info_network)
-  DECLARE_JSON_OPTIONAL_FIELDS(
-    CreateNetworkNodeToNode::In, node_cert, genesis_info)
+  DECLARE_JSON_OPTIONAL_FIELDS(CreateNetworkNodeToNode::In, genesis_info)
 
   DECLARE_JSON_TYPE(GetCommit::Out)
   DECLARE_JSON_REQUIRED_FIELDS(GetCommit::Out, transaction_id)
@@ -105,14 +99,7 @@ namespace ccf
 
   DECLARE_JSON_TYPE(GetNode::NodeInfo)
   DECLARE_JSON_REQUIRED_FIELDS(
-    GetNode::NodeInfo,
-    node_id,
-    status,
-    host,
-    port,
-    local_host,
-    local_port,
-    primary)
+    GetNode::NodeInfo, node_id, status, primary, rpc_interfaces)
 
   DECLARE_JSON_TYPE(GetNodes::Out)
   DECLARE_JSON_REQUIRED_FIELDS(GetNodes::Out, nodes)
@@ -144,8 +131,4 @@ namespace ccf
 
   DECLARE_JSON_TYPE(UpdateResharing::In)
   DECLARE_JSON_REQUIRED_FIELDS(UpdateResharing::In, rid)
-
-  DECLARE_JSON_TYPE(ObservedReconfigurationCommit::In)
-  DECLARE_JSON_REQUIRED_FIELDS(
-    ObservedReconfigurationCommit::In, from, reconfiguration_id)
 }

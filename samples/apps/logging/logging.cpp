@@ -2,7 +2,6 @@
 // Licensed under the Apache 2.0 License.
 
 // This app's includes
-#include "formatters.h"
 #include "logging_schema.h"
 
 // CCF
@@ -10,8 +9,10 @@
 #include "ccf/app_interface.h"
 #include "ccf/historical_queries_adapter.h"
 #include "ccf/http_query.h"
+#include "ccf/indexing/seqnos_by_key.h"
 #include "ccf/user_frontend.h"
 #include "ccf/version.h"
+#include "crypto/verifier.h"
 
 #include <charconv>
 #define FMT_HEADER_ONLY
@@ -31,6 +32,9 @@ namespace loggingapp
   // the _next_ write transaction to that key.
   using FirstWritesMap = kv::Map<size_t, ccf::SeqNo>;
   static constexpr auto FIRST_WRITES = "first_write_version";
+
+  using RecordsIndexingStrategy = ccf::indexing::LazyStrategy<
+    ccf::indexing::strategies::SeqnosByKey<RecordsMap>>;
 
   // SNIPPET_START: custom_identity
   struct CustomIdentity : public ccf::AuthnIdentity
@@ -133,6 +137,8 @@ namespace loggingapp
 
     metrics::Tracker metrics_tracker;
 
+    std::shared_ptr<RecordsIndexingStrategy> index_per_private_key = nullptr;
+
     static void update_first_write(kv::Tx& tx, size_t id)
     {
       auto first_writes = tx.rw<FirstWritesMap>("first_write_version");
@@ -156,6 +162,10 @@ namespace loggingapp
       get_public_params_schema(nlohmann::json::parse(j_get_public_in)),
       get_public_result_schema(nlohmann::json::parse(j_get_public_out))
     {
+      index_per_private_key =
+        std::make_shared<RecordsIndexingStrategy>(PRIVATE_RECORDS);
+      context.get_indexing_strategies().install_strategy(index_per_private_key);
+
       const ccf::AuthnPolicies auth_policies = {
         ccf::jwt_auth_policy, ccf::user_cert_auth_policy};
 
@@ -298,6 +308,13 @@ namespace loggingapp
         // SNIPPET: public_table_access
         auto records_handle = ctx.tx.template rw<RecordsMap>(PUBLIC_RECORDS);
         records_handle->put(params["id"], in.msg);
+        // SNIPPET_START: set_claims_digest
+        if (in.record_claim)
+        {
+          ctx.rpc_ctx->set_claims_digest(
+            ccf::ClaimsDigest::Digest::from_string(in.msg));
+        }
+        // SNIPPET_END: set_claims_digest
         return ccf::make_success(true);
       };
       // SNIPPET_END: record_public
@@ -418,12 +435,13 @@ namespace loggingapp
           return;
         }
 
-        auto cert = mbedtls::make_unique<mbedtls::X509Crt>();
-
-        const auto& cert_data = ctx.rpc_ctx->session->caller_cert;
-        const auto ret = mbedtls_x509_crt_parse(
-          cert.get(), cert_data.data(), cert_data.size());
-        if (ret != 0)
+        std::shared_ptr<Verifier> verifier;
+        try
+        {
+          const auto& cert_data = ctx.rpc_ctx->session->caller_cert;
+          verifier = make_verifier(cert_data);
+        }
+        catch (const std::exception& ex)
         {
           ctx.rpc_ctx->set_error(
             HTTP_STATUS_INTERNAL_SERVER_ERROR,
@@ -432,7 +450,8 @@ namespace loggingapp
           return;
         }
 
-        const auto log_line = fmt::format("{}: {}", cert->subject, in.msg);
+        const auto log_line =
+          fmt::format("{}: {}", verifier->subject(), in.msg);
         auto records_handle = ctx.tx.template rw<RecordsMap>(PRIVATE_RECORDS);
         records_handle->put(in.id, log_line);
         update_first_write(ctx.tx, in.id);
@@ -812,6 +831,66 @@ namespace loggingapp
         .install();
       // SNIPPET_END: get_historical_with_receipt
 
+      auto get_historical_with_receipt_and_claims =
+        [this](
+          ccf::endpoints::EndpointContext& ctx,
+          ccf::historical::StatePtr historical_state) {
+          const auto pack = ccf::jsonhandler::detect_json_pack(ctx.rpc_ctx);
+
+          // Parse id from query
+          const auto parsed_query =
+            http::parse_query(ctx.rpc_ctx->get_request_query());
+
+          std::string error_reason;
+          size_t id;
+          if (!http::get_query_value(parsed_query, "id", id, error_reason))
+          {
+            ctx.rpc_ctx->set_error(
+              HTTP_STATUS_BAD_REQUEST,
+              ccf::errors::InvalidQueryParameterValue,
+              std::move(error_reason));
+            return;
+          }
+
+          auto historical_tx = historical_state->store->create_read_only_tx();
+          auto records_handle =
+            historical_tx.template ro<RecordsMap>(PUBLIC_RECORDS);
+          const auto v = records_handle->get(id);
+
+          if (v.has_value())
+          {
+            LoggingGetReceipt::Out out;
+            out.msg = v.value();
+            assert(historical_state->receipt);
+            // SNIPPET_START: claims_digest_in_receipt
+            historical_state->receipt->describe(out.receipt);
+            // Claims are expanded as out.msg, so the claims digest is removed
+            // from the receipt to force verification to re-compute it.
+            out.receipt.leaf_components->claims_digest = std::nullopt;
+            // SNIPPET_END: claims_digest_in_receipt
+            ccf::jsonhandler::set_response(std::move(out), ctx.rpc_ctx, pack);
+          }
+          else
+          {
+            ctx.rpc_ctx->set_response_status(HTTP_STATUS_NO_CONTENT);
+          }
+        };
+      make_endpoint(
+        "/log/public/historical_receipt",
+        HTTP_GET,
+        ccf::historical::adapter_v2(
+          get_historical_with_receipt_and_claims,
+          context.get_historical_state(),
+          is_tx_committed),
+        auth_policies)
+        .set_auto_schema<void, LoggingGetReceipt::Out>()
+        .add_query_parameter<size_t>("id")
+        .set_forwarding_required(ccf::endpoints::ForwardingRequired::Never)
+        .set_execute_outside_consensus(
+          ccf::endpoints::ExecuteOutsideConsensus::Locally)
+        .install();
+      // SNIPPET_END: get_historical_with_receipt
+
       static constexpr auto get_historical_range_path =
         "/log/private/historical/range";
       auto get_historical_range = [&,
@@ -952,11 +1031,48 @@ namespace loggingapp
           return;
         }
 
+        const auto indexed_txid =
+          index_per_private_key->get_indexed_watermark();
+        if (indexed_txid.seqno < to_seqno)
+        {
+          index_per_private_key->extend_index_to(
+            {view_of_final_seqno, to_seqno});
+          ctx.rpc_ctx->set_response_status(HTTP_STATUS_ACCEPTED);
+          static constexpr size_t retry_after_seconds = 3;
+          ctx.rpc_ctx->set_response_header(
+            http::headers::RETRY_AFTER, retry_after_seconds);
+          ctx.rpc_ctx->set_response_header(
+            http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
+          ctx.rpc_ctx->set_response_body(fmt::format(
+            "Still constructing index for private records on key {} - indexed "
+            "to {}/{}",
+            id,
+            indexed_txid.seqno,
+            to_seqno));
+          return;
+        }
+
         // Set a maximum range, paginate larger requests
         static constexpr size_t max_seqno_per_page = 2000;
         const auto range_begin = from_seqno;
-        const auto range_end =
-          std::min(to_seqno, range_begin + max_seqno_per_page);
+
+        const auto interesting_seqnos =
+          index_per_private_key->get_write_txs_in_range(
+            id, range_begin, to_seqno, max_seqno_per_page);
+        if (!interesting_seqnos.has_value())
+        {
+          ctx.rpc_ctx->set_response_status(HTTP_STATUS_ACCEPTED);
+          static constexpr size_t retry_after_seconds = 3;
+          ctx.rpc_ctx->set_response_header(
+            http::headers::RETRY_AFTER, retry_after_seconds);
+          ctx.rpc_ctx->set_response_header(
+            http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
+          ctx.rpc_ctx->set_response_body(fmt::format(
+            "Still constructing index for private records at {}", id));
+          return;
+        }
+
+        const auto range_end = interesting_seqnos->back();
 
         // Use hash of request as RequestHandle. WARNING: This means identical
         // requests from different users will collide, and overwrite each
@@ -978,7 +1094,7 @@ namespace loggingapp
         auto& historical_cache = context.get_historical_state();
 
         auto stores =
-          historical_cache.get_store_range(handle, range_begin, range_end);
+          historical_cache.get_stores_for(handle, interesting_seqnos.value());
         if (stores.empty())
         {
           ctx.rpc_ctx->set_response_status(HTTP_STATUS_ACCEPTED);
@@ -997,11 +1113,8 @@ namespace loggingapp
 
         // Process the fetched Stores
         LoggingGetHistoricalRange::Out response;
-        for (size_t i = 0; i < stores.size(); ++i)
+        for (auto& store : stores)
         {
-          const auto store_seqno = range_begin + i;
-          auto& store = stores[i];
-
           auto historical_tx = store->create_read_only_tx();
           auto records_handle =
             historical_tx.template ro<RecordsMap>(PRIVATE_RECORDS);
@@ -1010,7 +1123,7 @@ namespace loggingapp
           if (v.has_value())
           {
             LoggingGetHistoricalRange::Entry e;
-            e.seqno = store_seqno;
+            e.seqno = store->current_txid().version;
             e.id = id;
             e.msg = v.value();
             response.entries.push_back(e);
@@ -1026,22 +1139,32 @@ namespace loggingapp
         if (range_end != to_seqno)
         {
           const auto next_page_start = range_end + 1;
-          const auto next_page_end =
-            std::min(to_seqno, next_page_start + max_seqno_per_page);
+          const auto next_seqnos =
+            index_per_private_key->get_write_txs_in_range(
+              id, next_page_start, to_seqno, max_seqno_per_page);
+          if (next_seqnos.has_value() && !next_seqnos->empty())
+          {
+            const auto next_page_end = next_seqnos->back();
 
-          ccf::historical::RequestHandle next_page_handle =
-            make_handle(next_page_start, next_page_end, id);
-          historical_cache.get_store_range(
-            next_page_handle, next_page_start, next_page_end);
+            ccf::historical::RequestHandle next_page_handle =
+              make_handle(next_page_start, next_page_end, id);
+            historical_cache.get_store_range(
+              next_page_handle, next_page_start, next_page_end);
+          }
 
-          // NB: This path tells the caller to continue to ask until the end of
-          // the range, even if the next response is paginated
-          response.next_link = fmt::format(
-            "/app{}?from_seqno={}&to_seqno={}&id={}",
-            get_historical_range_path,
-            next_page_start,
-            to_seqno,
-            id);
+          // If we don't yet know the next seqnos, or know for sure there are
+          // some, then set a next_link
+          if (!next_seqnos.has_value() || !next_seqnos->empty())
+          {
+            // NB: This path tells the caller to continue to ask until the end
+            // of the range, even if the next response is paginated
+            response.next_link = fmt::format(
+              "/app{}?from_seqno={}&to_seqno={}&id={}",
+              get_historical_range_path,
+              next_page_start,
+              to_seqno,
+              id);
+          }
         }
 
         // Construct the HTTP response
@@ -1054,7 +1177,7 @@ namespace loggingapp
         // ALSO: Assume this response makes it all the way to the client, and
         // they're finished with it, so we can drop the retrieved state. In a
         // real app this may be driven by a separate client request or an LRU
-        historical_cache.drop_request(handle);
+        historical_cache.drop_cached_states(handle);
       };
       make_endpoint(
         get_historical_range_path,
@@ -1066,6 +1189,185 @@ namespace loggingapp
           "from_seqno", ccf::endpoints::QueryParamPresence::OptionalParameter)
         .add_query_parameter<size_t>(
           "to_seqno", ccf::endpoints::QueryParamPresence::OptionalParameter)
+        .add_query_parameter<size_t>("id")
+        .set_forwarding_required(ccf::endpoints::ForwardingRequired::Never)
+        .set_execute_outside_consensus(
+          ccf::endpoints::ExecuteOutsideConsensus::Locally)
+        .install();
+
+      static constexpr auto get_historical_sparse_path =
+        "/log/private/historical/sparse";
+      auto get_historical_sparse = [&, this](
+                                     ccf::endpoints::EndpointContext& ctx) {
+        // Parse arguments from query
+        const auto parsed_query =
+          http::parse_query(ctx.rpc_ctx->get_request_query());
+
+        std::string error_reason;
+
+        size_t id;
+        if (!http::get_query_value(parsed_query, "id", id, error_reason))
+        {
+          ctx.rpc_ctx->set_error(
+            HTTP_STATUS_BAD_REQUEST,
+            ccf::errors::InvalidQueryParameterValue,
+            std::move(error_reason));
+          return;
+        }
+
+        std::vector<size_t> seqnos;
+        {
+          std::string seqnos_s;
+          if (!http::get_query_value(
+                parsed_query, "seqnos", seqnos_s, error_reason))
+          {
+            ctx.rpc_ctx->set_error(
+              HTTP_STATUS_BAD_REQUEST,
+              ccf::errors::InvalidQueryParameterValue,
+              std::move(error_reason));
+            return;
+          }
+
+          const auto terms = nonstd::split(seqnos_s, ",");
+          for (const auto& term : terms)
+          {
+            size_t val;
+            const auto [p, ec] = std::from_chars(term.begin(), term.end(), val);
+            if (ec != std::errc() || p != term.end())
+            {
+              ctx.rpc_ctx->set_error(
+                HTTP_STATUS_BAD_REQUEST,
+                ccf::errors::InvalidQueryParameterValue,
+                fmt::format("Unable to parse '{}' as a seqno", term));
+              return;
+            }
+            seqnos.push_back(val);
+          }
+        }
+
+        // End of range must be committed
+        if (consensus == nullptr)
+        {
+          ctx.rpc_ctx->set_error(
+            HTTP_STATUS_INTERNAL_SERVER_ERROR,
+            ccf::errors::InternalError,
+            "Node is not fully operational");
+          return;
+        }
+
+        std::sort(seqnos.begin(), seqnos.end());
+
+        const auto final_seqno = seqnos.back();
+        const auto view_of_final_seqno = consensus->get_view(final_seqno);
+        const auto committed_seqno = consensus->get_committed_seqno();
+        const auto committed_view = consensus->get_view(committed_seqno);
+        const auto tx_status = ccf::evaluate_tx_status(
+          view_of_final_seqno,
+          final_seqno,
+          view_of_final_seqno,
+          committed_view,
+          committed_seqno);
+        if (tx_status != ccf::TxStatus::Committed)
+        {
+          ctx.rpc_ctx->set_error(
+            HTTP_STATUS_BAD_REQUEST,
+            ccf::errors::InvalidInput,
+            fmt::format(
+              "Only committed transactions can be queried. Transaction {}.{} "
+              "is {}",
+              view_of_final_seqno,
+              final_seqno,
+              ccf::tx_status_to_str(tx_status)));
+          return;
+        }
+
+        // NB: Currently ignoring pagination, as this endpoint is temporary
+
+        // Use hash of request as RequestHandle. WARNING: This means identical
+        // requests from different users will collide, and overwrite each
+        // other's progress!
+        auto make_handle = [](size_t begin, size_t end, size_t id) {
+          auto size = sizeof(begin) + sizeof(end) + sizeof(id);
+          std::vector<uint8_t> v(size);
+          auto data = v.data();
+          serialized::write(data, size, begin);
+          serialized::write(data, size, end);
+          serialized::write(data, size, id);
+          return std::hash<decltype(v)>()(v);
+        };
+
+        ccf::historical::RequestHandle handle;
+        {
+          std::hash<size_t> h;
+          handle = h(id);
+          for (const auto& seqno : seqnos)
+          {
+            ds::hashutils::hash_combine(handle, seqno, h);
+          }
+        }
+
+        // Fetch the requested range
+        auto& historical_cache = context.get_historical_state();
+
+        ccf::historical::SeqNoCollection seqno_collection(
+          seqnos.begin(), seqnos.end());
+
+        auto stores = historical_cache.get_stores_for(handle, seqno_collection);
+        if (stores.empty())
+        {
+          ctx.rpc_ctx->set_response_status(HTTP_STATUS_ACCEPTED);
+          static constexpr size_t retry_after_seconds = 3;
+          ctx.rpc_ctx->set_response_header(
+            http::headers::RETRY_AFTER, retry_after_seconds);
+          ctx.rpc_ctx->set_response_header(
+            http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
+          ctx.rpc_ctx->set_response_body(fmt::format(
+            "Historical transactions are not yet available, fetching now"));
+          return;
+        }
+
+        // Process the fetched Stores
+        LoggingGetHistoricalRange::Out response;
+        for (const auto& store : stores)
+        {
+          auto historical_tx = store->create_read_only_tx();
+          auto records_handle =
+            historical_tx.template ro<RecordsMap>(PRIVATE_RECORDS);
+          const auto v = records_handle->get(id);
+
+          if (v.has_value())
+          {
+            LoggingGetHistoricalRange::Entry e;
+            e.seqno = store->current_txid().version;
+            e.id = id;
+            e.msg = v.value();
+            response.entries.push_back(e);
+          }
+          // This response do not include any entry when the given key wasn't
+          // modified at this seqno. It could instead indicate that the store
+          // was checked with an empty tombstone object, but this approach gives
+          // smaller responses
+        }
+
+        // Construct the HTTP response
+        nlohmann::json j_response = response;
+        ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
+        ctx.rpc_ctx->set_response_header(
+          http::headers::CONTENT_TYPE, http::headervalues::contenttype::JSON);
+        ctx.rpc_ctx->set_response_body(j_response.dump());
+
+        // ALSO: Assume this response makes it all the way to the client, and
+        // they're finished with it, so we can drop the retrieved state. In a
+        // real app this may be driven by a separate client request or an LRU
+        historical_cache.drop_cached_states(handle);
+      };
+      make_endpoint(
+        get_historical_sparse_path,
+        HTTP_GET,
+        get_historical_sparse,
+        auth_policies)
+        .set_auto_schema<void, LoggingGetHistoricalRange::Out>()
+        .add_query_parameter<std::string>("seqnos")
         .add_query_parameter<size_t>("id")
         .set_forwarding_required(ccf::endpoints::ForwardingRequired::Never)
         .set_execute_outside_consensus(
@@ -1191,7 +1493,7 @@ namespace loggingapp
         "This CCF sample app implements a simple logging application, securely "
         "recording messages at client-specified IDs. It demonstrates most of "
         "the features available to CCF apps.";
-      logger_handlers.openapi_info.document_version = "1.2.0";
+      logger_handlers.openapi_info.document_version = "1.6.0";
     }
   };
 }

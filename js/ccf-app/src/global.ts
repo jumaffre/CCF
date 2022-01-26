@@ -242,6 +242,14 @@ export interface CCFRpc {
    * The default is `false`.
    */
   setApplyWrites(force: boolean): void;
+
+  /**
+   * Set a claims digest to be associated with the transaction if it succeeds. This
+   * digest can later be accessed from the receipt, and expanded into a full claim.
+   *
+   * The `digest` argument must be a sha-256 ArrayBuffer, eg. produced by {@link CCF.digest}
+   */
+  setClaimsDigest(digest: ArrayBuffer): void;
 }
 
 export interface CCFConsensus {
@@ -252,9 +260,24 @@ export interface CCFConsensus {
 
   /**
    * Get the status of a transaction by ID, provided as a view+seqno pair.
-   * This is a node-local property - while it will converge on all nodes in
-   * a healthy network, it is derived from distributed state rather than
-   * distributed itself.
+   *
+   * Note that this value is the node's local understanding of the status
+   * of that transaction in the network at call time. For a given TxID, the
+   * initial status is always UNKNOWN, and eventually becomes COMMITTED or
+   * INVALID. See the documentation section titled "Verifying Transactions"
+   * for more detail.
+   *
+   *         UNKNOWN [Initial status]
+   *          v  ^
+   *        PENDING
+   *        v     v
+   *  COMMITTED INVALID [Final statuses]
+   *
+   * This status is not sampled atomically per handler: if this is called
+   * multiple times in a transaction handler, later calls may see more up to
+   * date values than earlier calls. Once a final state (COMMITTED or INVALID)
+   * has been reached, no further changes are possible.
+   *
    */
   getStatusForTxId(view: number, seqno: number): TransactionStatus;
 
@@ -276,7 +299,7 @@ export interface CCFHistorical {
    * to completely fetch and validate. The call should be repeated later with
    * the same arguments to retrieve the requested entries. This state is kept
    * until it is deleted for one of the following reasons:
-   *  - A call to {@linkcode dropCachedStateRange}
+   *  - A call to {@linkcode dropCachedStates}
    *  - `seconds_until_expiry` seconds elapse without calling this function
    *  - This handle is used to request a different seqno or range
    *

@@ -7,7 +7,6 @@
 #include "http/http_rpc_context.h"
 #include "kv/kv_types.h"
 #include "node/node_to_node.h"
-#include "node/request_tracker.h"
 
 namespace ccf
 {
@@ -27,7 +26,6 @@ namespace ccf
     std::shared_ptr<enclave::AbstractRPCResponder> rpcresponder;
     std::shared_ptr<ChannelProxy> n2n_channels;
     std::shared_ptr<enclave::RPCMap> rpc_map;
-    std::shared_ptr<aft::RequestTracker> request_tracker;
     ConsensusType consensus_type;
     NodeId self;
 
@@ -50,17 +48,10 @@ namespace ccf
       self = self_;
     }
 
-    void set_request_tracker(
-      std::shared_ptr<aft::RequestTracker> request_tracker_)
-    {
-      request_tracker = request_tracker_;
-    }
-
     bool forward_command(
       std::shared_ptr<enclave::RpcContext> rpc_ctx,
       const NodeId& to,
-      std::set<NodeId> nodes,
-      const std::vector<uint8_t>& caller_cert)
+      const std::vector<uint8_t>& caller_cert) override
     {
       IsCallerCertForwarded include_caller = false;
       const auto method = rpc_ctx->get_method();
@@ -88,38 +79,8 @@ namespace ccf
       ForwardedHeader msg = {
         ForwardedMsg::forwarded_cmd, rpc_ctx->frame_format()};
 
-      if (consensus_type == ConsensusType::BFT && !nodes.empty())
-      {
-        send_request_hash_to_nodes(rpc_ctx, nodes, to);
-      }
-
       return n2n_channels->send_encrypted(
         to, NodeMsgType::forwarded_msg, plain, msg);
-    }
-
-    void send_request_hash_to_nodes(
-      std::shared_ptr<enclave::RpcContext> rpc_ctx,
-      std::set<NodeId> nodes,
-      const NodeId& skip_node)
-    {
-      const auto& raw_request = rpc_ctx->get_serialised_request();
-      auto data_ = raw_request.data();
-      auto size_ = raw_request.size();
-
-      MessageHash msg(
-        ForwardedMsg::request_hash, crypto::Sha256Hash({data_, size_}));
-
-      for (auto to : nodes)
-      {
-        if (self != to && skip_node != to)
-        {
-          n2n_channels->send_authenticated(to, NodeMsgType::forwarded_msg, msg);
-        }
-      }
-
-      request_tracker->insert(
-        msg.hash,
-        threading::ThreadMessaging::thread_messaging.get_current_time_offset());
     }
 
     std::shared_ptr<enclave::RpcContext> recv_forwarded_command(
@@ -220,25 +181,6 @@ namespace ccf
       return std::make_pair(client_session_id, rpc);
     }
 
-    std::optional<MessageHash> recv_request_hash(
-      const NodeId& from, const uint8_t* data, size_t size)
-    {
-      MessageHash m;
-
-      try
-      {
-        m = n2n_channels->template recv_authenticated<MessageHash>(
-          from, data, size);
-      }
-      catch (const std::logic_error& err)
-      {
-        LOG_FAIL_FMT("Invalid forwarded hash");
-        LOG_DEBUG_FMT("Invalid forwarded hash: {}", err.what());
-        return std::nullopt;
-      }
-      return m;
-    }
-
     void recv_message(const ccf::NodeId& from, const uint8_t* data, size_t size)
     {
       try
@@ -322,21 +264,6 @@ namespace ccf
               return;
             }
 
-            break;
-          }
-
-          case ForwardedMsg::request_hash:
-          {
-            auto hash = recv_request_hash(from, data, size);
-            if (!hash.has_value())
-            {
-              return;
-            }
-
-            request_tracker->insert(
-              hash->hash,
-              threading::ThreadMessaging::thread_messaging
-                .get_current_time_offset());
             break;
           }
 

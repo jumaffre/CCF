@@ -14,18 +14,12 @@ def run(args):
         network.start_and_join(args)
         primary, _ = network.find_primary()
 
-        cmd = [
-            "python",
-            args.client_tutorial,
-            network.common_dir,
-        ]
-        rc = infra.proc.ccall(*cmd).returncode
-        assert rc == 0, f"Failed to run tutorial script: {rc}"
-
+    uncommitted_ledger_dir, committed_ledger_dirs = list(primary.get_ledger())
     cmd = [
         "python",
         args.ledger_tutorial,
-        primary.get_ledger()[1],
+        *committed_ledger_dirs,
+        uncommitted_ledger_dir,
     ]
     rc = infra.proc.ccall(*cmd).returncode
     assert rc == 0, f"Failed to run tutorial script: {rc}"

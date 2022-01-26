@@ -5,6 +5,7 @@
 #include "ccf/receipt.h"
 #include "ccf/tx_id.h"
 #include "consensus/ledger_enclave_types.h"
+#include "ds/contiguous_set.h"
 #include "kv/store.h"
 #include "node/history.h"
 #include "node/tx_receipt.h"
@@ -52,6 +53,8 @@ namespace ccf::historical
 
   using ExpiryDuration = std::chrono::seconds;
 
+  using SeqNoCollection = ds::ContiguousSet<ccf::SeqNo>;
+
   /** Stores the progress of historical query requests.
    *
    * A request will generally need to be made multiple times (with the same
@@ -59,10 +62,10 @@ namespace ccf::historical
    * is asynchronously retrieved from the ledger and then validated. If the same
    * handle is used for a new range, the state for the old range will be
    * discarded. State is also discarded after the handle's expiry duration, or
-   * when drop_request is called for a given handle. The management of requests
-   * (how many unique handles are concurrently active, how they are correlated
-   * across HTTP requests, how the active quota is divided between callers) is
-   * left to the calling system.
+   * when drop_cached_states is called for a given handle. The management of
+   * requests (how many unique handles are concurrently active, how they are
+   * correlated across HTTP requests, how the active quota is divided between
+   * callers) is left to the calling system.
    */
   class AbstractStateCache
   {
@@ -115,7 +118,7 @@ namespace ccf::historical
      * to completely fetch and validate. The call should be repeated later with
      * the same arguments to retrieve the requested entries. This state is kept
      * until it is deleted for one of the following reasons:
-     *  - A call to @c drop_request
+     *  - A call to @c drop_cached_states
      *  - @c seconds_until_expiry seconds elapse without calling this function
      *  - This handle is used to request a different seqno or range
      *
@@ -152,11 +155,29 @@ namespace ccf::historical
     virtual std::vector<StatePtr> get_state_range(
       RequestHandle handle, ccf::SeqNo start_seqno, ccf::SeqNo end_seqno) = 0;
 
+    /** Retrieve stores for a set of given indices.
+     */
+    virtual std::vector<StorePtr> get_stores_for(
+      RequestHandle handle,
+      const SeqNoCollection& seqnos,
+      ExpiryDuration seconds_until_expiry) = 0;
+    virtual std::vector<StorePtr> get_stores_for(
+      RequestHandle handle, const SeqNoCollection& seqnos) = 0;
+
+    /** Retrieve states for a set of given indices.
+     */
+    virtual std::vector<StatePtr> get_states_for(
+      RequestHandle handle,
+      const SeqNoCollection& seqnos,
+      ExpiryDuration seconds_until_expiry) = 0;
+    virtual std::vector<StatePtr> get_states_for(
+      RequestHandle handle, const SeqNoCollection& seqnos) = 0;
+
     /** Drop state for the given handle.
      *
      * May be used to free up space once a historical query has been resolved,
-     * more aggressively than waiting for the requests to expire.
+     * more aggressively than waiting for the states to expire.
      */
-    virtual bool drop_request(RequestHandle handle) = 0;
+    virtual bool drop_cached_states(RequestHandle handle) = 0;
   };
 }

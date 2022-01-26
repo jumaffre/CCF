@@ -14,14 +14,12 @@
 #include "node_signature_verify.h"
 #include "nodes.h"
 #include "signatures.h"
-#include "tls/tls.h"
 
 #include <array>
 #include <deque>
 #include <string.h>
 
 #define HAVE_OPENSSL
-#define HAVE_MBEDTLS
 // merklecpp traces are off by default, even when CCF tracing is enabled
 // #include "merklecpp_trace.h"
 #include <merklecpp/merklecpp.h>
@@ -56,7 +54,11 @@ namespace ccf
     COMPACT
   };
 
+#ifdef OVERRIDE_MAX_HISTORY_LEN
+  constexpr int MAX_HISTORY_LEN = OVERRIDE_MAX_HISTORY_LEN;
+#else
   constexpr int MAX_HISTORY_LEN = 1000;
+#endif
 
   static std::ostream& operator<<(std::ostream& os, HashOp flag)
   {
@@ -84,7 +86,7 @@ namespace ccf
 
   static inline void log_hash(const crypto::Sha256Hash& h, HashOp flag)
   {
-    LOG_DEBUG_FMT("History [{}] {}", flag, h);
+    LOG_TRACE_FMT("History [{}] {}", flag, h);
   }
 
   class NullTxHistoryPendingTx : public kv::PendingTx
@@ -136,6 +138,11 @@ namespace ccf
       version++;
     }
 
+    void append_entry(const crypto::Sha256Hash& digest) override
+    {
+      version++;
+    }
+
     kv::TxHistory::Result verify_and_sign(
       PrimarySignature&, kv::Term*, kv::Configuration::Nodes&) override
     {
@@ -181,15 +188,6 @@ namespace ccf
     }
 
     void try_emit_signature() override {}
-
-    bool add_request(
-      kv::TxHistory::RequestID,
-      const std::vector<uint8_t>&,
-      const std::vector<uint8_t>&,
-      uint8_t) override
-    {
-      return true;
-    }
 
     crypto::Sha256Hash get_replicated_state_root() override
     {
@@ -323,34 +321,8 @@ namespace ccf
         ccf::Tables::SERIALISED_MERKLE_TREE);
       crypto::Sha256Hash root = history.get_replicated_state_root();
 
-      Nonce hashed_nonce;
       std::vector<uint8_t> primary_sig;
       auto consensus = store.get_consensus();
-      if (consensus != nullptr && consensus->type() == ConsensusType::BFT)
-      {
-        auto progress_tracker = store.get_progress_tracker();
-        CCF_ASSERT(progress_tracker != nullptr, "progress_tracker is not set");
-        auto r = progress_tracker->record_primary(
-          txid, id, true, root, primary_sig, hashed_nonce);
-        if (r != kv::TxHistory::Result::OK)
-        {
-          throw ccf::ccf_logic_error(fmt::format(
-            "Expected success when primary added signature to the "
-            "progress "
-            "tracker. r:{}, view:{}, seqno:{}",
-            r,
-            txid.term,
-            txid.version));
-        }
-
-        // The nonce is generated in progress_racker->record_primary so it must
-        // exist.
-        hashed_nonce = progress_tracker->get_node_hashed_nonce(txid).value();
-      }
-      else
-      {
-        hashed_nonce.h.fill(0);
-      }
 
       primary_sig = kp.sign_hash(root.h.data(), root.h.size());
 
@@ -361,16 +333,9 @@ namespace ccf
         commit_txid.version,
         commit_txid.term,
         root,
-        hashed_nonce,
+        {}, // Nonce is currently empty
         primary_sig,
         endorsed_cert);
-
-      if (consensus != nullptr && consensus->type() == ConsensusType::BFT)
-      {
-        auto progress_tracker = store.get_progress_tracker();
-        CCF_ASSERT(progress_tracker != nullptr, "progress_tracker is not set");
-        progress_tracker->record_primary_signature(txid, primary_sig);
-      }
 
       signatures->put(sig_value);
       serialised_tree->put(
@@ -408,7 +373,7 @@ namespace ccf
       tree = new HistoryTree(serialised);
     }
 
-    void append(crypto::Sha256Hash& hash)
+    void append(const crypto::Sha256Hash& hash)
     {
       tree->insert(merkle::Hash(hash.h));
     }
@@ -681,17 +646,6 @@ namespace ccf
 
       kv::TxHistory::Result result = kv::TxHistory::Result::OK;
 
-      auto progress_tracker = store.get_progress_tracker();
-      CCF_ASSERT(progress_tracker != nullptr, "progress_tracker is not set");
-      result = progress_tracker->record_primary(
-        {sig.view, sig.seqno},
-        sig.node,
-        false,
-        sig.root,
-        sig.sig,
-        sig.hashed_nonce,
-        config);
-
       sig.node = id;
       sig.sig = kp.sign_hash(sig.root.h.data(), sig.root.h.size());
 
@@ -834,8 +788,8 @@ namespace ccf
 
     bool verify_proof(const std::vector<uint8_t>& v) override
     {
-      std::lock_guard<std::mutex> guard(state_lock);
       Proof proof(v);
+      std::lock_guard<std::mutex> guard(state_lock);
       return replicated_state_tree.verify(proof);
     }
 
@@ -846,29 +800,19 @@ namespace ccf
       return {leaf.h.begin(), leaf.h.end()};
     }
 
-    bool add_request(
-      kv::TxHistory::RequestID id,
-      const std::vector<uint8_t>& caller_cert,
-      const std::vector<uint8_t>& request,
-      uint8_t frame_format) override
-    {
-      LOG_DEBUG_FMT("HISTORY: add_request {0}", id);
-
-      auto consensus = store.get_consensus();
-      if (!consensus)
-      {
-        return false;
-      }
-
-      return consensus->on_request({id, request, caller_cert, frame_format});
-    }
-
     void append(const std::vector<uint8_t>& data) override
     {
-      std::lock_guard<std::mutex> guard(state_lock);
       crypto::Sha256Hash rh({data.data(), data.size()});
       log_hash(rh, APPEND);
+      std::lock_guard<std::mutex> guard(state_lock);
       replicated_state_tree.append(rh);
+    }
+
+    void append_entry(const crypto::Sha256Hash& digest) override
+    {
+      log_hash(digest, APPEND);
+      std::lock_guard<std::mutex> guard(state_lock);
+      replicated_state_tree.append(digest);
     }
 
     void set_endorsed_certificate(const crypto::Pem& cert) override

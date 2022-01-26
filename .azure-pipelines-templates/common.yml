@@ -13,6 +13,12 @@ jobs:
       - checkout: self
         clean: true
 
+      - ${{ if parameters.fetch_v8 }}:
+          - template: fetch_v8.yml
+            parameters:
+              target: ${{ parameters.target }}
+              v8_mode: ${{ parameters.fetch_v8 }}
+
       - template: cmake.yml
         parameters:
           cmake_args: "${{ parameters.cmake_args }}"
@@ -36,6 +42,8 @@ jobs:
           - template: metrics.yml
 
       - ${{ if and(eq(parameters.suffix, 'Release'), eq(parameters.target, 'SGX')) }}:
+          - template: cg.yml
           - template: publish_tls_report.yml
           - template: publish_compatibility_report.yml
           - template: install.yml
+          - template: publish_sbom.yml

@@ -10,6 +10,7 @@
 #include "consensus/aft/request.h"
 #include "ds/files.h"
 #include "ds/logger.h"
+#include "frontend_test_infra.h"
 #include "kv/map.h"
 #include "kv/test/null_encryptor.h"
 #include "kv/test/stub_consensus.h"
@@ -32,8 +33,6 @@ std::atomic<uint16_t> threading::ThreadMessaging::thread_count = 0;
 
 using namespace ccf;
 using namespace std;
-
-static constexpr auto default_pack = serdes::Pack::MsgPack;
 
 class BaseTestFrontend : public SimpleUserRpcFrontend
 {
@@ -395,10 +394,6 @@ public:
   }
 };
 
-// used throughout
-auto kp = crypto::make_key_pair();
-auto encryptor = std::make_shared<kv::NullTxEncryptor>();
-
 NetworkState bft_network(ConsensusType::BFT);
 auto history_kp = crypto::make_key_pair();
 
@@ -450,17 +445,16 @@ nlohmann::json parse_response_body(
 }
 
 // callers used throughout
-auto user_caller = kp -> self_sign("CN=name");
+auto user_caller = kp -> self_sign("CN=name", valid_from, valid_to);
 auto user_caller_der = crypto::make_verifier(user_caller) -> cert_der();
 
-auto member_caller = kp -> self_sign("CN=name_member");
-auto member_caller_der = crypto::make_verifier(member_caller) -> cert_der();
+auto member_caller_der = crypto::make_verifier(member_cert) -> cert_der();
 
-auto node_caller = kp -> self_sign("CN=node");
+auto node_caller = kp -> self_sign("CN=node", valid_from, valid_to);
 auto node_caller_der = crypto::make_verifier(node_caller) -> cert_der();
 
 auto kp_other = crypto::make_key_pair();
-auto invalid_caller = kp_other -> self_sign("CN=name");
+auto invalid_caller = kp_other -> self_sign("CN=name", valid_from, valid_to);
 auto invalid_caller_der = crypto::make_verifier(invalid_caller) -> cert_der();
 
 auto anonymous_caller_der = std::vector<uint8_t>();
@@ -495,7 +489,7 @@ void prepare_callers(NetworkState& network)
   GenesisGenerator g(network, tx);
   g.create_service({});
   user_id = g.add_user({user_caller});
-  member_id = g.add_member(member_caller);
+  member_id = g.add_member(member_cert);
   invalid_member_id = g.add_member(invalid_caller);
   CHECK(tx.commit() == kv::CommitResult::SUCCESS);
 }
@@ -513,45 +507,6 @@ void add_callers_bft_store()
   g.create_service({});
   user_id = g.add_user({user_caller});
   CHECK(gen_tx.commit() == kv::CommitResult::SUCCESS);
-}
-
-TEST_CASE("process_bft")
-{
-  add_callers_bft_store();
-  TestUserFrontend frontend(*bft_network.tables);
-  auto simple_call = create_simple_request();
-
-  const nlohmann::json call_body = {{"foo", "bar"}, {"baz", 42}};
-  const auto serialized_body = serdes::pack(call_body, default_pack);
-  simple_call.set_body(&serialized_body);
-
-  kv::TxHistory::RequestID rid = {1, 1};
-
-  const auto serialized_call = simple_call.build_request();
-  aft::Request request = {
-    rid, user_caller_der, serialized_call, enclave::FrameFormat::http};
-
-  auto session = std::make_shared<enclave::SessionContext>(
-    enclave::InvalidSessionId, user_caller_der);
-  auto ctx = enclave::make_rpc_context(session, request.raw);
-  ctx->execute_on_node = true;
-  const auto prescribed_commit_version =
-    bft_network.tables->current_version() + 1;
-  const auto max_conflict_version = kv::NoVersion;
-  const auto replicated_view = ccf::VIEW_UNKNOWN;
-  frontend.process_bft(
-    ctx, prescribed_commit_version, max_conflict_version, replicated_view);
-
-  auto tx = bft_network.tables->create_tx();
-  auto aft_requests = tx.rw<aft::RequestsMap>(ccf::Tables::AFT_REQUESTS);
-  auto request_value = aft_requests->get();
-  REQUIRE(request_value.has_value());
-
-  aft::Request deserialised_req = request_value.value();
-
-  REQUIRE(deserialised_req.caller_cert == user_caller_der);
-  REQUIRE(deserialised_req.raw == serialized_call);
-  REQUIRE(deserialised_req.frame_format == enclave::FrameFormat::http);
 }
 
 TEST_CASE("SignedReq to and from json")
@@ -1203,7 +1158,7 @@ TEST_CASE("Forwarding" * doctest::test_suite("forwarding"))
     REQUIRE(channel_stub->is_empty());
 
     const auto response = parse_response(r.value());
-    CHECK(response.status == HTTP_STATUS_TEMPORARY_REDIRECT);
+    CHECK(response.status == HTTP_STATUS_INTERNAL_SERVER_ERROR);
   }
 
   user_frontend_backup.set_cmd_forwarder(backup_forwarder);
@@ -1268,22 +1223,24 @@ TEST_CASE("Forwarding" * doctest::test_suite("forwarding"))
     auto response =
       parse_response(user_frontend_backup.process_forwarded(fwd_ctx));
 
-    CHECK(response.status == HTTP_STATUS_TEMPORARY_REDIRECT);
+    // Command was already forwarded
+    CHECK(response.status == HTTP_STATUS_SERVICE_UNAVAILABLE);
   }
 
   {
     // A write was executed on this frontend (above), so reads must be
     // forwarded too for session consistency
     INFO("Read command is now forwarded to primary on this session");
+
     TestUserFrontend user_frontend_backup_read(*network_backup.tables);
+    user_frontend_backup_read.set_cmd_forwarder(backup_forwarder);
     REQUIRE(channel_stub->is_empty());
 
     const auto r = user_frontend_backup_read.process(backup_ctx);
-    REQUIRE(r.has_value());
-    REQUIRE(channel_stub->is_empty());
+    REQUIRE(!r.has_value());
+    REQUIRE(channel_stub->size() == 1);
 
-    const auto response = parse_response(r.value());
-    CHECK(response.status == HTTP_STATUS_TEMPORARY_REDIRECT);
+    channel_stub->clear();
   }
 
   {
@@ -1452,7 +1409,7 @@ TEST_CASE("Memberfrontend forwarding" * doctest::test_suite("forwarding"))
     parse_response(member_frontend_primary.process_forwarded(fwd_ctx));
   CHECK(response.status == HTTP_STATUS_OK);
 
-  CHECK(member_frontend_primary.last_caller_cert == member_caller);
+  CHECK(member_frontend_primary.last_caller_cert == member_cert);
   CHECK(member_frontend_primary.last_caller_id.value() == member_id.value());
 }
 

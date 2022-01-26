@@ -5,6 +5,7 @@
 #include "consensus/ledger_enclave_types.h"
 #include "ds/ccf_assert.h"
 #include "ds/serialized.h"
+#include "kv/kv_types.h"
 #include "kv/serialised_entry_format.h"
 
 namespace consensus
@@ -23,19 +24,29 @@ namespace consensus
     {}
 
     /**
-     * Put a single entry to be written the ledger, when primary.
+     * Put a single entry to be written to the ledger, when primary.
      *
      * @param entry Serialised entry
-     * @param globally_committable True is entry is signature transaction
+     * @param globally_committable True if entry is signature transaction
      * @param force_chunk Force new ledger chunk to be created after this entry
      * (only if globally_committable)
+     * @param term Consensus term of entry
+     * @param index Index (seqno) of entry
      */
     void put_entry(
       const std::vector<uint8_t>& entry,
       bool globally_committable,
-      bool force_chunk = false)
+      bool force_chunk,
+      kv::Term term,
+      kv::Version index)
     {
-      put_entry(entry.data(), entry.size(), globally_committable, force_chunk);
+      put_entry(
+        entry.data(),
+        entry.size(),
+        globally_committable,
+        force_chunk,
+        term,
+        index);
     }
 
     /**
@@ -43,9 +54,11 @@ namespace consensus
      *
      * @param data Serialised entry start
      * @param size Serialised entry size
-     * @param globally_committable True is entry is signature transaction
+     * @param globally_committable True if entry is signature transaction
      * @param force_chunk Force new ledger chunk to be created after this entry
      * (only if globally_committable)
+     * @param term Consensus term of entry
+     * @param index Index (seqno) of entry
      *
      * Note: The entry should already contain its own header.
      */
@@ -53,7 +66,9 @@ namespace consensus
       const uint8_t* data,
       size_t size,
       bool globally_committable,
-      bool force_chunk = false)
+      bool force_chunk,
+      kv::Term term,
+      kv::Version index)
     {
       CCF_ASSERT_FMT(
         globally_committable || !force_chunk,

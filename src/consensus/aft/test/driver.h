@@ -40,15 +40,20 @@ struct LedgerStubProxy_Mermaid : public aft::LedgerStubProxy
   void put_entry(
     const std::vector<uint8_t>& data,
     bool globally_committable,
-    bool force_chunk) override
+    bool force_chunk,
+    kv::Term term,
+    kv::Version index) override
   {
     RAFT_DRIVER_OUT << fmt::format(
-                         "  {}->>{}: [ledger] appending: {}",
+                         "  {}->>{}: [ledger] appending: {}.{}={}",
                          _id,
                          _id,
+                         term,
+                         index,
                          stringify(data))
                     << std::endl;
-    aft::LedgerStubProxy::put_entry(data, globally_committable, force_chunk);
+    aft::LedgerStubProxy::put_entry(
+      data, globally_committable, force_chunk, term, index);
   }
 
   void truncate(aft::Index idx) override
@@ -95,8 +100,7 @@ struct LoggingStubStoreSig_Mermaid : public aft::LoggingStubStoreSig
 };
 
 using ms = std::chrono::milliseconds;
-using TRaft = aft::
-  Aft<LedgerStubProxy_Mermaid, aft::ChannelStubProxy, aft::StubSnapshotter>;
+using TRaft = aft::Aft<LedgerStubProxy_Mermaid, aft::StubSnapshotter>;
 using Store = LoggingStubStoreSig_Mermaid;
 using Adaptor = aft::Adaptor<Store>;
 
@@ -127,23 +131,17 @@ public:
       ccf::NodeId node_id(node_id_s);
 
       auto kv = std::make_shared<Store>(node_id);
+      const consensus::Configuration settings{
+        ConsensusType::CFT, {"10ms"}, {"100ms"}};
       auto raft = std::make_shared<TRaft>(
-        ConsensusType::CFT,
+        settings,
         std::make_unique<Adaptor>(kv),
         std::make_unique<LedgerStubProxy_Mermaid>(node_id),
         std::make_shared<aft::ChannelStubProxy>(),
         std::make_shared<aft::StubSnapshotter>(),
-        nullptr,
-        nullptr,
         std::make_shared<aft::State>(node_id),
         nullptr,
-        std::make_shared<aft::RequestTracker>(),
-        nullptr,
-        nullptr,
-        nullptr,
-        ms(10),
-        ms(100),
-        ms(100));
+        nullptr);
       raft->start_ticking();
 
       _nodes.emplace(node_id, NodeDriver{kv, raft});
@@ -328,10 +326,10 @@ public:
                          "  Note right of {}: {} @{}.{} (committed {})",
                          node_id,
                          raft->is_primary() ? "P" :
-                                              (raft->is_follower() ? "F" : "C"),
-                         raft->get_term(),
+                                              (raft->is_backup() ? "F" : "C"),
+                         raft->get_view(),
                          raft->get_last_idx(),
-                         raft->get_commit_idx())
+                         raft->get_committed_seqno())
                     << std::endl;
   }
 
@@ -391,7 +389,7 @@ public:
 
           auto& sender_raft = _nodes.at(node_id).raft;
           const auto payload_opt =
-            sender_raft->ledger->get_append_entries_payload(ae, sender_raft);
+            sender_raft->ledger->get_append_entries_payload(ae);
 
           if (!payload_opt.has_value())
           {
@@ -486,7 +484,7 @@ public:
     {
       if (node_driver.raft->is_primary())
       {
-        primaries.emplace_back(node_driver.raft->get_term(), node_id);
+        primaries.emplace_back(node_driver.raft->get_view(), node_id);
       }
     }
 
@@ -632,9 +630,9 @@ public:
   {
     auto [target_id, nd] = *_nodes.begin();
     auto& target_raft = nd.raft;
-    const auto target_term = target_raft->get_term();
+    const auto target_term = target_raft->get_view();
     const auto target_last_idx = target_raft->get_last_idx();
-    const auto target_commit_idx = target_raft->get_commit_idx();
+    const auto target_commit_idx = target_raft->get_committed_seqno();
 
     const auto target_final_entry =
       target_raft->ledger->get_entry_by_idx(target_last_idx);
@@ -645,13 +643,13 @@ public:
       const auto& node_id = it->first;
       auto& raft = it->second.raft;
 
-      if (raft->get_term() != target_term)
+      if (raft->get_view() != target_term)
       {
         RAFT_DRIVER_OUT
           << fmt::format(
                "  Note over {}: Term {} doesn't match term {} on {}",
                node_id,
-               raft->get_term(),
+               raft->get_view(),
                target_term,
                target_id)
           << std::endl;
@@ -692,13 +690,13 @@ public:
         }
       }
 
-      if (raft->get_commit_idx() != target_commit_idx)
+      if (raft->get_committed_seqno() != target_commit_idx)
       {
         RAFT_DRIVER_OUT << fmt::format(
                              "  Note over {}: Commit index {} doesn't "
                              "match commit index {} on {}",
                              node_id,
-                             raft->get_commit_idx(),
+                             raft->get_committed_seqno(),
                              target_commit_idx,
                              target_id)
                         << std::endl;

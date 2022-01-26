@@ -16,7 +16,7 @@ namespace tls
       Context(false, dtls),
       cert(cert_)
     {
-      cert->use(ssl.get(), cfg.get());
+      cert->use(ssl, cfg);
     }
   };
 }

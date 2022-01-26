@@ -7,12 +7,14 @@ import infra.network
 import infra.path
 import infra.proc
 import infra.net
-from ccf.ledger import NodeStatus
 import infra.e2e_args
 import suite.test_requirements as reqs
 import infra.logging_app as app
 import json
+import jinja2
 import requests
+import infra.crypto
+from datetime import datetime
 import governance_js
 from infra.runner import ConcurrentRunner
 import governance_history
@@ -36,7 +38,7 @@ def test_consensus_status(network, args):
     with primary.client() as c:
         r = c.get("/node/consensus")
         assert r.status_code == http.HTTPStatus.OK.value
-        assert r.body.json()["details"]["state"] == "Leader"
+        assert r.body.json()["details"]["leadership_state"] == "Leader"
     return network
 
 
@@ -83,11 +85,11 @@ def test_quote(network, args):
             mrenclave = quote["mrenclave"]
             assert mrenclave == expected_mrenclave, (mrenclave, expected_mrenclave)
 
-            cafile = os.path.join(network.common_dir, "networkcert.pem")
+            cafile = os.path.join(network.common_dir, "service_cert.pem")
             assert (
                 infra.proc.ccall(
                     "verify_quote.sh",
-                    f"https://{primary.pubhost}:{primary.pubport}",
+                    f"https://{primary.get_public_rpc_host()}:{primary.get_public_rpc_port()}",
                     "--cacert",
                     f"{cafile}",
                     log_output=True,
@@ -104,7 +106,7 @@ def test_user(network, args, verify=True):
     # Note: This test should not be chained in the test suite as it creates
     # a new user and uses its own LoggingTxs
     primary, _ = network.find_nodes()
-    new_user_local_id = f"user{3}"
+    new_user_local_id = "user3"
     new_user = network.create_user(new_user_local_id, args.participants_curve)
     user_data = {"lifetime": "temporary"}
     network.consortium.add_user(primary, new_user.local_id, user_data)
@@ -119,6 +121,50 @@ def test_user(network, args, verify=True):
     with primary.client(new_user_local_id) as c:
         r = c.get("/app/log/private")
         assert r.status_code == http.HTTPStatus.UNAUTHORIZED.value
+    return network
+
+
+@reqs.description("Validate sample Jinja templates")
+@reqs.supports_methods("log/private")
+def test_jinja_templates(network, args, verify=True):
+    primary, _ = network.find_primary()
+
+    new_user_local_id = "bob"
+    new_user = network.create_user(new_user_local_id, args.participants_curve)
+
+    with primary.client(new_user_local_id) as c:
+        r = c.post("/app/log/private", {"id": 42, "msg": "New user test"})
+        assert r.status_code == http.HTTPStatus.UNAUTHORIZED.value
+
+    template_loader = jinja2.ChoiceLoader(
+        [
+            jinja2.FileSystemLoader(args.jinja_templates_path),
+            jinja2.FileSystemLoader(os.path.dirname(new_user.cert_path)),
+        ]
+    )
+    template_env = jinja2.Environment(
+        loader=template_loader, undefined=jinja2.StrictUndefined
+    )
+
+    proposal_template = template_env.get_template("set_user_proposal.json.jinja")
+    proposal_body = proposal_template.render(cert=os.path.basename(new_user.cert_path))
+    proposal = network.consortium.get_any_active_member().propose(
+        primary, proposal_body
+    )
+
+    ballot_template = template_env.get_template("ballot.json.jinja")
+    ballot_body = ballot_template.render(**json.loads(proposal_body))
+    network.consortium.vote_using_majority(primary, proposal, ballot_body)
+
+    with primary.client(new_user_local_id) as c:
+        r = c.post("/app/log/private", {"id": 42, "msg": "New user test"})
+        assert r.status_code == http.HTTPStatus.OK.value
+
+    network.consortium.remove_user(primary, new_user.service_id)
+    with primary.client(new_user_local_id) as c:
+        r = c.get("/app/log/private")
+        assert r.status_code == http.HTTPStatus.UNAUTHORIZED.value
+
     return network
 
 
@@ -158,20 +204,6 @@ def test_member_data(network, args):
     return network
 
 
-@reqs.description("Check network/nodes endpoint")
-def test_node_ids(network, args):
-    nodes = network.find_nodes()
-    for node in nodes:
-        with node.client() as c:
-            r = c.get(f"/node/network/nodes?host={node.pubhost}&port={node.pubport}")
-            assert r.status_code == http.HTTPStatus.OK.value
-            info = r.body.json()["nodes"]
-            assert len(info) == 1
-            assert info[0]["node_id"] == node.node_id
-            assert info[0]["status"] == NodeStatus.TRUSTED.value
-        return network
-
-
 @reqs.description("Test ack state digest updates")
 def test_ack_state_digest_update(network, args):
     for node in network.get_joined_nodes():
@@ -185,9 +217,9 @@ def test_invalid_client_signature(network, args):
 
     def post_proposal_request_raw(node, headers=None, expected_error_msg=None):
         r = requests.post(
-            f"https://{node.pubhost}:{node.pubport}/gov/proposals",
+            f"https://{node.get_public_rpc_host()}:{node.get_public_rpc_port()}/gov/proposals",
             headers=headers,
-            verify=os.path.join(node.common_dir, "networkcert.pem"),
+            verify=os.path.join(node.common_dir, "service_cert.pem"),
         ).json()
         assert r["error"]["code"] == "InvalidAuthenticationInfo"
         assert (
@@ -217,6 +249,139 @@ def test_invalid_client_signature(network, args):
     )
 
 
+@reqs.description("Renew certificates of all nodes, one by one")
+def test_each_node_cert_renewal(network, args):
+    primary, _ = network.find_primary()
+    now = datetime.now()
+    validity_period_allowed = args.maximum_node_certificate_validity_days - 1
+    validity_period_forbidden = args.maximum_node_certificate_validity_days + 1
+
+    test_vectors = [
+        (now, validity_period_allowed, None),
+        (now, None, None),  # Omit validity period (deduced from service configuration)
+        (now, -1, infra.proposal.ProposalNotCreated),
+        (now, validity_period_forbidden, infra.proposal.ProposalNotAccepted),
+    ]
+
+    for (valid_from, validity_period_days, expected_exception) in test_vectors:
+        for node in network.get_joined_nodes():
+            with node.client() as c:
+                c.get("/node/network/nodes")
+
+                node_cert_tls_before = node.get_tls_certificate_pem()
+                assert (
+                    infra.crypto.compute_public_key_der_hash_hex_from_pem(
+                        node_cert_tls_before
+                    )
+                    == node.node_id
+                )
+
+                try:
+                    valid_from_x509 = str(infra.crypto.datetime_to_X509time(valid_from))
+                    network.consortium.set_node_certificate_validity(
+                        primary,
+                        node,
+                        valid_from=valid_from_x509,
+                        validity_period_days=validity_period_days,
+                    )
+                    node.set_certificate_validity_period(
+                        valid_from_x509,
+                        validity_period_days
+                        or args.maximum_node_certificate_validity_days,
+                    )
+                except Exception as e:
+                    if expected_exception is None:
+                        raise e
+                    assert isinstance(e, expected_exception)
+                    continue
+                else:
+                    assert (
+                        expected_exception is None
+                    ), "Proposal should have not succeeded"
+
+                # Node certificate is updated on global commit hook
+                network.wait_for_all_nodes_to_commit(primary)
+
+                node_cert_tls_after = node.get_tls_certificate_pem()
+                assert (
+                    node_cert_tls_before != node_cert_tls_after
+                ), f"Node {node.local_node_id} certificate was not renewed"
+                node.verify_certificate_validity_period()
+                LOG.info(
+                    f"Certificate for node {node.local_node_id} has successfully been renewed"
+                )
+
+                # Long-connected client is still connected after certificate renewal
+                c.get("/node/network/nodes")
+
+    return network
+
+
+def renew_service_certificate(network, args, valid_from, validity_period_days):
+    primary, _ = network.find_primary()
+    valid_from_x509 = str(infra.crypto.datetime_to_X509time(valid_from))
+    network.consortium.set_service_certificate_validity(
+        primary,
+        valid_from=valid_from_x509,
+        validity_period_days=validity_period_days,
+    )
+    network.verify_service_certificate_validity_period(
+        validity_period_days or args.maximum_service_certificate_validity_days
+    )
+    return network
+
+
+@reqs.description("Renew service certificate")
+def test_service_cert_renewal(network, args):
+    return renew_service_certificate(
+        network,
+        args,
+        valid_from=datetime.now(),
+        validity_period_days=args.maximum_service_certificate_validity_days - 1,
+    )
+
+
+@reqs.description("Renew service certificate - extended")
+def test_service_cert_renewal_extended(network, args):
+
+    validity_period_forbidden = args.maximum_service_certificate_validity_days + 1
+
+    now = datetime.now()
+    test_vectors = [
+        (now, None, None),  # Omit validity period (deduced from service configuration)
+        (now, -1, infra.proposal.ProposalNotCreated),
+        (now, validity_period_forbidden, infra.proposal.ProposalNotAccepted),
+    ]
+
+    for (valid_from, validity_period_days, expected_exception) in test_vectors:
+        try:
+            renew_service_certificate(network, args, valid_from, validity_period_days)
+        except Exception as e:
+            assert isinstance(e, expected_exception)
+            continue
+        else:
+            assert expected_exception is None, "Proposal should have not succeeded"
+
+    return network
+
+
+@reqs.description("Update certificates of all nodes, one by one")
+def test_all_nodes_cert_renewal(network, args):
+    primary, _ = network.find_primary()
+
+    valid_from = str(infra.crypto.datetime_to_X509time(datetime.now()))
+    validity_period_days = args.maximum_node_certificate_validity_days
+
+    network.consortium.set_all_nodes_certificate_validity(
+        primary,
+        valid_from=valid_from,
+        validity_period_days=validity_period_days,
+    )
+
+    for node in network.get_joined_nodes():
+        node.set_certificate_validity_period(valid_from, validity_period_days)
+
+
 def gov(args):
     with infra.network.network(
         args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
@@ -225,13 +390,17 @@ def gov(args):
         network.consortium.set_authenticate_session(args.authenticate_session)
         test_create_endpoint(network, args)
         test_consensus_status(network, args)
-        test_node_ids(network, args)
         test_member_data(network, args)
         test_quote(network, args)
         test_user(network, args)
+        test_jinja_templates(network, args)
         test_no_quote(network, args)
         test_ack_state_digest_update(network, args)
         test_invalid_client_signature(network, args)
+        test_each_node_cert_renewal(network, args)
+        test_all_nodes_cert_renewal(network, args)
+        test_service_cert_renewal(network, args)
+        test_service_cert_renewal_extended(network, args)
 
 
 def js_gov(args):
@@ -253,7 +422,15 @@ def js_gov(args):
 
 
 if __name__ == "__main__":
-    cr = ConcurrentRunner()
+
+    def add(parser):
+        parser.add_argument(
+            "--jinja-templates-path",
+            help="Path to directory containing sample Jinja templates",
+            required=True,
+        )
+
+    cr = ConcurrentRunner(add)
 
     cr.add(
         "session_auth",

@@ -37,7 +37,7 @@ The CCF unique member identity is the hex-encoded string of the SHA-256 hash of 
     $ identity_cert_path=/path/to/member/cert
     $ openssl x509 -in "$identity_cert_path" -noout -fingerprint -sha256 | cut -d "=" -f 2 | sed 's/://g' | awk '{print tolower($0)}'
 
-.. note:: See :ref:`overview/cryptography:Algorithms and Curves` for the list of supported cryptographic curves for member identity.
+.. note:: See :ref:`architecture/cryptography:Algorithms and Curves` for the list of supported cryptographic curves for member identity.
 
 Registering a New Member
 ------------------------
@@ -55,7 +55,7 @@ First, the new member should update and retrieve the latest state digest via the
 
 .. code-block:: bash
 
-    $ curl https://<ccf-node-address>/gov/ack/update_state_digest  --cacert networkcert.pem --key new_member_privk.pem --cert new_member_cert.pem
+    $ curl https://<ccf-node-address>/gov/ack/update_state_digest  --cacert service_cert.pem --key new_member_privk.pem --cert new_member_cert.pem
     {
         "state_digest": <...>
     }
@@ -65,7 +65,7 @@ Then, the new member should sign the state digest returned by the ``/gov/ack/upd
 
 .. code-block:: bash
 
-    $ scurl.sh https://<ccf-node-address>/gov/ack  --cacert networkcert.pem --key new_member_privk.pem --cert new_member_cert.pem --header "Content-Type: application/json" --data-binary '{"state_digest": <...>}'
+    $ scurl.sh https://<ccf-node-address>/gov/ack  --cacert service_cert.pem --key new_member_privk.pem --cert new_member_cert.pem --header "Content-Type: application/json" --data-binary '{"state_digest": <...>}'
     true
 
 Once the command completes, the new member becomes active and can take part in governance operations (e.g. creating a new proposal or voting for an existing one).

@@ -6,16 +6,24 @@ Trusting a New Node
 
 As opposed to an opening network in which nodes are trusted automatically, new nodes added to an open network must become trusted through a governance proposal and vote before becoming part of the network.
 
-When an operator starts a new node with the ``join`` option (see :ref:`operations/start_network:Adding a New Node to the Network`), the node is recorded in state ``Pending``. Then, members can vote to accept the new node, using the unique node id (hex-encoded string of the SHA-256 digest of the node's identity public key). See :ref:`governance/proposals:Proposing and Voting for a Proposal` for more detail.
+When an operator starts a new node with the ``join`` option (see :ref:`operations/start_network:Adding a New Node to the Network`), the node is recorded in state ``Pending``. Then, members can propose and vote to accept the new node via the ``transition_node_to_trusted`` proposal, using the unique node id (hex-encoded string of the SHA-256 digest of the node's identity public key). See :ref:`governance/proposals:Proposing and Voting for a Proposal` for more detail.
 
 Once the proposal successfully completes, the new node automatically becomes part of the network.
 
 .. note:: Once trusted, it may take some time for the new node to update its ledger and replay the transactions run on the network before it joined (from the beginning of time, or from the snapshot it started from).
 
+Removing an Existing Node
+-------------------------
+
+A node that is already part of the service can safely be retired using the ``remove_node`` proposal.
+
+.. note:: If the now-retired node was the primary node, once the proposal successfully completes, a new primary node will have to be elected.
+
+
 Updating Code Version
 ---------------------
 
-For new nodes to be able to join the network, the version of the code they run (as specified by the ``--enclave-file``) should be first trusted by the consortium of members.
+For new nodes to be able to join the network, the version of the code they run (as specified by ``enclave.file``) should be first trusted by the consortium of members.
 
 If the version of the code being executed needs to be updated (for example, to support additional endpoints), members can create an ``add_node_code`` proposal, specifying the new code version.
 
@@ -62,7 +70,7 @@ To limit the scope of key compromise, members of the consortium can refresh the 
         ]
     }
 
-    $ scurl.sh https://<ccf-node-address>/gov/proposals --cacert network_cert --key member1_privk --cert member1_cert --data-binary @trigger_ledger_rekey.json -H "content-type: application/json"
+    $ scurl.sh https://<ccf-node-address>/gov/proposals --cacert service_cert --key member1_privk --cert member1_cert --data-binary @trigger_ledger_rekey.json -H "content-type: application/json"
     {
         "ballot_count": 0,
         "proposal_id": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
@@ -70,7 +78,7 @@ To limit the scope of key compromise, members of the consortium can refresh the 
         "state": "Open"
     }
 
-    $ scurl.sh https://<ccf-node-address>/gov/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots --cacert network_cert --key member2_privk --cert member2_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
+    $ scurl.sh https://<ccf-node-address>/gov/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots --cacert service_cert --key member2_privk --cert member2_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
     {
         "ballot_count": 1,
         "proposal_id": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
@@ -78,7 +86,7 @@ To limit the scope of key compromise, members of the consortium can refresh the 
         "state": "Open"
     }
 
-    $ scurl.sh https://<ccf-node-address>/gov/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots --cacert network_cert --key member3_privk --cert member3_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
+    $ scurl.sh https://<ccf-node-address>/gov/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots --cacert service_cert --key member3_privk --cert member3_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
     {
         "ballot_count": 2,
         "proposal_id": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
@@ -93,7 +101,7 @@ Updating Recovery Threshold
 
 To protect the ledger secrets required to recover an existing service, CCF requires :ref:`members to submit their recovery shares <governance/accept_recovery:Submitting Recovery Shares>`.
 
-.. note:: The initial value of the recovery threshold is set via the ``--recovery-threshold`` option to the starting CCF node. If this value is unspecified, it is set to the initial number of consortium members.
+.. note:: The initial value of the recovery threshold is set via the ``start.service_configuration.recovery_threshold`` configuration entry when starting the first node in a new service. If this value is unspecified, it is set to the initial number of consortium members.
 
 The number of member shares required to restore the private ledger (``recovery_threshold``) is part of the service configuration and can be updated by members via the usual propose and vote process.
 
@@ -111,7 +119,7 @@ The number of member shares required to restore the private ledger (``recovery_t
         ]
     }
 
-    $ scurl.sh https://<ccf-node-address>/gov/proposals --cacert network_cert --key member1_privk --cert member1_cert --data-binary @set_recovery_threshold.json -H "content-type: application/json"
+    $ scurl.sh https://<ccf-node-address>/gov/proposals --cacert service_cert --key member1_privk --cert member1_cert --data-binary @set_recovery_threshold.json -H "content-type: application/json"
     {
         "ballot_count": 0,
         "proposal_id": "b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8",
@@ -119,7 +127,7 @@ The number of member shares required to restore the private ledger (``recovery_t
         "state": "Open"
     }
 
-    $ scurl.sh https://<ccf-node-address>/gov/proposals/b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8/ballots --cacert network_cert --key member2_privk --cert member2_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
+    $ scurl.sh https://<ccf-node-address>/gov/proposals/b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8/ballots --cacert service_cert --key member2_privk --cert member2_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
     {
         "ballot_count": 1,
         "proposal_id": "b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8",
@@ -128,7 +136,7 @@ The number of member shares required to restore the private ledger (``recovery_t
     }
     }
 
-    $ scurl.sh https://<ccf-node-address>/gov/proposals/b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8/ballots --cacert network_cert --key member3_privk --cert member3_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
+    $ scurl.sh https://<ccf-node-address>/gov/proposals/b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8/ballots --cacert service_cert --key member3_privk --cert member3_cert --data-binary @vote_accept_1.json -H "content-type: application/json"
     {
         "ballot_count": 2,
         "proposal_id": "b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8",
@@ -137,3 +145,59 @@ The number of member shares required to restore the private ledger (``recovery_t
     }
 
 .. note:: The new recovery threshold has to be in the range between 1 and the current number of active recovery members.
+
+Renewing Node Certificate
+-------------------------
+
+.. note:: Renewing the certificate of a node does not change the identity (public key) of that node but only its validity period.
+
+To renew the soon-to-be-expired certificate of a node, members should issue a ``set_node_certificate_validity`` proposal, specifying the date at which the validity period of the renewed certificate should start (``valid_from``), as well as its validity period in days (``validity_period_days`` -- optional).
+
+- The ``valid_from`` date argument should be a ASN1 UTCTime string, i.e. ``"YYMMDDhhmmssZ"``.
+- If set, the ``validity_period_days`` should be less than the service-wide maximum validity period configured by operators. If omitted, the ``validity_period_days`` defaults to the service-wide maximum validity period configured by operators (see :ref:`operations/certificates:Node Certificates`).
+
+A sample proposal is:
+
+.. code-block:: bash
+
+    $ cat set_node_certificate_validity.json
+    {
+        "actions": [
+            {
+                "name": "set_node_certificate_validity",
+                "args": {
+                    "node_id": "86c0ccfab4b869abbc779937c51158c9dd2a130d58323643a3119e83b33dcf5c"
+                    "valid_from": "220101143018Z",
+                    "validity_period_days": 365
+                }
+            }
+        ]
+    }
+
+.. tip:: All currently trusted nodes certificates can be renewed at once using the ``set_all_nodes_certificate_validity`` proposal (same arguments minus ``node_id``).
+
+Renewing Service Certificate
+----------------------------
+
+.. note:: Renewing the certificate of the service does not change its identity (public key) but only its validity period.
+
+Similarly to node certificates, the service certificate can be renewed via the ``set_service_certificate_validity`` proposal.
+
+If omitted, the ``validity_period_days`` defaults to the service-wide maximum validity period configured by operators (see :ref:`operations/certificates:Service Certificate`).
+
+A sample proposal is:
+
+.. code-block:: bash
+
+    $ cat set_service_certificate_validity.json
+    {
+        "actions": [
+            {
+                "name": "set_service_certificate_validity",
+                "args": {
+                    "valid_from": "220101143018Z",
+                    "validity_period_days": 365
+                }
+            }
+        ]
+    }

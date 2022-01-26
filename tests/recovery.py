@@ -50,18 +50,16 @@ def split_all_ledger_files_in_dir(input_dir, output_dir):
 def test_recover_service(network, args, from_snapshot=False, split_ledger=False):
     old_primary, _ = network.find_primary()
 
-    snapshot_dir = None
+    snapshots_dir = None
     if from_snapshot:
-        snapshot_dir = network.get_committed_snapshots(old_primary)
+        snapshots_dir = network.get_committed_snapshots(old_primary)
 
     # TODO: Delete
     network.consortium.activate(old_primary)
     network.consortium.activate(old_primary)
     network.stop_all_nodes()
 
-    current_ledger_dir, committed_ledger_dir = old_primary.get_ledger(
-        include_read_only_dirs=True
-    )
+    current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
 
     if split_ledger:
         # Test that ledger files can be arbitrarily split and that recovery
@@ -69,7 +67,10 @@ def test_recover_service(network, args, from_snapshot=False, split_ledger=False)
         # Note: For real operations, it would be best practice to use a separate
         # output directory
         split_all_ledger_files_in_dir(current_ledger_dir, current_ledger_dir)
-        split_all_ledger_files_in_dir(committed_ledger_dir, committed_ledger_dir)
+        if committed_ledger_dirs:
+            split_all_ledger_files_in_dir(
+                committed_ledger_dirs[0], committed_ledger_dirs[0]
+            )
 
     recovered_network = infra.network.Network(
         args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, network
@@ -77,8 +78,8 @@ def test_recover_service(network, args, from_snapshot=False, split_ledger=False)
     recovered_network.start_in_recovery(
         args,
         ledger_dir=current_ledger_dir,
-        committed_ledger_dir=committed_ledger_dir,
-        snapshot_dir=snapshot_dir,
+        committed_ledger_dirs=committed_ledger_dirs,
+        snapshots_dir=snapshots_dir,
     )
     recovered_network.recover(args)
 
@@ -90,14 +91,13 @@ def test_recover_service(network, args, from_snapshot=False, split_ledger=False)
 def test_recover_service_share_resilience(network, args, from_snapshot=False):
     old_primary, _ = network.find_primary()
 
-    snapshot_dir = None
+    snapshots_dir = None
     if from_snapshot:
-        snapshot_dir = network.get_committed_snapshots(old_primary)
-    current_ledger_dir, committed_ledger_dir = old_primary.get_ledger(
-        include_read_only_dirs=True
-    )
+        snapshots_dir = network.get_committed_snapshots(old_primary)
 
     network.stop_all_nodes()
+
+    current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
 
     recovered_network = infra.network.Network(
         args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, network
@@ -105,8 +105,8 @@ def test_recover_service_share_resilience(network, args, from_snapshot=False):
     recovered_network.start_in_recovery(
         args,
         ledger_dir=current_ledger_dir,
-        committed_ledger_dir=committed_ledger_dir,
-        snapshot_dir=snapshot_dir,
+        committed_ledger_dirs=committed_ledger_dirs,
+        snapshots_dir=snapshots_dir,
     )
     primary, _ = recovered_network.find_primary()
     recovered_network.consortium.transition_service_to_open(primary)
@@ -154,15 +154,13 @@ def test_recover_service_share_resilience(network, args, from_snapshot=False):
 def test_recover_service_after_abort(network, args, from_snapshot=False):
     old_primary, _ = network.find_primary()
 
-    snapshot_dir = None
+    snapshots_dir = None
     if from_snapshot:
-        snapshot_dir = network.get_committed_snapshots(old_primary)
+        snapshots_dir = network.get_committed_snapshots(old_primary)
 
     network.stop_all_nodes()
 
-    current_ledger_dir, committed_ledger_dir = old_primary.get_ledger(
-        include_read_only_dirs=True
-    )
+    current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
 
     aborted_recovered_network = infra.network.Network(
         args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, network
@@ -170,8 +168,8 @@ def test_recover_service_after_abort(network, args, from_snapshot=False):
     aborted_recovered_network.start_in_recovery(
         args,
         ledger_dir=current_ledger_dir,
-        committed_ledger_dir=committed_ledger_dir,
-        snapshot_dir=snapshot_dir,
+        committed_ledger_dirs=committed_ledger_dirs,
+        snapshots_dir=snapshots_dir,
     )
 
     LOG.info("Issue write transactions on to-be-aborted recovery network")
@@ -182,9 +180,7 @@ def test_recover_service_after_abort(network, args, from_snapshot=False):
 
     aborted_recovered_network.stop_all_nodes(skip_verification=True)
 
-    current_ledger_dir, committed_ledger_dir = primary.get_ledger(
-        include_read_only_dirs=True
-    )
+    current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
 
     recovered_network = infra.network.Network(
         args.nodes,
@@ -196,8 +192,8 @@ def test_recover_service_after_abort(network, args, from_snapshot=False):
     recovered_network.start_in_recovery(
         args,
         ledger_dir=current_ledger_dir,
-        committed_ledger_dir=committed_ledger_dir,
-        snapshot_dir=snapshot_dir,
+        committed_ledger_dirs=committed_ledger_dirs,
+        snapshots_dir=snapshots_dir,
     )
     primary, _ = recovered_network.find_primary()
     recovered_network.consortium.activate(primary)

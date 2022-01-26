@@ -23,6 +23,7 @@ namespace crypto
     virtual Pem private_key_pem() const = 0;
     virtual Pem public_key_pem() const = 0;
     virtual std::vector<uint8_t> public_key_der() const = 0;
+    virtual std::vector<uint8_t> private_key_der() const = 0;
 
     virtual bool verify(
       const std::vector<uint8_t>& contents,
@@ -45,35 +46,55 @@ namespace crypto
 
     virtual std::vector<uint8_t> sign(CBuffer d, MDType md_type = {}) const = 0;
 
-    virtual Pem create_csr(const CertificateSubjectIdentity& csi) const = 0;
+    virtual Pem create_csr(
+      const std::string& subject_name,
+      const std::vector<SubjectAltName>& subject_alt_names) const = 0;
 
-    Pem create_csr(const std::string& name)
+    Pem create_csr(const std::string& subject_name) const
     {
-      return create_csr(CertificateSubjectIdentity(name));
+      return create_csr(subject_name, {});
     }
 
     virtual Pem sign_csr(
       const Pem& issuer_cert,
       const Pem& signing_request,
+      const std::string& valid_from,
+      const std::string& valid_to,
       bool ca = false) const = 0;
 
     Pem self_sign(
       const std::string& name,
+      const std::string& valid_from,
+      const std::string& valid_to,
       const std::optional<SubjectAltName> subject_alt_name = std::nullopt,
       bool ca = true) const
     {
       std::vector<SubjectAltName> sans;
       if (subject_alt_name.has_value())
+      {
         sans.push_back(subject_alt_name.value());
-      auto csr = create_csr({name, sans});
-      return sign_csr(Pem(0), csr, ca);
+      }
+      auto csr = create_csr(name, sans);
+      return sign_csr(Pem(0), csr, valid_from, valid_to, ca);
     }
 
-    Pem self_sign(const CertificateSubjectIdentity& csi, bool ca = true) const
+    Pem self_sign(
+      const std::string& subject_name,
+      const std::string& valid_from,
+      const std::string& valid_to,
+      const std::vector<SubjectAltName>& subject_alt_names,
+      bool ca = true) const
     {
-      auto csr = create_csr(csi);
-      return sign_csr(Pem(0), csr, ca);
+      auto csr = create_csr(subject_name, subject_alt_names);
+      return sign_csr(Pem(0), csr, valid_from, valid_to, ca);
     }
+
+    virtual std::vector<uint8_t> derive_shared_secret(
+      const PublicKey& peer_key) = 0;
+
+    virtual std::vector<uint8_t> public_key_raw() const = 0;
+
+    virtual CurveID get_curve_id() const = 0;
   };
 
   using PublicKeyPtr = std::shared_ptr<PublicKey>;
