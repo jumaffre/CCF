@@ -84,9 +84,9 @@ namespace kv
     MapHooks map_hooks;
 
     std::shared_ptr<Consensus> consensus = nullptr;
-
     std::shared_ptr<TxHistory> history = nullptr;
     EncryptorPtr encryptor = nullptr;
+    SnapshotterPtr snapshotter = nullptr;
 
     kv::ReplicateType replicate_type = kv::ReplicateType::ALL;
     std::unordered_set<std::string> replicated_tables;
@@ -184,7 +184,7 @@ namespace kv
       return consensus;
     }
 
-    void set_consensus(std::shared_ptr<Consensus> consensus_)
+    void set_consensus(const std::shared_ptr<Consensus>& consensus_)
     {
       consensus = consensus_;
     }
@@ -194,7 +194,7 @@ namespace kv
       return history;
     }
 
-    void set_history(std::shared_ptr<TxHistory> history_)
+    void set_history(const std::shared_ptr<TxHistory>& history_)
     {
       history = history_;
     }
@@ -207,6 +207,11 @@ namespace kv
     EncryptorPtr get_encryptor() override
     {
       return encryptor;
+    }
+
+    void set_snapshotter(const SnapshotterPtr& snapshotter_)
+    {
+      snapshotter = snapshotter_;
     }
 
     /** Get a map by name, iff it exists at the given version.
