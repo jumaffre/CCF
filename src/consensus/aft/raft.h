@@ -963,6 +963,7 @@ namespace aft
         batch_size);
 
       // Number of entries in batch so far
+      // constexpr auto batch_window_size = 100;
       auto batch_avg = batch_window_sum / batch_window_size;
 
       LOG_FAIL_FMT(
@@ -975,7 +976,10 @@ namespace aft
       batch_window_sum += (batch_size - batch_avg);
 
       LOG_FAIL_FMT(
-        "batch_window_sum += {}-{} = {}", batch_size, batch_size, batch_avg);
+        "batch_window_sum += {}-{} = {}",
+        batch_size,
+        batch_avg,
+        batch_window_sum);
 
       // Total number of entries is
       entries_batch_size = std::max((batch_window_sum / batch_window_size), 1);
