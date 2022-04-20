@@ -557,33 +557,35 @@ def run(args):
     ) as network:
         network.start_and_open(args)
 
-        test_version(network, args)
+        test_add_node(network, args)
 
-        if args.consensus != "BFT":
-            test_join_straddling_primary_replacement(network, args)
-            test_node_replacement(network, args)
-            test_add_node_from_backup(network, args)
-            test_add_node(network, args)
-            test_add_node_on_other_curve(network, args)
-            test_retire_backup(network, args)
-            test_add_as_many_pending_nodes(network, args)
-            test_add_node(network, args)
-            test_retire_primary(network, args)
-            test_add_node_with_read_only_ledger(network, args)
+        # test_version(network, args)
 
-            test_add_node_from_snapshot(network, args)
-            test_add_node_from_snapshot(network, args, from_backup=True)
-            test_add_node_from_snapshot(network, args, copy_ledger_read_only=False)
+        # if args.consensus != "BFT":
+        #     test_join_straddling_primary_replacement(network, args)
+        #     test_node_replacement(network, args)
+        #     test_add_node_from_backup(network, args)
+        #     test_add_node(network, args)
+        #     test_add_node_on_other_curve(network, args)
+        #     test_retire_backup(network, args)
+        #     test_add_as_many_pending_nodes(network, args)
+        #     test_add_node(network, args)
+        #     test_retire_primary(network, args)
+        #     test_add_node_with_read_only_ledger(network, args)
 
-            test_node_filter(network, args)
-            test_retiring_nodes_emit_at_most_one_signature(network, args)
+        #     test_add_node_from_snapshot(network, args)
+        #     test_add_node_from_snapshot(network, args, from_backup=True)
+        #     test_add_node_from_snapshot(network, args, copy_ledger_read_only=False)
 
-        if args.reconfiguration_type == "TwoTransaction":
-            test_learner_catches_up(network, args)
+        #     test_node_filter(network, args)
+        #     test_retiring_nodes_emit_at_most_one_signature(network, args)
 
-        test_service_config_endpoint(network, args)
-        test_node_certificates_validity_period(network, args)
-        test_add_node_invalid_validity_period(network, args)
+        # if args.reconfiguration_type == "TwoTransaction":
+        #     test_learner_catches_up(network, args)
+
+        # test_service_config_endpoint(network, args)
+        # test_node_certificates_validity_period(network, args)
+        # test_add_node_invalid_validity_period(network, args)
 
 
 def run_join_old_snapshot(args):
@@ -766,7 +768,7 @@ if __name__ == "__main__":
         "1tx_reconfig",
         run,
         package="samples/apps/logging/liblogging",
-        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),
         reconfiguration_type="OneTransaction",
     )
 

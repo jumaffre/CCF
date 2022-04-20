@@ -129,7 +129,9 @@ namespace aft
     // Earliest index at which this node's retirement can be committed
     std::optional<ccf::SeqNo> retirement_committable_idx = std::nullopt;
 
-    size_t entry_size_not_limited = 0;
+    // On the primary node, total size/number of entries yet to be sent to
+    // backup nodes in append entries messages
+    size_t entry_size_not_limited = 0; // TODO: Rename
     size_t entry_count = 0;
     Index entries_batch_size = 20;
     static constexpr int batch_window_size = 100;
@@ -147,6 +149,8 @@ namespace aft
     std::default_random_engine rand;
 
   public:
+    // TODO: Total size of entries to be replicated before the entries are
+    // automatically sent to backups in append entries message
     static constexpr size_t append_entries_size_limit = 20000;
     std::unique_ptr<LedgerProxy> ledger;
     std::shared_ptr<ccf::NodeToNode> channels;
@@ -923,17 +927,36 @@ namespace aft
 
     inline void update_batch_size()
     {
+      // Assume:
+      // - entry_count = 5 entries in flight
+      // - entry_size_not_limited = 100 bytes in total
+      // - append_entries_size_limit = 20000 (maximum size of single append
+      // entries)
+      // - batch window size = 100
+      //
+      // avg_entry_size = 20 bytes
+      // batch_size = 20000 / 20 = 1000 entries
+      // batch_avg = 0 (start)
+      // batch_window_sum = 2000
+      // entries_batch_size = 2000 / 100 = 20 entries
+
+      // Average size of entries to be sent
       auto avg_entry_size = (entry_count == 0) ?
         append_entries_size_limit :
         entry_size_not_limited / entry_count;
 
+      // Number of entries to be sent in single batch
       auto batch_size = (avg_entry_size == 0) ?
         append_entries_size_limit / 2 :
         append_entries_size_limit / avg_entry_size;
 
+      // Number of entries in batch so far
       auto batch_avg = batch_window_sum / batch_window_size;
+
       // balance out total batch size across batch window
       batch_window_sum += (batch_size - batch_avg);
+
+      // Total number of entries is
       entries_batch_size = std::max((batch_window_sum / batch_window_size), 1);
     }
 
@@ -1533,9 +1556,10 @@ namespace aft
       {
         // Failed due to log inconsistency. Reset sent_idx, and try again soon.
         LOG_DEBUG_FMT(
-          "Recv append entries response to {} from {}: failed",
+          "Recv append entries response to {} from {} for index {} : failed",
           state->my_node_id,
-          from);
+          from,
+          r.last_log_idx);
         node->second.sent_idx = node->second.match_idx;
         return;
       }
