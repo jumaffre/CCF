@@ -945,19 +945,46 @@ namespace aft
         append_entries_size_limit :
         entry_size_not_limited / entry_count;
 
+      LOG_FAIL_FMT(
+        "avg_entry_size: {}/{} = {}",
+        entry_size_not_limited,
+        entry_count,
+        avg_entry_size);
+
       // Number of entries to be sent in single batch
       auto batch_size = (avg_entry_size == 0) ?
         append_entries_size_limit / 2 :
         append_entries_size_limit / avg_entry_size;
 
+      LOG_FAIL_FMT(
+        "batch_size: {}/{} = {}",
+        append_entries_size_limit,
+        avg_entry_size,
+        batch_size);
+
       // Number of entries in batch so far
       auto batch_avg = batch_window_sum / batch_window_size;
+
+      LOG_FAIL_FMT(
+        "batch_avg: {}/{} = {}",
+        batch_window_sum,
+        batch_window_size,
+        batch_avg);
 
       // balance out total batch size across batch window
       batch_window_sum += (batch_size - batch_avg);
 
+      LOG_FAIL_FMT(
+        "batch_window_sum += {}-{} = {}", batch_size, batch_size, batch_avg);
+
       // Total number of entries is
       entries_batch_size = std::max((batch_window_sum / batch_window_size), 1);
+
+      LOG_FAIL_FMT(
+        "entries_batch_size = {}/{} = {}",
+        batch_window_sum,
+        batch_window_size,
+        entries_batch_size);
     }
 
     ccf::NodeId get_primary_at_config(
