@@ -1,7 +1,18 @@
 {
-  "name": "Sample Development Environment for CCF",
+  "name": "Sample Development Environment for CCF Apps",
   "context": "..",
   "image": "mcr.microsoft.com/ccf/app/dev:lts-devcontainer",
   "runArgs": [],
-  "extensions": ["ms-vscode.cpptools", "ms-python.python"]
+  "extensions": [
+    "ms-vscode.cpptools",
+    "ms-python.python"
+  ],
+  "postStartCommand": "/opt/ccf/bin/sandbox.sh",
+  "portsAttributes": {
+    "8000": {
+      "label": "CCF node",
+      "protocol": "https",
+      "onAutoForward": "notify"
+    }
+  }
 }
