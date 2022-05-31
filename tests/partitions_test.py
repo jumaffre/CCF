@@ -274,6 +274,22 @@ def test_new_joiner_helps_liveness(network, args):
         primary, _ = network.find_nodes()
         network.wait_for_all_nodes_to_commit(primary=primary)
 
+# https://github.com/microsoft/CCF/issues/3837#issuecomment-1139513144
+@reqs.description("Reconfigure network while majority of backups are partitioned")
+def test_partition_while_reconfiguration(network, args):
+    primary, backups = network.find_nodes()
+
+    new_nodes = []
+    for _ in range(len(backups)):
+        new_node = network.create_node("local://localhost")
+        network.join_node(new_node, args.package, args)
+        new_nodes.append(new_node)
+
+    with network.partitioner.partition(backups):
+        pass
+
+
+
 
 @reqs.description("Add a learner, partition nodes, check that there is no progress")
 def test_learner_does_not_take_part(network, args):
