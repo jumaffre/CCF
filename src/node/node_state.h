@@ -176,6 +176,8 @@ namespace ccf
     // join
     //
     std::optional<JoinNetworkNodeToNode::Out> join_response = std::nullopt;
+    // First TxID at which the new node observes itself as trusted
+    std::optional<TxID> join_txid = std::nullopt;
 
     //
     // recovery
@@ -599,6 +601,16 @@ namespace ccf
       return rpcsessions->create_client(std::move(join_client_cert));
     }
 
+    void join_rpc_response_callback()
+    {
+      // TODO:
+    }
+
+    void join_rpc_committed_callback()
+    {
+      // TODO:
+    }
+
     void initiate_join_unsafe()
     {
       sm.expect(NodeStartupState::pending);
@@ -662,7 +674,8 @@ namespace ccf
             return;
           }
 
-          // Set network secrets, node id and become part of network.
+          // If the node is trusted, wait for this TxID to commit before taking
+          // part in consensus (in case node trusting is rolled back)
           if (
             resp.node_status == NodeStatus::TRUSTED ||
             resp.node_status == NodeStatus::LEARNER)
@@ -684,8 +697,6 @@ namespace ccf
                 http::headers::CCF_TX_ID));
             }
 
-            LOG_FAIL_FMT("Join TxID: {}", tx_id_header->second);
-
             auto join_client = make_join_client();
             auto [target_host, target_port] =
               split_net_address(config.join.target_rpc_address);
@@ -697,29 +708,61 @@ namespace ccf
                 http_status status,
                 http::HeaderMap&& headers,
                 std::vector<uint8_t>&& data) {
-                LOG_FAIL_FMT("TXiD client response");
-
                 std::lock_guard<std::mutex> guard(lock);
                 if (!sm.check(NodeStartupState::pending))
                 {
                   return;
                 }
 
-                complete_join_unsafe();
+                if (status != HTTP_STATUS_OK)
+                {
+                  return;
+                }
+
+                auto j = serdes::unpack(data, serdes::Pack::Text);
+
+                GetTxStatus::Out resp;
+                try
+                {
+                  resp = j.get<GetTxStatus::Out>();
+                }
+                catch (const std::exception& e)
+                {
+                  // TODO: Re-schedule
+                  LOG_FAIL_FMT(
+                    "Could not parse response from /node/tx endpoint");
+                  return;
+                }
+
+                LOG_DEBUG_FMT(
+                  "Response to join /node/tx for TxID {}: {}",
+                  resp.transaction_id.to_str(),
+                  tx_status_to_str(resp.status));
+
+                // If the target TxID is not committed, the join timer will soon
+                // kick in again
+                if (resp.status == TxStatus::Committed)
+                {
+                  complete_join_unsafe();
+                }
+                else if (resp.status == TxStatus::Invalid)
+                {
+                  join_txid.reset();
+                }
               });
+
+            join_txid = TxID::from_str(tx_id_header->second);
+            LOG_FAIL_FMT("Join TxID: {}", join_txid->to_str());
 
             http::Request r(
               fmt::format(
-                "/{}/{}/transaction_id={}",
+                "/{}/{}?transaction_id={}",
                 get_actor_prefix(ActorsType::nodes),
                 "tx",
-                tx_id_header->second),
+                join_txid->to_str()),
               HTTP_GET);
             join_client->send_request(r.build_request());
-
             join_response = std::move(resp);
-
-            // TODO: Store join response and start polling for commit response
           }
           else if (resp.node_status == NodeStatus::PENDING)
           {
