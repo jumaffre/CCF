@@ -463,6 +463,124 @@ namespace ccf
     // funcs in state "pending"
     //
 
+    void complete_join(JoinNetworkNodeToNode::Out&& resp)
+    {
+      // std::lock_guard<std::mutex> guard(lock);
+
+      LOG_INFO_FMT("Completing join protocol");
+
+      network.identity = std::make_unique<ReplicatedNetworkIdentity>(
+        resp.network_info->identity);
+      network.ledger_secrets->init_from_map(
+        std::move(resp.network_info->ledger_secrets));
+
+      crypto::Pem n2n_channels_cert;
+      if (!resp.network_info->endorsed_certificate.has_value())
+      {
+        // Endorsed node certificate is included in join response
+        // from 2.x (CFT only). When joining an existing 1.x service,
+        // self-sign own certificate and use it to endorse TLS
+        // connections.
+        endorsed_node_cert =
+          create_endorsed_node_cert(default_node_cert_validity_period_days);
+        history->set_endorsed_certificate(endorsed_node_cert.value());
+        n2n_channels_cert = endorsed_node_cert.value();
+        open_frontend(ActorsType::members);
+        open_user_frontend();
+        accept_network_tls_connections();
+      }
+      else
+      {
+        n2n_channels_cert = resp.network_info->endorsed_certificate.value();
+      }
+
+      setup_consensus(
+        resp.network_info->service_status.value_or(ServiceStatus::OPENING),
+        resp.network_info->reconfiguration_type.value_or(
+          ReconfigurationType::ONE_TRANSACTION),
+        resp.network_info->public_only,
+        n2n_channels_cert);
+      auto_refresh_jwt_keys();
+
+      if (resp.network_info->public_only)
+      {
+        last_recovered_signed_idx =
+          resp.network_info->last_recovered_signed_idx;
+        setup_recovery_hook();
+        snapshotter->set_snapshot_generation(false);
+      }
+
+      View view = VIEW_UNKNOWN;
+      std::vector<kv::Version> view_history = {};
+      if (startup_snapshot_info)
+      {
+        // It is only possible to deserialise the entire snapshot then,
+        // once the ledger secrets have been passed in by the network
+        kv::ConsensusHookPtrs hooks;
+        deserialise_snapshot(
+          network.tables,
+          startup_snapshot_info->raw,
+          hooks,
+          &view_history,
+          resp.network_info->public_only,
+          startup_snapshot_info->evidence_seqno,
+          config.recover.previous_service_identity);
+
+        for (auto& hook : hooks)
+        {
+          hook->call(consensus.get());
+        }
+
+        auto tx = network.tables->create_read_only_tx();
+        auto signatures = tx.ro(network.signatures);
+        auto sig = signatures->get();
+        if (!sig.has_value())
+        {
+          throw std::logic_error(
+            fmt::format("No signatures found after applying snapshot"));
+        }
+        view = sig->view;
+
+        if (!resp.network_info->public_only)
+        {
+          // Only clear snapshot if not recovering. When joining the
+          // public network the snapshot is used later to initialise the
+          // recovery store
+          startup_snapshot_info.reset();
+        }
+
+        LOG_INFO_FMT(
+          "Joiner successfully resumed from snapshot at seqno {} and "
+          "view {}",
+          network.tables->current_version(),
+          view);
+      }
+
+      consensus->init_as_backup(
+        network.tables->current_version(),
+        view,
+        view_history,
+        last_recovered_signed_idx);
+
+      snapshotter->set_last_snapshot_idx(network.tables->current_version());
+
+      if (resp.network_info->public_only)
+      {
+        sm.advance(NodeStartupState::partOfPublicNetwork);
+      }
+      else
+      {
+        reset_data(quote_info.quote);
+        reset_data(quote_info.endorsements);
+        sm.advance(NodeStartupState::partOfNetwork);
+      }
+
+      LOG_INFO_FMT(
+        "Node has now joined the network as node {}: {}",
+        self,
+        (resp.network_info->public_only ? "public only" : "all domains"));
+    }
+
     void initiate_join_unsafe()
     {
       sm.expect(NodeStartupState::pending);
@@ -551,119 +669,8 @@ namespace ccf
                 resp.network_info->consensus_type));
             }
 
-            network.identity = std::make_unique<ReplicatedNetworkIdentity>(
-              resp.network_info->identity);
-            network.ledger_secrets->init_from_map(
-              std::move(resp.network_info->ledger_secrets));
-
-            crypto::Pem n2n_channels_cert;
-            if (!resp.network_info->endorsed_certificate.has_value())
-            {
-              // Endorsed node certificate is included in join response
-              // from 2.x (CFT only). When joining an existing 1.x service,
-              // self-sign own certificate and use it to endorse TLS
-              // connections.
-              endorsed_node_cert = create_endorsed_node_cert(
-                default_node_cert_validity_period_days);
-              history->set_endorsed_certificate(endorsed_node_cert.value());
-              n2n_channels_cert = endorsed_node_cert.value();
-              open_frontend(ActorsType::members);
-              open_user_frontend();
-              accept_network_tls_connections();
-            }
-            else
-            {
-              n2n_channels_cert =
-                resp.network_info->endorsed_certificate.value();
-            }
-
-            setup_consensus(
-              resp.network_info->service_status.value_or(
-                ServiceStatus::OPENING),
-              resp.network_info->reconfiguration_type.value_or(
-                ReconfigurationType::ONE_TRANSACTION),
-              resp.network_info->public_only,
-              n2n_channels_cert);
-            auto_refresh_jwt_keys();
-
-            if (resp.network_info->public_only)
-            {
-              last_recovered_signed_idx =
-                resp.network_info->last_recovered_signed_idx;
-              setup_recovery_hook();
-              snapshotter->set_snapshot_generation(false);
-            }
-
-            View view = VIEW_UNKNOWN;
-            std::vector<kv::Version> view_history = {};
-            if (startup_snapshot_info)
-            {
-              // It is only possible to deserialise the entire snapshot then,
-              // once the ledger secrets have been passed in by the network
-              kv::ConsensusHookPtrs hooks;
-              deserialise_snapshot(
-                network.tables,
-                startup_snapshot_info->raw,
-                hooks,
-                &view_history,
-                resp.network_info->public_only,
-                startup_snapshot_info->evidence_seqno,
-                config.recover.previous_service_identity);
-
-              for (auto& hook : hooks)
-              {
-                hook->call(consensus.get());
-              }
-
-              auto tx = network.tables->create_read_only_tx();
-              auto signatures = tx.ro(network.signatures);
-              auto sig = signatures->get();
-              if (!sig.has_value())
-              {
-                throw std::logic_error(
-                  fmt::format("No signatures found after applying snapshot"));
-              }
-              view = sig->view;
-
-              if (!resp.network_info->public_only)
-              {
-                // Only clear snapshot if not recovering. When joining the
-                // public network the snapshot is used later to initialise the
-                // recovery store
-                startup_snapshot_info.reset();
-              }
-
-              LOG_INFO_FMT(
-                "Joiner successfully resumed from snapshot at seqno {} and "
-                "view {}",
-                network.tables->current_version(),
-                view);
-            }
-
-            consensus->init_as_backup(
-              network.tables->current_version(),
-              view,
-              view_history,
-              last_recovered_signed_idx);
-
-            snapshotter->set_last_snapshot_idx(
-              network.tables->current_version());
-
-            if (resp.network_info->public_only)
-            {
-              sm.advance(NodeStartupState::partOfPublicNetwork);
-            }
-            else
-            {
-              reset_data(quote_info.quote);
-              reset_data(quote_info.endorsements);
-              sm.advance(NodeStartupState::partOfNetwork);
-            }
-
-            LOG_INFO_FMT(
-              "Node has now joined the network as node {}: {}",
-              self,
-              (resp.network_info->public_only ? "public only" : "all domains"));
+            complete_join(std::move(resp));
+            // TODO: Store join response and start polling for commit response
           }
           else if (resp.node_status == NodeStatus::PENDING)
           {
