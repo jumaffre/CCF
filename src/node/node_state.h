@@ -173,6 +173,11 @@ namespace ccf
     std::shared_ptr<Snapshotter> snapshotter;
 
     //
+    // join
+    //
+    std::optional<JoinNetworkNodeToNode::Out> join_response = std::nullopt;
+
+    //
     // recovery
     //
     std::shared_ptr<kv::Store> recovery_store;
@@ -463,11 +468,11 @@ namespace ccf
     // funcs in state "pending"
     //
 
-    void complete_join(JoinNetworkNodeToNode::Out&& resp)
+    void complete_join_unsafe()
     {
-      // std::lock_guard<std::mutex> guard(lock);
-
       LOG_INFO_FMT("Completing join protocol");
+
+      auto& resp = join_response.value();
 
       network.identity = std::make_unique<ReplicatedNetworkIdentity>(
         resp.network_info->identity);
@@ -575,16 +580,15 @@ namespace ccf
         sm.advance(NodeStartupState::partOfNetwork);
       }
 
+      join_response.reset();
       LOG_INFO_FMT(
         "Node has now joined the network as node {}: {}",
         self,
         (resp.network_info->public_only ? "public only" : "all domains"));
     }
 
-    void initiate_join_unsafe()
+    auto make_join_client()
     {
-      sm.expect(NodeStartupState::pending);
-
       auto network_ca = std::make_shared<tls::CA>(std::string(
         config.join.service_cert.begin(), config.join.service_cert.end()));
       auto join_client_cert = std::make_unique<tls::Cert>(
@@ -592,14 +596,17 @@ namespace ccf
         self_signed_node_cert,
         node_sign_kp->private_key_pem(),
         config.join.target_rpc_address);
+      return rpcsessions->create_client(std::move(join_client_cert));
+    }
 
-      // Create RPC client and connect to remote node
-      auto join_client =
-        rpcsessions->create_client(std::move(join_client_cert));
+    void initiate_join_unsafe()
+    {
+      sm.expect(NodeStartupState::pending);
 
       auto [target_host, target_port] =
         split_net_address(config.join.target_rpc_address);
 
+      auto join_client = make_join_client();
       join_client->connect(
         target_host,
         target_port,
@@ -669,7 +676,49 @@ namespace ccf
                 resp.network_info->consensus_type));
             }
 
-            complete_join(std::move(resp));
+            const auto& tx_id_header = headers.find(http::headers::CCF_TX_ID);
+            if (tx_id_header == headers.end())
+            {
+              throw std::logic_error(fmt::format(
+                "No {} header found in join response",
+                http::headers::CCF_TX_ID));
+            }
+
+            LOG_FAIL_FMT("Join TxID: {}", tx_id_header->second);
+
+            auto join_client = make_join_client();
+            auto [target_host, target_port] =
+              split_net_address(config.join.target_rpc_address);
+
+            join_client->connect(
+              target_host,
+              target_port,
+              [this](
+                http_status status,
+                http::HeaderMap&& headers,
+                std::vector<uint8_t>&& data) {
+                LOG_FAIL_FMT("TXiD client response");
+
+                std::lock_guard<std::mutex> guard(lock);
+                if (!sm.check(NodeStartupState::pending))
+                {
+                  return;
+                }
+
+                complete_join_unsafe();
+              });
+
+            http::Request r(
+              fmt::format(
+                "/{}/{}/transaction_id={}",
+                get_actor_prefix(ActorsType::nodes),
+                "tx",
+                tx_id_header->second),
+              HTTP_GET);
+            join_client->send_request(r.build_request());
+
+            join_response = std::move(resp);
+
             // TODO: Store join response and start polling for commit response
           }
           else if (resp.node_status == NodeStatus::PENDING)
@@ -886,7 +935,8 @@ namespace ccf
         // If the ledger entry is a signature, it is safe to compact the store
         if (result == kv::ApplyResult::PASS_SIGNATURE)
         {
-          // If the ledger entry is a signature, it is safe to compact the store
+          // If the ledger entry is a signature, it is safe to compact the
+          // store
           store->compact(last_recovered_idx);
           auto tx = store->create_read_only_tx();
           auto last_sig = tx.ro(network.signatures)->get();
@@ -2131,8 +2181,8 @@ namespace ccf
                 // Also, automatically refresh self-signed node certificate,
                 // using the same validity period as the endorsed certificate.
                 // Note that this is only done when the certificate is renewed
-                // via proposal (i.e. when the member frontend is open), and not
-                // for the initial addition of the node (the self-signed
+                // via proposal (i.e. when the member frontend is open), and
+                // not for the initial addition of the node (the self-signed
                 // certificate is output to disk then).
                 auto [valid_from, valid_to] =
                   crypto::make_verifier(endorsed_node_cert.value())
@@ -2352,9 +2402,9 @@ namespace ccf
 
       // Note: The Signatures hook and SerialisedMerkleTree hook are separate
       // because the signature and the Merkle tree are recorded in distinct
-      // tables (for serialisation performance reasons). However here, they are
-      // expected to always be called together and for the same version as they
-      // are always written by each signature transaction.
+      // tables (for serialisation performance reasons). However here, they
+      // are expected to always be called together and for the same version as
+      // they are always written by each signature transaction.
 
       network.tables->set_map_hook(
         network.signatures.get_name(),
