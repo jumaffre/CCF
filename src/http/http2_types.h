@@ -28,6 +28,7 @@ namespace http2
     std::vector<uint8_t> request_body;
     http_status status;
     size_t current_offset = 0;
+    bool has_trailers = false;
 
     // Response
     std::vector<uint8_t> response_body;

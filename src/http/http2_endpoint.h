@@ -159,48 +159,76 @@ namespace http
           // Note: return HTTP_STATUS_INTERNAL_SERVER_ERROR, e.what()
         }
 
-        const auto actor_opt = http::extract_actor(*rpc_ctx);
-        if (!actor_opt.has_value())
-        {
-          rpc_ctx->set_error(
-            HTTP_STATUS_NOT_FOUND,
-            ccf::errors::ResourceNotFound,
-            fmt::format(
-              "Request path must contain '/[actor]/[method]'. Unable to parse "
-              "'{}'.",
-              rpc_ctx->get_method()));
-          // Note: return HTTP_STATUS_NOT_FOUND, e.what()
-          return;
-        }
+        const auto path = rpc_ctx->get_method();
+        const auto first_slash = path.find_first_of('/');
+        const auto second_slash = path.find_first_of('/', first_slash + 1);
+        const auto actor = path.substr(first_slash + 1, second_slash - 1);
 
-        const auto& actor_s = actor_opt.value();
-        auto actor = rpc_map->resolve(actor_s);
-        auto search = rpc_map->find(actor);
-        if (actor == ccf::ActorsType::unknown || !search.has_value())
+        if (actor == "kvledger.KvLedger")
         {
-          rpc_ctx->set_error(
-            HTTP_STATUS_NOT_FOUND,
-            ccf::errors::ResourceNotFound,
-            fmt::format("Unknown actor '{}'.", actor_s));
-          // Note: return HTTP_STATUS_NOT_FOUND, e.what()
-          return;
-        }
+          auto search = rpc_map->find(ccf::ActorsType::users);
+          auto response = search.value()->process(rpc_ctx);
 
-        auto response = search.value()->process(rpc_ctx);
-
-        if (!response.has_value())
-        {
-          // If the RPC is pending, hold the connection.
-          LOG_TRACE_FMT("Pending");
-          return;
+          if (!response.has_value())
+          {
+            // If the RPC is pending, hold the connection.
+            LOG_TRACE_FMT("Pending");
+            return;
+          }
+          else
+          {
+            server_session.send_response(
+              stream_id,
+              rpc_ctx->get_response_http_status(),
+              rpc_ctx->get_response_headers(),
+              std::move(rpc_ctx->get_response_body()));
+          }
         }
         else
         {
-          server_session.send_response(
-            stream_id,
-            rpc_ctx->get_response_http_status(),
-            rpc_ctx->get_response_headers(),
-            std::move(rpc_ctx->get_response_body()));
+          const auto actor_opt = http::extract_actor(*rpc_ctx);
+
+          if (!actor_opt.has_value())
+          {
+            rpc_ctx->set_error(
+              HTTP_STATUS_NOT_FOUND,
+              ccf::errors::ResourceNotFound,
+              fmt::format(
+                "Request path must contain '/[actor]/[method]'. Unable to "
+                "parse '{}'.",
+                rpc_ctx->get_method()));
+            // Note: return HTTP_STATUS_NOT_FOUND, e.what()
+            return;
+          }
+
+          const auto& actor_s = actor_opt.value();
+          auto actor = rpc_map->resolve(actor_s);
+          auto search = rpc_map->find(actor);
+          if (actor == ccf::ActorsType::unknown || !search.has_value())
+          {
+            rpc_ctx->set_error(
+              HTTP_STATUS_NOT_FOUND,
+              ccf::errors::ResourceNotFound,
+              fmt::format("Unknown actor '{}'.", actor_s));
+            // Note: return HTTP_STATUS_NOT_FOUND, e.what()
+            return;
+          }
+          auto response = search.value()->process(rpc_ctx);
+
+          if (!response.has_value())
+          {
+            // If the RPC is pending, hold the connection.
+            LOG_TRACE_FMT("Pending");
+            return;
+          }
+          else
+          {
+            server_session.send_response(
+              stream_id,
+              rpc_ctx->get_response_http_status(),
+              rpc_ctx->get_response_headers(),
+              std::move(rpc_ctx->get_response_body()));
+          }
         }
       }
       catch (const std::exception& e)

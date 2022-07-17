@@ -39,6 +39,7 @@ namespace http2
 
     auto& response_body = stream_data->response_body;
 
+    LOG_TRACE_FMT("Response body size: {}", response_body.size());
     if (response_body.size() > 0)
     {
       // Note: Explore zero-copy alternative (NGHTTP2_DATA_FLAG_NO_COPY)
@@ -46,6 +47,22 @@ namespace http2
     }
 
     *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    
+    if (stream_data->has_trailers)
+    {
+      LOG_TRACE_FMT("http2::sending trailers");
+      *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+      std::vector<nghttp2_nv> trailer_hdrs;
+      trailer_hdrs.emplace_back(make_nv("grpc-status", "0"));
+
+      int rv = nghttp2_submit_trailer(session, stream_id, trailer_hdrs.data(), trailer_hdrs.size());
+      if (rv != 0)
+      {
+        LOG_FAIL_FMT("Error submitting trailer: {}", nghttp2_strerror(rv));
+        throw std::logic_error(
+          fmt::format("nghttp2_submit_trailer error: {}", rv));
+      }
+    }
 
     return response_body.size();
   }
@@ -211,6 +228,10 @@ namespace http2
     }
     else
     {
+      if (k == "te" && v == "trailers") // TODO: define these strings
+      {
+        stream_data->has_trailers = true;
+      }
       stream_data->headers.emplace(k, v);
     }
 
