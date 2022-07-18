@@ -119,10 +119,10 @@ private:
   std::map<ccf::NodeId, NodeDriver> _nodes;
   std::set<std::pair<ccf::NodeId, ccf::NodeId>> _connections;
 
-  void replicate_with_hooks(
+  void _replicate(
     const std::string& term_s,
-    const aft::ReplicatedData& r,
-    std::shared_ptr<kv::ConsensusHookPtrs> hooks)
+    std::vector<uint8_t> data,
+    const std::optional<kv::Configuration::Nodes>& configuration = std::nullopt)
   {
     const auto opt = find_primary_in_term(term_s);
     if (!opt.has_value())
@@ -130,7 +130,7 @@ private:
       RAFT_DRIVER_OUT << fmt::format(
                            "  Note left of {}: No primary to replicate {}",
                            _nodes.begin()->first,
-                           stringify(r.data))
+                           stringify(data))
                       << std::endl;
       return;
     }
@@ -143,13 +143,26 @@ private:
                          node_id,
                          term_s,
                          idx,
-                         stringify(r.data),
-                         r.type == aft::ReplicatedDataType::reconfiguration ?
-                           "reconfiguration" :
-                           "raw")
+                         stringify(data),
+                         configuration.has_value() ? "reconfiguration" : "raw")
                     << std::endl;
 
-    auto s = nlohmann::json(r).dump();
+    aft::ReplicatedDataType type = aft::ReplicatedDataType::raw;
+    auto hooks = std::make_shared<kv::ConsensusHookPtrs>();
+    if (configuration.has_value())
+    {
+      auto hook = std::make_unique<aft::ConfigurationChangeHook>(
+        configuration.value(), idx);
+      hooks->push_back(std::move(hook));
+      type = aft::ReplicatedDataType::reconfiguration;
+      auto c = nlohmann::json(configuration).dump();
+
+      // If the entry is a reconfiguration, the replicated data is overwritten
+      // with the serialised configuration
+      data = std::vector<uint8_t>(c.begin(), c.end());
+    }
+
+    auto s = nlohmann::json(aft::ReplicatedData{type, data}).dump();
     auto d = std::make_shared<std::vector<uint8_t>>(s.begin(), s.end());
     // True means all these entries are committable
     raft->replicate(kv::BatchVector{{idx, d, true, hooks}}, term);
@@ -222,14 +235,7 @@ public:
       configuration.try_emplace(node_id);
     }
 
-    auto hook = std::make_unique<aft::ConfigurationChangeHook>(configuration);
-    auto hooks = std::make_shared<kv::ConsensusHookPtrs>();
-    hooks->push_back(std::move(hook));
-
-    auto c = nlohmann::json(configuration).dump();
-    auto data = std::vector<uint8_t>(c.begin(), c.end());
-    replicate_with_hooks(
-      term_s, {aft::ReplicatedDataType::reconfiguration, data}, hooks);
+    _replicate(term_s, {}, configuration);
   }
 
   void log(
@@ -599,8 +605,7 @@ public:
   void replicate(
     const std::string& term_s, std::shared_ptr<std::vector<uint8_t>> data)
   {
-    auto hooks = std::shared_ptr<kv::ConsensusHookPtrs>();
-    replicate_with_hooks(term_s, {aft::ReplicatedDataType::raw, *data}, hooks);
+    _replicate(term_s, *data);
   }
 
   void disconnect(ccf::NodeId left, ccf::NodeId right)

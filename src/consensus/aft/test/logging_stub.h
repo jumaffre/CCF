@@ -274,10 +274,13 @@ namespace aft
   class ConfigurationChangeHook : public kv::ConsensusHook
   {
     kv::Configuration::Nodes new_nodes;
+    kv::Version version;
 
   public:
-    ConfigurationChangeHook(kv::Configuration::Nodes new_nodes_) :
-      new_nodes(new_nodes_)
+    ConfigurationChangeHook(
+      kv::Configuration::Nodes new_nodes_, kv::Version version_) :
+      new_nodes(new_nodes_),
+      version(version_)
     {
       // Note: Does not support retired nodes (yet!)
     }
@@ -291,8 +294,7 @@ namespace aft
         configuration[node_id] = {};
       }
 
-      // TODO: Pass version!
-      consensus->add_configuration(0, configuration, {}, {});
+      consensus->add_configuration(version, configuration, {}, {});
     }
   };
 
@@ -454,17 +456,17 @@ namespace aft
     {
       kv::ConsensusHookPtrs hooks = {};
 
-      // Ignore wrapping term and version
+      // Read wrapping term and version
       auto data_ = data.data();
       auto size = data.size();
       serialized::read<aft::Term>(data_, size);
-      serialized::read<kv::Version>(data_, size);
+      auto version = serialized::read<kv::Version>(data_, size);
       ReplicatedData r = nlohmann::json::parse(std::span{data_, size});
       if (r.type == ReplicatedDataType::reconfiguration)
       {
         kv::Configuration::Nodes configuration = nlohmann::json::parse(r.data);
-        auto hook =
-          std::make_unique<aft::ConfigurationChangeHook>(configuration);
+        auto hook = std::make_unique<aft::ConfigurationChangeHook>(
+          configuration, version);
         hooks.push_back(std::move(hook));
       }
 
