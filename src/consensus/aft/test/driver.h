@@ -20,7 +20,7 @@ std::string stringify(const std::vector<uint8_t>& v, size_t max_size = 15ul)
 {
   auto size = std::min(v.size(), max_size);
   return fmt::format(
-    "[{} bytes] {}", v.size(), std::string(v.begin(), v.end()));
+    "[{} bytes] {}", v.size(), std::string(v.begin(), v.begin() + size));
 }
 
 std::string stringify(const std::optional<std::vector<uint8_t>>& o)
@@ -121,8 +121,7 @@ private:
 
   void replicate_with_hooks(
     const std::string& term_s,
-    std::shared_ptr<std::vector<uint8_t>> data,
-    aft::ReplicatedDataType data_type,
+    const aft::ReplicatedData& r,
     std::shared_ptr<kv::ConsensusHookPtrs> hooks)
   {
     const auto opt = find_primary_in_term(term_s);
@@ -131,7 +130,7 @@ private:
       RAFT_DRIVER_OUT << fmt::format(
                            "  Note left of {}: No primary to replicate {}",
                            _nodes.begin()->first,
-                           stringify(*data))
+                           stringify(r.data))
                       << std::endl;
       return;
     }
@@ -139,22 +138,21 @@ private:
     auto& raft = _nodes.at(node_id).raft;
     const auto idx = raft->get_last_idx() + 1;
     RAFT_DRIVER_OUT << fmt::format(
-                         "  {}->>{}: replicate {}.{} = {}",
+                         "  {}->>{}: replicate {}.{} = {} [{}]",
                          node_id,
                          node_id,
                          term_s,
                          idx,
-                         stringify(*data))
+                         stringify(r.data),
+                         r.type == aft::ReplicatedDataType::reconfiguration ?
+                           "reconfiguration" :
+                           "raw")
                     << std::endl;
-    auto replicated_data = std::make_shared<std::vector<uint8_t>>(
-      sizeof(aft::ReplicatedDataType) + data->size());
-    auto p = replicated_data->data();
-    auto size = replicated_data->size();
-    serialized::write(p, size, aft::ReplicatedDataType::data);
-    serialized::write(p, size, data->data(), data->size());
 
+    auto s = nlohmann::json(r).dump();
+    auto d = std::make_shared<std::vector<uint8_t>>(s.begin(), s.end());
     // True means all these entries are committable
-    raft->replicate(kv::BatchVector{{idx, replicated_data, true, hooks}}, term);
+    raft->replicate(kv::BatchVector{{idx, d, true, hooks}}, term);
   }
 
   void add_node(ccf::NodeId node_id)
@@ -171,6 +169,11 @@ private:
       nullptr,
       nullptr);
     raft->start_ticking();
+
+    if (_nodes.find(node_id) != _nodes.end())
+    {
+      throw std::logic_error(fmt::format("Node {} already exists", node_id));
+    }
 
     _nodes.emplace(node_id, NodeDriver{kv, raft});
   }
@@ -205,51 +208,28 @@ public:
     const std::string& term_s, std::vector<std::string> node_ids)
   {
     kv::Configuration::Nodes configuration;
-    // TODO: Size calculation for reconfiguration_data needs sorting out
-    auto reconfiguration_data =
-      std::make_shared<std::vector<uint8_t>>(sizeof(size_t));
-    auto p = reconfiguration_data->data();
-    auto size = reconfiguration_data->size();
-    serialized::write(p, size, node_ids.size());
-
     for (const auto& node_id_s : node_ids)
     {
       ccf::NodeId node_id(node_id_s);
 
-      if (_nodes.find(node_id) != _nodes.end())
+      if (_nodes.find(node_id) == _nodes.end())
       {
-        throw std::runtime_error(
-          fmt::format("Node {} already exists in configuration", node_id));
+        throw std::runtime_error(fmt::format(
+          "Node {} does not exist yet. Use \"add_new_node, <node_id>\"",
+          node_id));
       }
 
-      auto kv = std::make_shared<Store>(node_id);
-      const consensus::Configuration settings{
-        ConsensusType::CFT, {"10ms"}, {"100ms"}};
-      auto raft = std::make_shared<TRaft>(
-        settings,
-        std::make_unique<Adaptor>(kv),
-        std::make_unique<LedgerStubProxy_Mermaid>(node_id),
-        std::make_shared<aft::ChannelStubProxy>(),
-        std::make_shared<aft::State>(node_id),
-        nullptr,
-        nullptr);
-
-      _nodes.emplace(node_id, NodeDriver{kv, raft});
       configuration.try_emplace(node_id);
-      reconfiguration_data->resize(
-        reconfiguration_data->size() + sizeof(size_t) + node_id.size());
-      serialized::write(p, size, node_id.value());
     }
 
     auto hook = std::make_unique<aft::ConfigurationChangeHook>(configuration);
     auto hooks = std::make_shared<kv::ConsensusHookPtrs>();
     hooks->push_back(std::move(hook));
 
+    auto c = nlohmann::json(configuration).dump();
+    auto data = std::vector<uint8_t>(c.begin(), c.end());
     replicate_with_hooks(
-      term_s,
-      reconfiguration_data,
-      aft::ReplicatedDataType::reconfiguration,
-      hooks);
+      term_s, {aft::ReplicatedDataType::reconfiguration, data}, hooks);
   }
 
   void log(
@@ -620,7 +600,7 @@ public:
     const std::string& term_s, std::shared_ptr<std::vector<uint8_t>> data)
   {
     auto hooks = std::shared_ptr<kv::ConsensusHookPtrs>();
-    replicate_with_hooks(term_s, data, aft::ReplicatedDataType::data, hooks);
+    replicate_with_hooks(term_s, {aft::ReplicatedDataType::raw, *data}, hooks);
   }
 
   void disconnect(ccf::NodeId left, ccf::NodeId right)

@@ -253,12 +253,23 @@ namespace aft
     }
   };
 
-  // All replicated entries are prefixed with this type
   enum class ReplicatedDataType
   {
-    data = 0,
+    raw = 0,
     reconfiguration = 1
   };
+  DECLARE_JSON_ENUM(
+    ReplicatedDataType,
+    {{ReplicatedDataType::raw, "raw"},
+     {ReplicatedDataType::reconfiguration, "reconfiguration"}});
+
+  struct ReplicatedData
+  {
+    ReplicatedDataType type;
+    std::vector<uint8_t> data;
+  };
+  DECLARE_JSON_TYPE(ReplicatedData);
+  DECLARE_JSON_REQUIRED_FIELDS(ReplicatedData, type, data);
 
   class ConfigurationChangeHook : public kv::ConsensusHook
   {
@@ -442,19 +453,18 @@ namespace aft
       const std::optional<kv::TxID>& expected_txid = std::nullopt) override
     {
       kv::ConsensusHookPtrs hooks = {};
-      kv::Configuration::Nodes configuration = {};
-      auto p = data.data();
+
+      // Ignore wrapping term and version
+      auto data_ = data.data();
       auto size = data.size();
-      auto data_type = serialized::read<ReplicatedDataType>(p, size);
-      if (data_type == ReplicatedDataType::reconfiguration)
+      serialized::read<aft::Term>(data_, size);
+      serialized::read<kv::Version>(data_, size);
+      ReplicatedData r = nlohmann::json::parse(std::span{data_, size});
+      if (r.type == ReplicatedDataType::reconfiguration)
       {
-        size_t node_id_count = serialized::read<size_t>(p, size);
-        for (size_t i = 0; i < node_id_count; i++)
-        {
-          auto node_id = serialized::read<ccf::NodeId::Value>(p, size);
-          configuration[node_id] = {};
-        }
-        auto hook = std::make_unique<ConfigurationChangeHook>(configuration);
+        kv::Configuration::Nodes configuration = nlohmann::json::parse(r.data);
+        auto hook =
+          std::make_unique<aft::ConfigurationChangeHook>(configuration);
         hooks.push_back(std::move(hook));
       }
 
