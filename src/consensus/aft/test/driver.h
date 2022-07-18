@@ -157,6 +157,24 @@ private:
     raft->replicate(kv::BatchVector{{idx, replicated_data, true, hooks}}, term);
   }
 
+  void add_node(ccf::NodeId node_id)
+  {
+    auto kv = std::make_shared<Store>(node_id);
+    const consensus::Configuration settings{
+      ConsensusType::CFT, {"10ms"}, {"100ms"}};
+    auto raft = std::make_shared<TRaft>(
+      settings,
+      std::make_unique<Adaptor>(kv),
+      std::make_unique<LedgerStubProxy_Mermaid>(node_id),
+      std::make_shared<aft::ChannelStubProxy>(),
+      std::make_shared<aft::State>(node_id),
+      nullptr,
+      nullptr);
+    raft->start_ticking();
+
+    _nodes.emplace(node_id, NodeDriver{kv, raft});
+  }
+
 public:
   RaftDriver(std::vector<std::string> node_ids)
   {
@@ -164,29 +182,23 @@ public:
 
     for (const auto& node_id_s : node_ids)
     {
-      ccf::NodeId node_id(node_id_s);
-
-      auto kv = std::make_shared<Store>(node_id);
-      const consensus::Configuration settings{
-        ConsensusType::CFT, {"10ms"}, {"100ms"}};
-      auto raft = std::make_shared<TRaft>(
-        settings,
-        std::make_unique<Adaptor>(kv),
-        std::make_unique<LedgerStubProxy_Mermaid>(node_id),
-        std::make_shared<aft::ChannelStubProxy>(),
-        std::make_shared<aft::State>(node_id),
-        nullptr,
-        nullptr);
-      raft->start_ticking();
-
-      _nodes.emplace(node_id, NodeDriver{kv, raft});
-      configuration.try_emplace(node_id);
+      add_node(node_id_s);
+      configuration.try_emplace(node_id_s);
     }
 
     for (auto& node : _nodes)
     {
       node.second.raft->add_configuration(0, configuration);
     }
+  }
+
+  void add_new_node(std::string node_id_s)
+  {
+    ccf::NodeId node_id(node_id_s);
+    add_node(node_id);
+    RAFT_DRIVER_OUT << fmt::format(
+                         "  Note over {}: Node {} created", node_id, node_id)
+                    << std::endl;
   }
 
   void replicate_new_configuration(

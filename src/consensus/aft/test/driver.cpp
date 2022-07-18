@@ -155,6 +155,10 @@ int main(int argc, char** argv)
         driver->replicate_new_configuration(
           items[0], {std::next(items.begin()), items.end()});
         break;
+      case shash("add_new_node"):
+        assert(items.size() == 2);
+        driver->add_new_node(items[1]);
+        break;
       case shash(""):
         // Ignore empty lines
         break;
