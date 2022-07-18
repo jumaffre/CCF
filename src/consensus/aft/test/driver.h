@@ -168,7 +168,7 @@ private:
     raft->replicate(kv::BatchVector{{idx, d, true, hooks}}, term);
   }
 
-  void add_node(ccf::NodeId node_id)
+  std::shared_ptr<TRaft> add_node(ccf::NodeId node_id)
   {
     auto kv = std::make_shared<Store>(node_id);
     const consensus::Configuration settings{
@@ -181,7 +181,6 @@ private:
       std::make_shared<aft::State>(node_id),
       nullptr,
       nullptr);
-    raft->start_ticking();
 
     if (_nodes.find(node_id) != _nodes.end())
     {
@@ -189,6 +188,7 @@ private:
     }
 
     _nodes.emplace(node_id, NodeDriver{kv, raft});
+    return raft;
   }
 
 public:
@@ -198,7 +198,8 @@ public:
 
     for (const auto& node_id_s : node_ids)
     {
-      add_node(node_id_s);
+      auto raft = add_node(node_id_s);
+      raft->start_ticking();
       configuration.try_emplace(node_id_s);
     }
 
