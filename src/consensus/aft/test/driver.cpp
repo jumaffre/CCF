@@ -149,15 +149,19 @@ int main(int argc, char** argv)
         assert(items.size() == 2);
         driver->assert_is_primary(items[1]);
         break;
+      case shash("assert_commit_idx"):
+        assert(items.size() == 3);
+        driver->assert_commit_idx(items[1], items[2]);
+        break;
       case shash("replicate_new_configuration"):
         assert(items.size() >= 3);
         items.erase(items.begin());
         driver->replicate_new_configuration(
           items[0], {std::next(items.begin()), items.end()});
         break;
-      case shash("add_new_node"):
+      case shash("create_new_node"):
         assert(items.size() == 2);
-        driver->add_new_node(items[1]);
+        driver->create_new_node(items[1]);
         break;
       case shash(""):
         // Ignore empty lines

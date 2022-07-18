@@ -454,14 +454,14 @@ namespace aft
       bool public_only = false,
       const std::optional<kv::TxID>& expected_txid = std::nullopt) override
     {
-      kv::ConsensusHookPtrs hooks = {};
-
+      // Set reconfiguration hook if there are any new nodes
       // Read wrapping term and version
       auto data_ = data.data();
       auto size = data.size();
       serialized::read<aft::Term>(data_, size);
       auto version = serialized::read<kv::Version>(data_, size);
       ReplicatedData r = nlohmann::json::parse(std::span{data_, size});
+      kv::ConsensusHookPtrs hooks = {};
       if (r.type == ReplicatedDataType::reconfiguration)
       {
         kv::Configuration::Nodes configuration = nlohmann::json::parse(r.data);

@@ -209,7 +209,7 @@ public:
     }
   }
 
-  void add_new_node(std::string node_id_s)
+  void create_new_node(std::string node_id_s)
   {
     ccf::NodeId node_id(node_id_s);
     add_node(node_id);
@@ -229,7 +229,7 @@ public:
       if (_nodes.find(node_id) == _nodes.end())
       {
         throw std::runtime_error(fmt::format(
-          "Node {} does not exist yet. Use \"add_new_node, <node_id>\"",
+          "Node {} does not exist yet. Use \"create_new_node, <node_id>\"",
           node_id));
       }
 
@@ -793,6 +793,21 @@ public:
     if (!all_match)
     {
       throw std::runtime_error("States not in sync");
+    }
+  }
+
+  void assert_commit_idx(ccf::NodeId node_id, const std::string& idx_s)
+  {
+    auto idx = std::stol(idx_s);
+    if (_nodes.at(node_id).raft->get_committed_seqno() != idx)
+    {
+      RAFT_DRIVER_OUT
+        << fmt::format(
+             "  Note over {}: Node is not at expected commit idx {}",
+             node_id,
+             idx)
+        << std::endl;
+      throw std::runtime_error("Node not at expected commit idx");
     }
   }
 };
