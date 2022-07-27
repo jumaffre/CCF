@@ -135,9 +135,9 @@ namespace crypto
     if (!ok)
     {
       int ec = ERR_get_error();
-      LOG_DEBUG_FMT(
-        "OpenSSL signature verification failure: {}",
-        OpenSSL::error_string(ec));
+      // LOG_DEBUG_FMT(
+      //   "OpenSSL signature verification failure: {}",
+      //   OpenSSL::error_string(ec));
     }
 
     return ok;
