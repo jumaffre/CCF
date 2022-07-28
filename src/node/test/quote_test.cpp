@@ -2,6 +2,8 @@
 #include "ccf/crypto/pem.h"
 #include "ccf/crypto/verifier.h"
 #include "ccf/ds/logger.h"
+#include "ccf/quote_info.h"
+#include "ccf/service/code_digest.h"
 #include "crypto/ecdsa.h"
 #include "ds/std_formatters.h"
 
@@ -73,13 +75,105 @@ struct attestation_report
   uint8_t reserved;
   union tcb_version launch_tcb;
   uint8_t reserved3[168];
-  struct signature signature; /* 0x2A0 */
+  struct signature signature;
 };
+
+// TODO: Try to find this in AMD public doc (unsuccessful so far)
+constexpr auto amd_root_signing_key_public = R"(-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0Ld52RJOdeiJlqK2JdsV
+mD7FktuotWwX1fNgW41XY9Xz1HEhSUmhLz9Cu9DHRlvgJSNxbeYYsnJfvyjx1MfU
+0V5tkKiU1EesNFta1kTA0szNisdYc9isqk7mXT5+KfGRbfc4V/9zRIcE8jlHN61S
+1ju8X93+6dxDUrG2SzxqJ4BhqyYmUDruPXJSX4vUc01P7j98MpqOS95rORdGHeI5
+2Naz5m2B+O+vjsC060d37jY9LFeuOP4Meri8qgfi2S5kKqg/aF6aPtuAZQVR7u3K
+FYXP59XmJgtcog05gmI0T/OitLhuzVvpZcLph0odh/1IPXqx3+MnjD97A7fXpqGd
+/y8KxX7jksTEzAOgbKAeam3lm+3yKIcTYMlsRMXPcjNbIvmsBykD//xSniusuHBk
+gnlENEWx1UcbQQrs+gVDkuVPhsnzIRNgYvM48Y+7LGiJYnrmE8xcrexekBxrva2V
+9TJQqnN3Q53kt5viQi3+gCfmkwC0F0tirIZbLkXPrPwzZ0M9eNxhIySb2npJfgnq
+z55I0u33wh4r0ZNQeTGfw03MBUtyuzGesGkcw+loqMaq1qR4tjGbPYxCvpCq7+Og
+pCCoMNit2uLo9M18fHz10lOMT8nWAUvRZFzteXCm+7PHdYPlmQwUw3LvenJ/ILXo
+QPHfbkH0CyPfhl1jWhJFZasCAwEAAQ==
+-----END PUBLIC KEY-----
+)";
+
+namespace ccf
+{
+  bool verify_quote(
+    const QuoteInfo& quote_info,
+    CodeDigest& unique_id,
+    crypto::Sha256Hash& hash_node_public_key)
+  {
+    // First, verify endorsements
+    std::string endorsements = {
+      quote_info.endorsements.begin(), quote_info.endorsements.end()};
+    auto certificates = crypto::split_x509_cert_bundle(endorsements);
+    auto actual_amd_root_verifier =
+      crypto::make_verifier(crypto::Pem(certificates[2]));
+    if (
+      actual_amd_root_verifier->public_key_pem().str() !=
+      amd_root_signing_key_public)
+    {
+      LOG_FAIL_FMT("AMD root signing public key is not as expected");
+      return false;
+    }
+
+    // Verify that root certificate is self-signed
+    if (!actual_amd_root_verifier->verify_certificate({&certificates[2]}))
+    {
+      LOG_FAIL_FMT(
+        "AMD root signing public key certificate is not self-signed");
+      return false;
+    }
+
+    auto vcek_verifier = crypto::make_verifier(crypto::Pem(certificates[0]));
+    if (!vcek_verifier->verify_certificate(
+          {&certificates[2]}, {&certificates[1]}))
+    {
+      LOG_FAIL_FMT("VCEK endorsement verification failed!");
+      return false;
+    }
+
+    // Then, verify quote signature
+    attestation_report quote =
+      *reinterpret_cast<const attestation_report*>(quote_info.quote.data());
+
+    // Make ASN1 der signature
+    auto sig = crypto::ecdsa_sig_from_r_s(
+      quote.signature.r,
+      sizeof(quote.signature.r),
+      quote.signature.s,
+      sizeof(quote.signature.s),
+      false /* little endian */);
+    std::vector<uint8_t> tbs = {
+      quote_info.quote.begin(),
+      quote_info.quote.end() - sizeof(quote.signature)};
+
+    if (quote.signature_algo != signature_algo_t::ecdsa_p384_sha384)
+    {
+      LOG_FAIL_FMT(
+        "Unsupported signature algorithm: {} (supported: {})",
+        quote.signature_algo,
+        signature_algo_t::ecdsa_p384_sha384);
+      return false;
+    }
+
+    if (!vcek_verifier->verify(tbs, sig))
+    {
+      LOG_FAIL_FMT("Signature verification failed!");
+      return false;
+    }
+
+    return true;
+  }
+}
 
 int main(int argc, char** argv)
 {
   logger::config::default_init();
 
+  // TODO:
+  // 1. New node should generate quote on startup
+  // 2. New node should also retrieve endorsement certificates on
+  // startup (see below)
   std::string raw_quote_b64 =
     "AgAAAAIAAAAfAAMAAAAAAAEAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAEAAA"
     "ACAAAAAAAGXQEAAAAAAAAAAAAAAAAAAABCZJkAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
@@ -106,22 +200,13 @@ int main(int argc, char** argv)
     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     "AAAAAAAAAAAAAAAAAAA=";
-
   auto raw_quote = crypto::raw_from_b64(raw_quote_b64);
-  LOG_INFO_FMT("Quote size: {}", raw_quote.size());
-
   attestation_report quote =
     *reinterpret_cast<attestation_report*>(raw_quote.data());
 
-  LOG_INFO_FMT("Reported TCB: {}", quote.reported_tcb.raw);
-
-  // 1. Retrieve VCEK certificate
-
+  // Retrieve VCEK certificate from chip ID and TCB
   auto url_chip_id = fmt::format("{:02x}", fmt::join(quote.chip_id, ""));
-  LOG_INFO_FMT("Url chip id: {}", url_chip_id);
-
   auto url_reported_tcb_buffer = fmt::format("{:0x}", quote.reported_tcb.raw);
-  LOG_INFO_FMT("Url reported TCB: {}", url_reported_tcb_buffer);
 
   // TODO:
   // 1. This URL should be configurable via node configuration here:
@@ -138,8 +223,11 @@ int main(int argc, char** argv)
     url_reported_tcb_buffer);
   LOG_INFO_FMT("VECK certificate URL: {}", url);
 
-  // Note: VECK is first certificate, ASK second, ARK last.
-  auto curl_response_body = R"(-----BEGIN CERTIFICATE-----
+  // TODO: Endorsement certificates should be retrieved using in-enclave node
+  // HTTP client.
+
+  //  Note: VECK is first certificate, ASK second, ARK last.
+  std::string curl_response_body = R"(-----BEGIN CERTIFICATE-----
 MIIFTDCCAvugAwIBAgIBADBGBgkqhkiG9w0BAQowOaAPMA0GCWCGSAFlAwQCAgUA
 oRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCATCjAwIBATB7MRQwEgYD
 VQQLDAtFbmdpbmVlcmluZzELMAkGA1UEBhMCVVMxFDASBgNVBAcMC1NhbnRhIENs
@@ -245,73 +333,29 @@ CViAvgT9kf/rBq1d+ivj6skkHxuzcxbk1xv6ZGxrteJxVH7KlX7YRdZ6eARKwLe4
 AFZEAwoKCQ==
 -----END CERTIFICATE-----)";
 
-  auto certificates = crypto::split_x509_cert_bundle(curl_response_body);
+  // TODO: Create new enum format for SEV-SNP quote
+  ccf::QuoteInfo quote_info = {};
+  quote_info.quote = raw_quote;
+  quote_info.endorsements = {
+    curl_response_body.data(),
+    curl_response_body.data() + curl_response_body.size()};
 
-  // Verify endorsements
-  // TODO: To find in spec
-  constexpr auto amd_root_signing_key_public = R"(-----BEGIN PUBLIC KEY-----
-MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0Ld52RJOdeiJlqK2JdsV
-mD7FktuotWwX1fNgW41XY9Xz1HEhSUmhLz9Cu9DHRlvgJSNxbeYYsnJfvyjx1MfU
-0V5tkKiU1EesNFta1kTA0szNisdYc9isqk7mXT5+KfGRbfc4V/9zRIcE8jlHN61S
-1ju8X93+6dxDUrG2SzxqJ4BhqyYmUDruPXJSX4vUc01P7j98MpqOS95rORdGHeI5
-2Naz5m2B+O+vjsC060d37jY9LFeuOP4Meri8qgfi2S5kKqg/aF6aPtuAZQVR7u3K
-FYXP59XmJgtcog05gmI0T/OitLhuzVvpZcLph0odh/1IPXqx3+MnjD97A7fXpqGd
-/y8KxX7jksTEzAOgbKAeam3lm+3yKIcTYMlsRMXPcjNbIvmsBykD//xSniusuHBk
-gnlENEWx1UcbQQrs+gVDkuVPhsnzIRNgYvM48Y+7LGiJYnrmE8xcrexekBxrva2V
-9TJQqnN3Q53kt5viQi3+gCfmkwC0F0tirIZbLkXPrPwzZ0M9eNxhIySb2npJfgnq
-z55I0u33wh4r0ZNQeTGfw03MBUtyuzGesGkcw+loqMaq1qR4tjGbPYxCvpCq7+Og
-pCCoMNit2uLo9M18fHz10lOMT8nWAUvRZFzteXCm+7PHdYPlmQwUw3LvenJ/ILXo
-QPHfbkH0CyPfhl1jWhJFZasCAwEAAQ==
------END PUBLIC KEY-----
-)";
-
-  auto actual_amd_root_verifier =
-    crypto::make_verifier(crypto::Pem(certificates[2]));
-  if (
-    actual_amd_root_verifier->public_key_pem() !=
-    crypto::Pem(amd_root_signing_key_public))
+  // Note: Open Enclave only provides quote verification function to _parse_
+  // quote.
+  ccf::CodeDigest code_digest = {};
+  crypto::Sha256Hash node_public_key_hash = {};
+  if (!verify_quote(quote_info, code_digest, node_public_key_hash))
   {
-    LOG_FAIL_FMT("AMD root signing public key is not as expected");
+    LOG_FAIL_FMT("Failed to verify quote");
     return 1;
   }
 
-  // Verify that root certificate is self-signed
-  if (!actual_amd_root_verifier->verify_certificate({&certificates[2]}))
-  {
-    LOG_FAIL_FMT("AMD root sigining public key certificate is not self-signed");
-    return 1;
-  }
+  // TODO:
+  // 1. Verify output code_digest against
+  // https://microsoft.github.io/CCF/main/audit/builtin_maps.html#nodes-code-ids
+  // 2. Verify node_public_key_hash against client certificate in TLS handshake
+  // on node join
 
-  auto vcek_verifier = crypto::make_verifier(crypto::Pem(certificates[0]));
-  if (!vcek_verifier->verify_certificate(
-        {&certificates[2]}, {&certificates[1]}))
-  {
-    LOG_FAIL_FMT("VCEK endorsement verification failed!");
-    return 1;
-  }
-
-  auto& sig = quote.signature;
-  auto& sig_algo = quote.signature_algo;
-
-  // Make ASN1 der signature
-  auto sig_ = crypto::ecdsa_sig_from_r_s(
-    sig.r, sizeof(sig.r), sig.s, sizeof(sig.s), false /* little endian */);
-
-  std::vector<uint8_t> tbs = {raw_quote.begin(), raw_quote.end() - sizeof(sig)};
-
-  if (quote.signature_algo != signature_algo_t::ecdsa_p384_sha384)
-  {
-    LOG_FAIL_FMT(
-      "Unsupported signature algorithm: {} (supported: {})",
-      quote.signature_algo,
-      signature_algo_t::ecdsa_p384_sha384);
-    return 1;
-  }
-
-  if (!vcek_verifier->verify(tbs, sig_))
-  {
-    LOG_FAIL_FMT("Signature verification failed!");
-    return 1;
-  }
   LOG_INFO_FMT("Signature successfully verified!");
+  return 0;
 }
