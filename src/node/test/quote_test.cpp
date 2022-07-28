@@ -23,11 +23,19 @@ union tcb_version
 };
 
 // Table 107.
+static constexpr size_t ecdsa_point_size_bytes = 72;
 struct signature
 {
-  uint8_t r[72];
-  uint8_t s[72];
-  uint8_t reserved[512 - 144];
+  uint8_t r[ecdsa_point_size_bytes];
+  uint8_t s[ecdsa_point_size_bytes];
+  uint8_t reserved[512 - 2 * ecdsa_point_size_bytes];
+};
+
+// Table. 105
+enum class signature_algo_t : uint32_t
+{
+  invalid = 0,
+  ecdsa_p384_sha384 = 1
 };
 
 // Table 21.
@@ -39,8 +47,7 @@ struct attestation_report
   uint8_t family_id[16];
   uint8_t image_id[16];
   uint32_t vmpl;
-  uint32_t signature_algo; // Table. 105 (only 1 supported, i.e. ECDSA P-384
-                           // with SHA-384)
+  signature_algo_t signature_algo;
   union tcb_version platform_version;
   uint64_t platform_info;
   uint32_t flags;
@@ -116,10 +123,14 @@ int main(int argc, char** argv)
   auto url_reported_tcb_buffer = fmt::format("{:0x}", quote.reported_tcb.raw);
   LOG_INFO_FMT("Url reported TCB: {}", url_reported_tcb_buffer);
 
-  // Note: Also works for global.acccache.azure.net and
-  // americas.acccache.azure.net
-  // TODO: Also support AMD server (see
-  // https://www.amd.com/system/files/TechDocs/57230.pdf)
+  // TODO:
+  // 1. This URL should be configurable via node configuration here:
+  // https://microsoft.github.io/CCF/main/operations/configuration.html
+  // 2. Also support extended guest report? (see
+  // https://developer.amd.com/wp-content/resources/56421.pdf 4.1.8)
+  // 3. Also support AMD server (see
+  // https://www.amd.com/system/files/TechDocs/57230.pdf).
+
   auto url = fmt::format(
     "https://americas.test.acccache.azure.net/SevSnpVM/certificates/{}/"
     "{}?api-version=2020-10-15-preview",
@@ -238,7 +249,7 @@ AFZEAwoKCQ==
 
   // Verify endorsements
   // TODO: To find in spec
-  constexpr auto amd_root_public_key = R"(-----BEGIN PUBLIC KEY-----
+  constexpr auto amd_root_signing_key_public = R"(-----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0Ld52RJOdeiJlqK2JdsV
 mD7FktuotWwX1fNgW41XY9Xz1HEhSUmhLz9Cu9DHRlvgJSNxbeYYsnJfvyjx1MfU
 0V5tkKiU1EesNFta1kTA0szNisdYc9isqk7mXT5+KfGRbfc4V/9zRIcE8jlHN61S
@@ -258,9 +269,16 @@ QPHfbkH0CyPfhl1jWhJFZasCAwEAAQ==
     crypto::make_verifier(crypto::Pem(certificates[2]));
   if (
     actual_amd_root_verifier->public_key_pem() !=
-    crypto::Pem(amd_root_public_key))
+    crypto::Pem(amd_root_signing_key_public))
   {
-    LOG_FAIL_FMT("Root AMD public key is not as expected");
+    LOG_FAIL_FMT("AMD root signing public key is not as expected");
+    return 1;
+  }
+
+  // Verify that root certificate is self-signed
+  if (!actual_amd_root_verifier->verify_certificate({&certificates[2]}))
+  {
+    LOG_FAIL_FMT("AMD root sigining public key certificate is not self-signed");
     return 1;
   }
 
@@ -280,6 +298,15 @@ QPHfbkH0CyPfhl1jWhJFZasCAwEAAQ==
     sig.r, sizeof(sig.r), sig.s, sizeof(sig.s), false /* little endian */);
 
   std::vector<uint8_t> tbs = {raw_quote.begin(), raw_quote.end() - sizeof(sig)};
+
+  if (quote.signature_algo != signature_algo_t::ecdsa_p384_sha384)
+  {
+    LOG_FAIL_FMT(
+      "Unsupported signature algorithm: {} (supported: {})",
+      quote.signature_algo,
+      signature_algo_t::ecdsa_p384_sha384);
+    return 1;
+  }
 
   if (!vcek_verifier->verify(tbs, sig_))
   {
