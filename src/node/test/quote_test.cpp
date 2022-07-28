@@ -72,7 +72,6 @@ struct attestation_report
 int main(int argc, char** argv)
 {
   logger::config::default_init();
-  LOG_TRACE_FMT("here we are");
 
   std::string raw_quote_b64 =
     "AgAAAAIAAAAfAAMAAAAAAAEAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAEAAA"
@@ -109,7 +108,6 @@ int main(int argc, char** argv)
 
   LOG_INFO_FMT("Reported TCB: {}", quote.reported_tcb.raw);
 
-  // TODO:
   // 1. Retrieve VCEK certificate
 
   auto url_chip_id = fmt::format("{:02x}", fmt::join(quote.chip_id, ""));
@@ -120,6 +118,8 @@ int main(int argc, char** argv)
 
   // Note: Also works for global.acccache.azure.net and
   // americas.acccache.azure.net
+  // TODO: Also support AMD server (see
+  // https://www.amd.com/system/files/TechDocs/57230.pdf)
   auto url = fmt::format(
     "https://americas.test.acccache.azure.net/SevSnpVM/certificates/{}/"
     "{}?api-version=2020-10-15-preview",
@@ -127,8 +127,7 @@ int main(int argc, char** argv)
     url_reported_tcb_buffer);
   LOG_INFO_FMT("VECK certificate URL: {}", url);
 
-  // $ curl $url
-
+  // Note: VECK is first certificate, ASK second, ARK last.
   auto curl_response_body = R"(-----BEGIN CERTIFICATE-----
 MIIFTDCCAvugAwIBAgIBADBGBgkqhkiG9w0BAQowOaAPMA0GCWCGSAFlAwQCAgUA
 oRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCATCjAwIBATB7MRQwEgYD
@@ -235,41 +234,43 @@ CViAvgT9kf/rBq1d+ivj6skkHxuzcxbk1xv6ZGxrteJxVH7KlX7YRdZ6eARKwLe4
 AFZEAwoKCQ==
 -----END CERTIFICATE-----)";
 
-  // TODO: Extra VCEK certificate from curl response
-  auto veck_certificate_pem = R"(-----BEGIN CERTIFICATE-----
-MIIFTDCCAvugAwIBAgIBADBGBgkqhkiG9w0BAQowOaAPMA0GCWCGSAFlAwQCAgUA
-oRwwGgYJKoZIhvcNAQEIMA0GCWCGSAFlAwQCAgUAogMCATCjAwIBATB7MRQwEgYD
-VQQLDAtFbmdpbmVlcmluZzELMAkGA1UEBhMCVVMxFDASBgNVBAcMC1NhbnRhIENs
-YXJhMQswCQYDVQQIDAJDQTEfMB0GA1UECgwWQWR2YW5jZWQgTWljcm8gRGV2aWNl
-czESMBAGA1UEAwwJU0VWLU1pbGFuMB4XDTIyMDUyMDIyNTIyN1oXDTI5MDUyMDIy
-NTIyN1owejEUMBIGA1UECwwLRW5naW5lZXJpbmcxCzAJBgNVBAYTAlVTMRQwEgYD
-VQQHDAtTYW50YSBDbGFyYTELMAkGA1UECAwCQ0ExHzAdBgNVBAoMFkFkdmFuY2Vk
-IE1pY3JvIERldmljZXMxETAPBgNVBAMMCFNFVi1WQ0VLMHYwEAYHKoZIzj0CAQYF
-K4EEACIDYgAE7ZlvMpQknEomxM6fzhOTsT+gP13kyRrAhLeHcumpKpNJO7kwBsmW
-KBnn48G0LdbYk9vcQa7oFlUTXlJnwFdYflNsnxq5/D6jtITCDw6LwZqo/kKCcTLy
-iJdG6zoA/PXio4IBFjCCARIwEAYJKwYBBAGceAEBBAMCAQAwFwYJKwYBBAGceAEC
-BAoWCE1pbGFuLUIwMBEGCisGAQQBnHgBAwEEAwIBAjARBgorBgEEAZx4AQMCBAMC
-AQAwEQYKKwYBBAGceAEDBAQDAgEAMBEGCisGAQQBnHgBAwUEAwIBADARBgorBgEE
-AZx4AQMGBAMCAQAwEQYKKwYBBAGceAEDBwQDAgEAMBEGCisGAQQBnHgBAwMEAwIB
-BjARBgorBgEEAZx4AQMIBAMCAV0wTQYJKwYBBAGceAEEBEDWiwAoyZ2EZNIhIgbs
-DvLuUxZFJQ2I6/oqd/QYdiK1vwqSmmQtHezwb9hq30jiK033Oe8EF2wMxB6FN4RH
-DBe8MEYGCSqGSIb3DQEBCjA5oA8wDQYJYIZIAWUDBAICBQChHDAaBgkqhkiG9w0B
-AQgwDQYJYIZIAWUDBAICBQCiAwIBMKMDAgEBA4ICAQAj6LDorCibD4xmxZpbRAsW
-dL12O2/KrKE432vc3OXbqNz1weV2CTnJTIZX3a8e1fFHm/J6o2v9bR+LLaWEFhyT
-HNkNM3fS4MuEKTJuT5ePL73OUwi8a/DOF+YNaCt8DIXgoIfs5P/2lxy5G0889w+i
-lhBWlru4rbmoP3zJG09JOzX6RQEVJ9DhfTdfiELYwRAtIxiPL9Kouy1dmn/JNuRy
-AVf+btb8DwosmyU86+luyOenzJv5cF5ZXIiWTaUhm4sgPDoQ9ey9BDEdR25lQWcK
-J7SZfGSQeM9Et/BayI+cDlMmtuey2htnwa1biXMlloDpu7TXAZQJ3cfedNS7rLVb
-wEM24rQdYBSfVYdpyEsnFy5vMfVErbsh5m4U9p0OTG3Ymp+R/Ffd5e+CAjIHWkNn
-/7bWtwcF0FkA8XvIHSRaJl+iOMP/x94DzXQN4VTY5vCcYEo+5qbmS40o/6U4wL/K
-dmjkDK7rk5SU4veQkZmnnXFzG26f5RBiJSMK4PDHo93Y1P96taRmwkSJm8UekJhp
-IgVk+2sXo38miztaco3PiFUD75A3CM46XOL9D8PKyNT2/bMdvhn59oo7eTvkZfJV
-dMdjGSzumye9BggNy7kwUShq+W3jejToKiBbRvZr8dm7ESxKRm3+QzhPpE558tIO
-bbecaQXTkKlUAP3ftmUgTA==
------END CERTIFICATE-----)";
+  auto certificates = crypto::split_x509_cert_bundle(curl_response_body);
 
-  // TODO: Skipped for now: verify endorsements
-  auto vcek_verifier = crypto::make_verifier(crypto::Pem(veck_certificate_pem));
+  // Verify endorsements
+  // TODO: To find in spec
+  constexpr auto amd_root_public_key = R"(-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA0Ld52RJOdeiJlqK2JdsV
+mD7FktuotWwX1fNgW41XY9Xz1HEhSUmhLz9Cu9DHRlvgJSNxbeYYsnJfvyjx1MfU
+0V5tkKiU1EesNFta1kTA0szNisdYc9isqk7mXT5+KfGRbfc4V/9zRIcE8jlHN61S
+1ju8X93+6dxDUrG2SzxqJ4BhqyYmUDruPXJSX4vUc01P7j98MpqOS95rORdGHeI5
+2Naz5m2B+O+vjsC060d37jY9LFeuOP4Meri8qgfi2S5kKqg/aF6aPtuAZQVR7u3K
+FYXP59XmJgtcog05gmI0T/OitLhuzVvpZcLph0odh/1IPXqx3+MnjD97A7fXpqGd
+/y8KxX7jksTEzAOgbKAeam3lm+3yKIcTYMlsRMXPcjNbIvmsBykD//xSniusuHBk
+gnlENEWx1UcbQQrs+gVDkuVPhsnzIRNgYvM48Y+7LGiJYnrmE8xcrexekBxrva2V
+9TJQqnN3Q53kt5viQi3+gCfmkwC0F0tirIZbLkXPrPwzZ0M9eNxhIySb2npJfgnq
+z55I0u33wh4r0ZNQeTGfw03MBUtyuzGesGkcw+loqMaq1qR4tjGbPYxCvpCq7+Og
+pCCoMNit2uLo9M18fHz10lOMT8nWAUvRZFzteXCm+7PHdYPlmQwUw3LvenJ/ILXo
+QPHfbkH0CyPfhl1jWhJFZasCAwEAAQ==
+-----END PUBLIC KEY-----
+)";
+
+  auto actual_amd_root_verifier =
+    crypto::make_verifier(crypto::Pem(certificates[2]));
+  if (
+    actual_amd_root_verifier->public_key_pem() !=
+    crypto::Pem(amd_root_public_key))
+  {
+    LOG_FAIL_FMT("Root AMD public key is not as expected");
+    return 1;
+  }
+
+  auto vcek_verifier = crypto::make_verifier(crypto::Pem(certificates[0]));
+  if (!vcek_verifier->verify_certificate(
+        {&certificates[2]}, {&certificates[1]}))
+  {
+    LOG_FAIL_FMT("VCEK endorsement verification failed!");
+    return 1;
+  }
 
   auto& sig = quote.signature;
   auto& sig_algo = quote.signature_algo;
@@ -282,11 +283,8 @@ bbecaQXTkKlUAP3ftmUgTA==
 
   if (!vcek_verifier->verify(tbs, sig_))
   {
-    LOG_INFO_FMT("Signature verification failed!");
+    LOG_FAIL_FMT("Signature verification failed!");
     return 1;
   }
   LOG_INFO_FMT("Signature successfully verified!");
-
-  // 2. Construct TBS
-  // 3. Verify signature
 }
