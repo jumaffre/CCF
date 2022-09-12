@@ -75,6 +75,13 @@ namespace client
     Unique_SSL_CTX ctx;
     Unique_BIO bio;
 
+    auto get_ciphersuite_name()
+    {
+      SSL* ssl;
+      BIO_get_ssl(bio, &ssl);
+      return SSL_CIPHER_get_name(SSL_get_current_cipher(ssl));
+    }
+
     void init()
     {
       SSL_CTX_clear_mode(ctx, SSL_MODE_AUTO_RETRY);
@@ -107,10 +114,14 @@ namespace client
         BIO_do_connect(bio);
       } while (BIO_should_retry(bio));
 
+      LOG_FAIL_FMT("Connected: {}", get_ciphersuite_name());
+
       do
       {
         BIO_do_handshake(bio);
       } while (BIO_should_retry(bio));
+
+      LOG_FAIL_FMT("handshaked");
 
       connected = true;
     }
@@ -143,13 +154,6 @@ namespace client
     }
 
     virtual ~TlsClient() {}
-
-    auto get_ciphersuite_name()
-    {
-      SSL* ssl;
-      BIO_get_ssl(bio, &ssl);
-      return SSL_CIPHER_get_name(SSL_get_current_cipher(ssl));
-    }
 
     void write(std::span<const uint8_t> b)
     {
@@ -212,10 +216,12 @@ namespace client
       do
       {
         ret = BIO_read(bio, buf.data(), buf.size());
+        LOG_FAIL_FMT("ret: {}", ret);
       } while (ret < 0 && BIO_should_retry(bio));
 
       if (ret > 0)
       {
+        LOG_FAIL_FMT("Something to read: {}", ret);
         buf.resize(ret);
       }
       else if (ret == 0)

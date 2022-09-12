@@ -292,8 +292,11 @@ namespace asynchost
 
       if (!s->connect(host, port))
       {
+        LOG_DEBUG_FMT("Not connected");
         return false;
       }
+
+      LOG_DEBUG_FMT("Connected");
 
       sockets.emplace(id, s);
       return true;
@@ -316,6 +319,7 @@ namespace asynchost
       if (s->second.is_null())
         return false;
 
+      LOG_DEBUG_FMT("Writing to socket, {}", len);
       return s->second->write(len, data, addr);
     }
 

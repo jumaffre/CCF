@@ -57,10 +57,12 @@ namespace client
         path = fmt::format("/{}/{}", prefix.value(), path);
       }
 
+      LOG_FAIL_FMT("Params: {}", params.size());
+
       auto r = http::Request(path, verb);
       r.set_body(params.data(), params.size());
-      r.set_header(http::headers::CONTENT_TYPE, content_type);
-      r.set_header("Host", host);
+      // r.set_header(http::headers::CONTENT_TYPE, content_type);
+      r.set_header(http::headers::HOST, host);
       if (auth_token != nullptr)
       {
         r.set_header(
@@ -88,6 +90,7 @@ namespace client
 
     Response call_raw(const std::vector<uint8_t>& raw)
     {
+      LOG_FAIL_FMT("raw: {}", std::string(raw.begin(), raw.end()));
       write(raw);
       return read_response();
     }
@@ -143,16 +146,14 @@ namespace client
       const char* auth_token = nullptr)
     {
       std::vector<uint8_t> body;
-      if (!params.is_null())
+      std::string content_type = http::headervalues::contenttype::JSON;
+      if (!params.is_null() && verb != HTTP_GET)
       {
+        content_type = http::headervalues::contenttype::MSGPACK;
         body = serdes::pack(params, serdes::Pack::MsgPack);
       }
       return gen_request(
-        method,
-        {body.data(), body.size()},
-        http::headervalues::contenttype::MSGPACK,
-        verb,
-        auth_token);
+        method, {body.data(), body.size()}, content_type, verb, auth_token);
     }
 
     Response call(
@@ -194,6 +195,7 @@ namespace client
                                      it.value().dump());
         }
       }
+      LOG_FAIL_FMT("get: {}", full_path);
       return call(full_path, nullptr, HTTP_GET);
     }
 
@@ -227,8 +229,13 @@ namespace client
       while (!last_response.has_value())
       {
         const auto next = read_all();
+        LOG_FAIL_FMT("here: {}", next.size());
         parser.execute(next.data(), next.size());
       }
+
+      LOG_FAIL_FMT(
+        "Resp: {}",
+        std::string(last_response->body.begin(), last_response->body.end()));
 
       return std::move(last_response.value());
     }

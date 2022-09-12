@@ -78,26 +78,46 @@ namespace ccf::pal
       node_quote_info.quote.assign(quote_bytes, quote_bytes + resp.report_size);
 
       client::RpcTlsClient client{
-        "americas.test.acccache.azure.net",
+        "kdsintf.amd.com",
         "443",
         nullptr,
         std::make_shared<tls::Cert>(
           nullptr, std::nullopt, std::nullopt, std::nullopt, false)};
 
       auto params = nlohmann::json::object();
-      params["api-version"] = "2020-10-15-preview";
+      // params["api-version"] = "2020-10-15-preview";
 
-      auto response = client.get(
-        fmt::format(
-          "/SevSnpVM/certificates/{}/{}",
-          fmt::format("{:02x}", fmt::join(quote->chip_id, "")),
-          fmt::format("{:0x}", *(uint64_t*)(&quote->reported_tcb))),
-        params);
+      // auto uri = fmt::format(
+      //   "/SevSnpVM/certificates/{}/{}",
+      //   fmt::format("{:02x}", fmt::join(quote->chip_id, "")),
+      //   fmt::format("{:0x}", *(uint64_t*)(&quote->reported_tcb)));
+
+      constexpr auto product_name = "Milan";
+      auto uri = fmt::format(
+        "/vcek/v1/{}/{}",
+        product_name,
+        fmt::format("{:02x}", fmt::join(quote->chip_id, "")));
+      params["blSPL"] = quote->reported_tcb.boot_loader;
+      params["teeSPL"] = quote->reported_tcb.tee;
+      params["snpSPL"] = quote->reported_tcb.snp;
+      params["ucodeSPL"] = quote->reported_tcb.microcode;
+
+      CCF_APP_FAIL("Fetching endorsements at {}", uri);
+
+      auto response = client.get(uri, params);
+
+      // TODO: Cert chain:
+      // 1. https://kdsintf.amd.com/vcek/v1/Milan/cert_chain
+      // 2. VECK certificate:
+      // https://kdsintf.amd.com/vcek/v1/Milan/{quote->chip_id}?blSPL={boot_loader}&teeSPL={tee}&snpSPL={microcode}&ucodeSPL={snp}
 
       if (response.status != HTTP_STATUS_OK)
       {
-        throw std::logic_error("Failed to get attestation endorsements");
+        throw std::logic_error(fmt::format(
+          "Failed to get attestation endorsements: {}", response.status));
       }
+
+      CCF_APP_INFO("Endorsements successfully fetched at {}", uri);
 
       node_quote_info.endorsements.assign(
         response.body.begin(), response.body.end());
