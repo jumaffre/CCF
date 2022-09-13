@@ -32,7 +32,7 @@ from loguru import logger as LOG
 
 BASE_NODE_CLIENT_HOST = "127.100.0.0"
 
-NODE_STARTUP_RETRY_COUNT = 5
+NODE_STARTUP_RETRY_COUNT = 10
 
 
 class NodeNetworkState(Enum):

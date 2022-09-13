@@ -215,22 +215,30 @@ namespace client
       auto ret = 0;
       do
       {
+        LOG_FAIL_FMT("About to read: {}", buf.size());
         ret = BIO_read(bio, buf.data(), buf.size());
         LOG_FAIL_FMT("ret: {}", ret);
       } while (ret < 0 && BIO_should_retry(bio));
 
+      std::cout << "here" << std::endl;
+
+      LOG_FAIL_FMT("Now here");
+
       if (ret > 0)
       {
+        std::cout << "there" << std::endl;
         LOG_FAIL_FMT("Something to read: {}", ret);
         buf.resize(ret);
       }
       else if (ret == 0)
       {
+        std::cout << "where" << std::endl;
         connected = false;
         throw std::logic_error("Underlying transport closed");
       }
       else
       {
+        std::cout << "dhere" << std::endl;
         throw std::logic_error(error_string(ERR_get_error()));
       }
 
