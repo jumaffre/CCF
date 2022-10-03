@@ -205,6 +205,13 @@ namespace crypto
         Unique_SSL_OBJECT(
           PEM_read_bio_X509_CRL(mem, NULL, NULL, NULL), X509_CRL_free)
       {}
+      Unique_X509_CRL(const std::vector<uint8_t>& data, bool pem = true) :
+        Unique_SSL_OBJECT(
+          pem ? PEM_read_bio_X509_CRL(
+                  Unique_BIO(data.data(), data.size()), NULL, NULL, NULL) :
+                d2i_X509_CRL_bio(Unique_BIO(data.data(), data.size()), NULL),
+          X509_CRL_free)
+      {}
     };
 
     struct Unique_X509 : public Unique_SSL_OBJECT<X509, X509_new, X509_free>

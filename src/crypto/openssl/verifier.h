@@ -29,6 +29,7 @@ namespace crypto
     virtual bool verify_certificate(
       const std::vector<const Pem*>& trusted_certs,
       const std::vector<const Pem*>& chain = {},
+      const std::vector<std::vector<uint8_t>>& crls = {},
       bool ignore_time = false) override;
 
     virtual bool is_self_signed() const override;

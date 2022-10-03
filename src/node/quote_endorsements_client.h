@@ -7,8 +7,8 @@
 
 namespace ccf
 {
-  using QuoteEndorsementsFetchedCallback =
-    std::function<void(std::vector<uint8_t>&& endorsements)>;
+  using QuoteEndorsementsFetchedCallback = std::function<void(
+    std::vector<uint8_t>&& endorsements_pem, std::vector<uint8_t>&& crl_der)>;
 
   // Resilient client to fetch attestation report endorsement certificate.
   class QuoteEndorsementsClient
@@ -33,6 +33,7 @@ namespace ccf
     QuoteEndorsementsFetchedCallback done_cb;
 
     std::vector<uint8_t> endorsements_pem;
+    std::vector<uint8_t> crl_der = {};
 
     // Uniquely identify each received request. We assume that this client sends
     // requests in series, after receiving the response to each one or after a
@@ -133,17 +134,27 @@ namespace ccf
         std::chrono::milliseconds(server_connection_timeout_s * 1000));
     }
 
-    void handle_success_response(std::vector<uint8_t>&& data, bool is_der)
+    void handle_success_response(
+      std::vector<uint8_t>&& data, bool is_der, bool is_crl = false)
     {
-      if (is_der)
+      if (is_crl)
       {
-        auto raw = crypto::cert_der_to_pem(data).raw();
-        endorsements_pem.insert(endorsements_pem.end(), raw.begin(), raw.end());
+        // TODO: Check is Azure has CRL too!
+        crl_der.insert(crl_der.end(), data.begin(), data.end());
       }
       else
       {
-        endorsements_pem.insert(
-          endorsements_pem.end(), data.begin(), data.end());
+        if (is_der)
+        {
+          auto raw = crypto::cert_der_to_pem(data).raw();
+          endorsements_pem.insert(
+            endorsements_pem.end(), raw.begin(), raw.end());
+        }
+        else
+        {
+          endorsements_pem.insert(
+            endorsements_pem.end(), data.begin(), data.end());
+        }
       }
 
       auto& server = config.servers.front();
@@ -152,7 +163,7 @@ namespace ccf
       {
         LOG_INFO_FMT("Complete endorsement chain successfully retrieved");
         has_completed = true;
-        done_cb(std::move(endorsements_pem));
+        done_cb(std::move(endorsements_pem), std::move(crl_der));
       }
       else
       {
@@ -182,7 +193,8 @@ namespace ccf
               "{} bytes",
               data.size());
 
-            handle_success_response(std::move(data), endpoint.response_is_der);
+            handle_success_response(
+              std::move(data), endpoint.response_is_der, endpoint.is_crl);
             return;
           }
 

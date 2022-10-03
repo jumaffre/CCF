@@ -95,6 +95,7 @@ namespace crypto
   bool Verifier_OpenSSL::verify_certificate(
     const std::vector<const Pem*>& trusted_certs,
     const std::vector<const Pem*>& chain,
+    const std::vector<std::vector<uint8_t>>& crls,
     bool ignore_time)
   {
     Unique_X509_STORE store;
@@ -115,6 +116,15 @@ namespace crypto
 
       CHECK1(sk_X509_push(chain_stack, cert));
       CHECK1(X509_up_ref(cert));
+    }
+
+    // TODO: Add CRLs
+    for (auto& crl : crls)
+    {
+      LOG_FAIL_FMT("One crl of size: {}", crl.size());
+      // Unique_BIO crlbio(crl);
+      Unique_X509_CRL c(crl, false); // TODO: Would be nice if CRLs were PEM
+      CHECK1(X509_STORE_add_crl(store, c));
     }
 
     // Allow to use intermediate CAs as trust anchors

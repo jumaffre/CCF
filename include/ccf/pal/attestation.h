@@ -158,8 +158,11 @@ namespace ccf::pal
       }
 
       auto chip_cert_verifier = crypto::make_verifier(chip_certificate);
+      // TODO: Is this right? Does this verify all the way up to the root?
       if (!chip_cert_verifier->verify_certificate(
-            {&root_certificate, &sev_version_certificate}))
+            {&root_certificate, &sev_version_certificate},
+            {},
+            {quote_info.endorsements_crl}))
       {
         throw std::logic_error(
           "The chain of signatures from the root of trust to this "

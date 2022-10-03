@@ -313,7 +313,7 @@ namespace ccf::historical
 
         auto v = crypto::make_unique_verifier(*receipt.node_cert);
         if (!v->verify_certificate(
-              {&network_identity->cert}, {}, /* ignore_time */ true))
+              {&network_identity->cert}, {}, {}, /* ignore_time */ true))
         {
           // The current service identity does not endorse the node certificate
           // in the receipt, so we search for the the most recent write to the

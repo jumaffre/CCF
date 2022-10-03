@@ -96,6 +96,7 @@ namespace ccf
       crypto::Pem prev_pem(*prev_service_identity);
       if (!v->verify_certificate(
             {&prev_pem},
+            {},
             {}, /* ignore_time */
             true))
       {

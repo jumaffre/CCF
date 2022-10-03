@@ -24,6 +24,7 @@ namespace ccf::pal::snp
       std::string uri;
       std::map<std::string, std::string> params;
       bool response_is_der = false;
+      bool is_crl = false;
     };
     using Server = std::list<EndpointInfo>;
 
@@ -90,6 +91,13 @@ namespace ccf::pal::snp
        "443",
        fmt::format("/vcek/v1/{}/cert_chain", product_name),
        {}});
+    server.push_back(
+      {endpoint,
+       "443",
+       fmt::format("/vcek/v1/{}/crl", product_name),
+       {},
+       true,
+       true});
 
     return server;
   }

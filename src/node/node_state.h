@@ -354,11 +354,14 @@ namespace ccf
           quote_endorsements_client = std::make_shared<QuoteEndorsementsClient>(
             rpcsessions,
             endpoint_config,
-            [this, quote_info_](std::vector<uint8_t>&& endorsements) {
+            [this, quote_info_](
+              std::vector<uint8_t>&& endorsements_pem,
+              std::vector<uint8_t>&& crl_der) {
               // Note: Only called for SEV-SNP
               std::lock_guard<pal::Mutex> guard(lock);
               quote_info = quote_info_;
-              quote_info.endorsements = std::move(endorsements);
+              quote_info.endorsements = std::move(endorsements_pem);
+              quote_info.endorsements_crl = std::move(crl_der);
               launch_node();
               quote_endorsements_client.reset();
             });
