@@ -95,7 +95,7 @@ namespace crypto
   bool Verifier_OpenSSL::verify_certificate(
     const std::vector<const Pem*>& trusted_certs,
     const std::vector<const Pem*>& chain,
-    const std::vector<std::vector<uint8_t>>& crls,
+    const std::vector<const Pem*>& crls,
     bool ignore_time)
   {
     Unique_X509_STORE store;
@@ -119,11 +119,12 @@ namespace crypto
     }
 
     // TODO: Add CRLs
-    for (auto& crl : crls)
+    for (auto& pem : crls)
     {
-      LOG_FAIL_FMT("One crl of size: {}", crl.size());
+      LOG_FAIL_FMT("One crl of size: {}", pem->raw().size());
       // Unique_BIO crlbio(crl);
-      Unique_X509_CRL c(crl, false); // TODO: Would be nice if CRLs were PEM
+      Unique_BIO crlbio(*pem);
+      Unique_X509_CRL c(crlbio);
       CHECK1(X509_STORE_add_crl(store, c));
     }
 

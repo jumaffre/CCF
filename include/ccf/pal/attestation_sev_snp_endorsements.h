@@ -52,6 +52,7 @@ namespace ccf::pal::snp
     const std::string& chip_id_hex,
     const std::string& reported_tcb)
   {
+    // TODO: Support CRLs for Azure (url currently unknown)
     std::map<std::string, std::string> params;
     params["api-version"] = "2020-10-15-preview";
     return {

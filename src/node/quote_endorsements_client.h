@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ccf/pal/attestation.h"
+#include "crypto/crl.h"
 #include "enclave/rpc_sessions.h"
 
 namespace ccf
@@ -140,15 +141,25 @@ namespace ccf
       if (is_crl)
       {
         // TODO: Check is Azure has CRL too!
-        crl_der.insert(crl_der.end(), data.begin(), data.end());
+        // It looks like it's not served yet?
+        // TODO: Convert CRL DER to PEM
+        if (is_der)
+        {
+          auto pem = crypto::crl_der_to_pem(data).raw();
+          crl_der.insert(crl_der.end(), pem.begin(), pem.end());
+        }
+        else
+        {
+          crl_der.insert(crl_der.end(), data.begin(), data.end());
+        }
       }
       else
       {
         if (is_der)
         {
-          auto raw = crypto::cert_der_to_pem(data).raw();
+          auto pem = crypto::cert_der_to_pem(data).raw();
           endorsements_pem.insert(
-            endorsements_pem.end(), raw.begin(), raw.end());
+            endorsements_pem.end(), pem.begin(), pem.end());
         }
         else
         {

@@ -4,6 +4,7 @@
 #pragma once
 #include "ccf/ds/json.h"
 
+#include <variant>
 #include <vector>
 
 namespace ccf
@@ -20,6 +21,19 @@ namespace ccf
     {{QuoteFormat::oe_sgx_v1, "OE_SGX_v1"},
      {QuoteFormat::insecure_virtual, "Insecure_Virtual"},
      {QuoteFormat::amd_sev_snp_v1, "AMD_SEV_SNP_v1"}});
+
+  struct QuoteEndorsements
+  {
+    /// Endorsement certificates
+    std::vector<uint8_t> certificates;
+    /// Endorsement certificate revocation lists
+    std::vector<uint8_t> crls;
+    /// Root public key
+    std::vector<uint8_t> root_public_key;
+  };
+  DECLARE_JSON_TYPE(QuoteEndorsements);
+  DECLARE_JSON_REQUIRED_FIELDS(
+    QuoteEndorsements, certificates, crls, root_public_key);
 
   /// Describes a quote (attestation) from trusted hardware
   struct QuoteInfo

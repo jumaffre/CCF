@@ -372,6 +372,8 @@ TEST_CASE("Extract public key from csr")
   create_csr_and_extract_pubk<KeyPair_OpenSSL>();
 }
 
+// TODO: Convert CRL to PEM
+
 template <typename T, typename S>
 void run_csr(bool corrupt_csr = false)
 {
