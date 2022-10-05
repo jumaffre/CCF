@@ -33,7 +33,7 @@ namespace ccf
     pal::snp::EndorsementEndpointsConfiguration config;
     QuoteEndorsementsFetchedCallback done_cb;
 
-    std::vector<uint8_t> endorsements_pem;
+    std::vector<uint8_t> endorsements_pem = {};
     std::vector<uint8_t> crl_der = {};
 
     // Uniquely identify each received request. We assume that this client sends
@@ -120,9 +120,23 @@ namespace ccf
             if (
               msg->data.self->server_retries_count >= max_server_retries_count)
             {
-              // Move on to next server if we have passed max retries count
-              servers.pop_front();
+              if (servers.size() > 1)
+              {
+                // Move on to next server if we have passed max retries count
+                servers.pop_front();
+              }
+              else
+              {
+                auto& server = servers.front();
+                LOG_FAIL_FMT(
+                  "Giving up retrying fetching attestation endorsements from "
+                  "{} after {} attempts ",
+                  server.front().host,
+                  max_server_retries_count);
+                return;
+              }
             }
+
             msg->data.self->fetch(servers.front());
           }
         },
@@ -138,6 +152,13 @@ namespace ccf
     void handle_success_response(
       std::vector<uint8_t>&& data, bool is_der, bool is_crl = false)
     {
+      if (has_completed)
+      {
+        // We may receive a response to an in-flight request after having
+        // fetched all endorsements
+        return;
+      }
+
       if (is_crl)
       {
         // TODO: Check is Azure has CRL too!
