@@ -132,6 +132,9 @@ namespace ccf::pal
         unique_id.begin());
 
       // TODO: Deserialise certs and CRLs from quote_info.endorsements
+
+      // TODO: Split CRL bundle just like certs, just in case there's more than
+      // one
       auto certificates = crypto::split_x509_cert_bundle(std::string(
         quote_info.endorsements.begin(), quote_info.endorsements.end()));
       auto chip_certificate = certificates[0];

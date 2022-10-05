@@ -174,6 +174,10 @@ namespace ccf
         {
           crl_der.insert(crl_der.end(), data.begin(), data.end());
         }
+        LOG_INFO_FMT(
+          "Successfully retrieved endorsements CRL for attestation report: "
+          "{} bytes",
+          data.size());
       }
       else
       {
@@ -188,13 +192,17 @@ namespace ccf
           endorsements_pem.insert(
             endorsements_pem.end(), data.begin(), data.end());
         }
+        LOG_INFO_FMT(
+          "Successfully retrieved endorsements certificates for attestation "
+          "report: {} bytes",
+          data.size());
       }
 
       auto& server = config.servers.front();
       server.pop_front();
       if (server.empty())
       {
-        LOG_INFO_FMT("Complete endorsement chain successfully retrieved");
+        LOG_INFO_FMT("Complete endorsements successfully retrieved");
         has_completed = true;
         done_cb(std::move(endorsements_pem), std::move(crl_der));
       }
@@ -221,11 +229,6 @@ namespace ccf
 
           if (status == HTTP_STATUS_OK)
           {
-            LOG_INFO_FMT(
-              "Successfully retrieved endorsements for attestation report: "
-              "{} bytes",
-              data.size());
-
             handle_success_response(
               std::move(data), endpoint.response_is_der, endpoint.is_crl);
             return;
