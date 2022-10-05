@@ -131,6 +131,7 @@ namespace ccf::pal
         std::end(quote.measurement),
         unique_id.begin());
 
+      // TODO: Deserialise certs and CRLs from quote_info.endorsements
       auto certificates = crypto::split_x509_cert_bundle(std::string(
         quote_info.endorsements.begin(), quote_info.endorsements.end()));
       auto chip_certificate = certificates[0];
@@ -156,10 +157,18 @@ namespace ccf::pal
           "signed as expected");
       }
 
-      auto crl_pem = crypto::Pem(quote_info.endorsements_crl);
+      // TODO: ugly!
+      std::vector<const crypto::Pem*> crls_pem = {};
+      std::unique_ptr<crypto::Pem> crl_pem = nullptr;
+      if (!quote_info.endorsements_crl.empty())
+      {
+        crl_pem = std::make_unique<crypto::Pem>(quote_info.endorsements_crl);
+        crls_pem.push_back(crl_pem.get());
+      }
+
       auto chip_cert_verifier = crypto::make_verifier(chip_certificate);
       if (!chip_cert_verifier->verify_certificate(
-            {&root_certificate}, {&sev_version_certificate}, {&crl_pem}))
+            {&root_certificate}, {&sev_version_certificate}, crls_pem))
       {
         throw std::logic_error(
           "The chain of signatures from the root of trust to this "

@@ -164,6 +164,7 @@ namespace ccf
         // TODO: Check is Azure has CRL too!
         // It looks like it's not served yet?
         // TODO: Convert CRL DER to PEM
+        crl_der = std::vector<uint8_t>();
         if (is_der)
         {
           auto pem = crypto::crl_der_to_pem(data).raw();
