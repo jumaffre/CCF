@@ -42,8 +42,58 @@ namespace ccf::grpc
     {
       return http_responder->close_stream(std::move(trailers));
     }
+
+    std::optional<std::vector<uint8_t>> read_data(size_t size)
+    {
+      return http_responder->read_stream(size);
+    }
   };
 
+  template <typename T>
+  class ReadStream : public BaseStream
+  {
+  public:
+    ReadStream(const std::shared_ptr<http::HTTPResponder>& r) : BaseStream(r) {}
+
+    T read_msg()
+    {
+      auto message_frame = read_data(impl::message_frame_length);
+      if (!message_frame.has_value())
+      {
+        LOG_FAIL_FMT("Error reading gRPC message frame");
+        throw std::logic_error("No gRPC message frame!");
+      }
+
+      auto& m = message_frame.value();
+      const uint8_t* data = m.data();
+      auto size = m.size();
+      LOG_FAIL_FMT("here");
+      auto message_length = impl::read_message_frame(data, size);
+
+      LOG_FAIL_FMT("Message length: {}", message_length);
+
+      auto message = read_data(message_length);
+      if (!message.has_value())
+      {
+        LOG_FAIL_FMT("Error reading full gRPC message");
+        throw std::logic_error("No gRPC message!");
+      }
+
+      T msg;
+      if (!msg.ParseFromArray(message->data(), message->size()))
+      {
+        LOG_FAIL_FMT("Error parsing gRPC message");
+        throw std::logic_error(fmt::format(
+          "Error deserialising protobuf payload of type {}, size {}",
+          msg.GetTypeName(),
+          message->size()));
+      }
+
+      return msg;
+    }
+  };
+
+  // TODO: Rename to WriteStream (or OutStream)
   template <typename T>
   class Stream : public BaseStream
   {
@@ -103,6 +153,9 @@ namespace ccf::grpc
   using StreamPtr = std::unique_ptr<Stream<T>>;
 
   template <typename T>
+  using ReadStreamPtr = std::unique_ptr<ReadStream<T>>;
+
+  template <typename T>
   using DetachedStreamPtr = std::unique_ptr<DetachedStream<T>>;
 
   static std::shared_ptr<http::HTTPResponder> get_http_responder(
@@ -124,6 +177,13 @@ namespace ccf::grpc
   {
     return std::make_unique<Stream<T>>(
       get_http_responder(rpc_ctx), status, headers);
+  }
+
+  template <typename T>
+  static ReadStreamPtr<T> make_read_stream(
+    const std::shared_ptr<ccf::RpcContext>& rpc_ctx)
+  {
+    return std::make_unique<ReadStream<T>>(get_http_responder(rpc_ctx));
   }
 
   template <typename T>

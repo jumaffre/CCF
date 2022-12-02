@@ -226,6 +226,44 @@ namespace http2
   public:
     ServerParser(http::RequestProcessor& proc_) : Parser(false), proc(proc_) {}
 
+    // TODO: Replace with std::span<const uint8_t>
+    std::optional<std::vector<uint8_t>> read_stream(
+      StreamId stream_id, size_t to_read)
+    {
+      LOG_TRACE_FMT(
+        "http2::read_stream: stream {} - to read {} bytes", stream_id, to_read);
+
+      auto* stream_data = get_stream_data(session, stream_id);
+      if (stream_data == nullptr)
+      {
+        throw std::logic_error(
+          fmt::format("Stream {} no longer exists", stream_id));
+      }
+
+      // TODO: Use data source
+      static size_t current_offset = 0;
+
+      LOG_FAIL_FMT(
+        "Reading: {} bytes, from offset {}", to_read, current_offset);
+
+      auto const& data = stream_data->incoming.body;
+
+      LOG_FAIL_FMT("Current incoming data size: {}", data.size());
+
+      if (data.size() - current_offset >= to_read)
+      {
+        LOG_FAIL_FMT("Returning {} bytes", to_read);
+        current_offset += to_read;
+        return std::vector<uint8_t>{
+          data.begin() + current_offset,
+          data.begin() + current_offset + to_read};
+      }
+
+      LOG_FAIL_FMT("Returning nothing");
+
+      return std::nullopt;
+    }
+
     void respond(
       StreamId stream_id,
       http_status status,
@@ -292,8 +330,10 @@ namespace http2
 
       if (stream_data->outgoing.state != StreamResponseState::Uninitialised)
       {
-        throw std::logic_error(fmt::format(
-          "Stream {} should be uninitialised to start stream", stream_id));
+        LOG_FAIL_FMT("Stream already started");
+        return;
+        // throw std::logic_error(fmt::format(
+        //   "Stream {} should be uninitialised to start stream", stream_id));
       }
 
       stream_data->outgoing.state = StreamResponseState::Streaming;

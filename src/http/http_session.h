@@ -285,6 +285,11 @@ namespace http
       return true;
     }
 
+    std::optional<std::vector<uint8_t>> read_stream(size_t size) override
+    {
+      throw std::logic_error("Not implemented!");
+    }
+
     bool start_stream(
       http_status status, const http::HeaderMap& headers) override
     {

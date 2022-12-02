@@ -22,11 +22,12 @@ namespace ccf::grpc
       auto compressed_flag = serialized::read<CompressedFlag>(data, size);
       if (compressed_flag >= 1)
       {
-        throw std::logic_error(fmt::format(
-          "gRPC compressed flag has unexpected value {} - currently only "
-          "support "
-          "unencoded gRPC payloads",
-          compressed_flag));
+        LOG_FAIL_FMT("here: {}", compressed_flag);
+        // throw std::logic_error(fmt::format(
+        //   "gRPC compressed flag has unexpected value {} - currently only "
+        //   "support "
+        //   "unencoded gRPC payloads",
+        //   compressed_flag));
       }
       return ntohl(serialized::read<MessageLength>(data, size));
     }

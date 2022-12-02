@@ -139,6 +139,29 @@ namespace http
       return true;
     }
 
+    // TODO: Return error to caller for when stream has been closed.
+    std::optional<std::vector<uint8_t>> read_stream(size_t size) override
+    {
+      auto sp = server_parser.lock();
+      if (sp)
+      {
+        try
+        {
+          return sp->read_stream(stream_id, size);
+        }
+        catch (const std::exception& e)
+        {
+          LOG_DEBUG_FMT("Error sending headers {}: {}", stream_id, e.what());
+          return std::nullopt;
+        }
+      }
+      else
+      {
+        LOG_DEBUG_FMT("Stream {} is closed", stream_id);
+        return std::nullopt;
+      }
+    }
+
     bool start_stream(
       http_status status, const http::HeaderMap& headers) override
     {
@@ -401,6 +424,12 @@ namespace http
       return get_stream_responder(http::DEFAULT_STREAM_ID)
         ->send_response(
           status_code, std::move(headers), std::move(trailers), body);
+    }
+
+    std::optional<std::vector<uint8_t>> read_stream(size_t size) override
+    {
+      LOG_FAIL_FMT("Read stream: {}", size);
+      return get_stream_responder(http::DEFAULT_STREAM_ID)->read_stream(size);
     }
 
     bool start_stream(

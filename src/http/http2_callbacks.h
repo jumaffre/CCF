@@ -29,12 +29,17 @@ namespace http2
     auto& body = stream_data->outgoing.body.ro_data();
     size_t to_read = std::min(body.size(), length);
 
+    LOG_TRACE_FMT(
+      "http2::read_outgoing_callback, stream: {} - to read {} bytes",
+      stream_id,
+      to_read);
+
     if (
       to_read == 0 &&
       stream_data->outgoing.state == StreamResponseState::Streaming)
     {
       // Early out: when streaming, avoid calling this callback
-      // repeatedly when there no data to read
+      // repeatedly when there is no data to read
       return NGHTTP2_ERR_DEFERRED;
     }
 
@@ -82,8 +87,20 @@ namespace http2
           return 0;
         }
 
+        auto& headers = stream_data->incoming.headers;
+        std::string url = {};
+        {
+          const auto url_it = headers.find(http2::headers::PATH);
+          if (url_it != headers.end())
+          {
+            url = url_it->second;
+          }
+        }
+
         // If the request is complete, process it
-        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
+        if (
+          frame->hd.flags & NGHTTP2_FLAG_END_STREAM ||
+          url == "/temp.Test/ClientStream")
         {
           auto* p = get_parser(user_data);
           p->handle_completed(stream_id, stream_data);

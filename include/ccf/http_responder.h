@@ -18,6 +18,8 @@ namespace http
       http::HeaderMap&& trailers,
       std::span<const uint8_t> body) = 0;
 
+    virtual std::optional<std::vector<uint8_t>> read_stream(size_t size) = 0;
+
     virtual bool start_stream(
       http_status status, const http::HeaderMap& headers) = 0;
 

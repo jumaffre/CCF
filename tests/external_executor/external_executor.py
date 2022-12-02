@@ -464,47 +464,60 @@ def test_async_streaming(network, args):
         event_message = "event_message"
         event = Misc.Event(name=event_name)
 
-        q = queue.Queue()
+        def generate_events(length):
+            for i in range(length):
+                yield Misc.Event(name=f"{event_name} [{i}]")
 
-        def subscribe(event_name):
-            credentials = grpc.ssl_channel_credentials(
-                open(os.path.join(network.common_dir, "service_cert.pem"), "rb").read()
-            )
-            with grpc.secure_channel(
-                target=f"{primary.get_public_rpc_host()}:{primary.get_public_rpc_port()}",
-                credentials=credentials,
-            ) as channel:
-                s = MiscService.TestStub(channel)
-                LOG.debug(f"Waiting for event {event_name}...")
-                for e in s.Sub(event_name):  # Blocking
-                    q.put(e)
-                    return
+        events = []
+        for e in generate_events(10):
+            events.append(e)
 
-        t = threading.Thread(target=subscribe, args=(event,))
-        t.start()
+        LOG.error(len(events))
 
-        LOG.info(f"Publishing event {event_name}")
-        # Note: There may not be any subscriber yet, so retry until there is one
-        while True:
-            try:
-                s.Pub(Misc.EventInfo(name=event_name, message=event_message))
-                break
-            except grpc.RpcError:
-                LOG.debug(f"Waiting for subscriber for event {event_name}")
-            time.sleep(0.1)
+        LOG.error("Calling client stream!")
+        for event_info in s.ClientStream(e for e in events):
+            LOG.error(event_info)
+        # q = queue.Queue()
 
-        t.join()
+        # def subscribe(event_name):
+        #     credentials = grpc.ssl_channel_credentials(
+        #         open(os.path.join(network.common_dir, "service_cert.pem"), "rb").read()
+        #     )
+        #     with grpc.secure_channel(
+        #         target=f"{primary.get_public_rpc_host()}:{primary.get_public_rpc_port()}",
+        #         credentials=credentials,
+        #     ) as channel:
+        #         s = MiscService.TestStub(channel)
+        #         LOG.debug(f"Waiting for event {event_name}...")
+        #         for e in s.Sub(event_name):  # Blocking
+        #             q.put(e)
+        #             return
 
-        # Assert that expected message was received by subscriber
-        assert q.qsize() == 1
-        res_event = q.get()
-        assert res_event.name == event_name
-        assert res_event.message == event_message
+        # t = threading.Thread(target=subscribe, args=(event,))
+        # t.start()
 
-        # Subscriber session is now closed but server-side detached stream
-        # still exists in the app. Make sure that streaming on closed
-        # session does not cause a node crash.
-        s.Pub(Misc.EventInfo(name=event_name, message=event_message))
+        # LOG.info(f"Publishing event {event_name}")
+        # # Note: There may not be any subscriber yet, so retry until there is one
+        # while True:
+        #     try:
+        #         s.Pub(Misc.EventInfo(name=event_name, message=event_message))
+        #         break
+        #     except grpc.RpcError:
+        #         LOG.debug(f"Waiting for subscriber for event {event_name}")
+        #     time.sleep(0.1)
+
+        # t.join()
+
+        # # Assert that expected message was received by subscriber
+        # assert q.qsize() == 1
+        # res_event = q.get()
+        # assert res_event.name == event_name
+        # assert res_event.message == event_message
+
+        # # Subscriber session is now closed but server-side detached stream
+        # # still exists in the app. Make sure that streaming on closed
+        # # session does not cause a node crash.
+        # s.Pub(Misc.EventInfo(name=event_name, message=event_message))
 
     return network
 
@@ -598,14 +611,14 @@ def run(args):
                 == "HTTP2"
             ), "Target node does not support HTTP/2"
 
-        network = test_executor_registration(network, args)
-        network = test_kv(network, args)
-        network = test_simple_executor(network, args)
-        network = test_parallel_executors(network, args)
-        network = test_streaming(network, args)
+        # network = test_executor_registration(network, args)
+        # network = test_kv(network, args)
+        # network = test_simple_executor(network, args)
+        # network = test_parallel_executors(network, args)
+        # network = test_streaming(network, args)
         network = test_async_streaming(network, args)
-        network = test_logging_executor(network, args)
-        network = test_multiple_executors(network, args)
+        # network = test_logging_executor(network, args)
+        # network = test_multiple_executors(network, args)
 
 
 if __name__ == "__main__":

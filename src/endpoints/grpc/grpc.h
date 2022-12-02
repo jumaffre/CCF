@@ -20,6 +20,8 @@ namespace ccf::grpc
     auto request_content_type =
       ctx->get_request_header(http::headers::CONTENT_TYPE);
 
+    LOG_FAIL_FMT("Request body size: {}", request_body.size());
+
     auto data = request_body.data();
     auto size = request_body.size();
 
@@ -44,7 +46,7 @@ namespace ccf::grpc
         {
           throw std::logic_error(fmt::format(
             "Error in gRPC frame: only {} bytes remaining but message header "
-            "says messages is {} bytes",
+            "says messages are {} bytes",
             size,
             message_length));
         }
@@ -67,22 +69,38 @@ namespace ccf::grpc
     }
     else
     {
-      const auto message_length = impl::read_message_frame(data, size);
-      if (size != message_length)
-      {
-        throw std::logic_error(fmt::format(
-          "Error in gRPC frame: frame size is {} but messages is {} bytes",
-          size,
-          message_length));
-      }
-
+      // TODO: Store this in stream data
+      static size_t read_so_far = 0;
+      auto data_ = data + read_so_far;
+      auto size_ = size - read_so_far;
+      LOG_FAIL_FMT("read so far: {}", read_so_far);
       In in;
-      if (!in.ParseFromArray(data, message_length))
+      try
       {
-        throw std::logic_error(fmt::format(
-          "Error deserialising protobuf payload of type {}, size {}",
-          in.GetTypeName(),
-          size));
+        const auto message_length = impl::read_message_frame(data_, size_);
+
+        if (message_length > size_)
+        {
+          throw std::logic_error(fmt::format(
+            "Error in gRPC frame: only {} bytes remaining but message header "
+            "says message is {} bytes",
+            size_,
+            message_length));
+        }
+        read_so_far += message_length + grpc::impl::message_frame_length;
+
+        if (!in.ParseFromArray(data_, message_length))
+        {
+          throw std::logic_error(fmt::format(
+            "Error deserialising protobuf payload of type {}, size {}",
+            in.GetTypeName(),
+            size_));
+        }
+      }
+      catch (const std::exception& e)
+      {
+        // Note: Client streaming!
+        LOG_FAIL_FMT("Error deserialising payload: {}", e.what());
       }
       return in;
     }
@@ -160,6 +178,13 @@ namespace ccf
       endpoints::CommandEndpointContext&, In&&, grpc::StreamPtr<Out>&&)>;
 
   template <typename In, typename Out>
+  using GrpcCommandStreamStreamEndpoint =
+    std::function<grpc::GrpcAdapterEmptyResponse(
+      endpoints::CommandEndpointContext&,
+      grpc::ReadStreamPtr<In>&&,
+      grpc::StreamPtr<Out>&&)>;
+
+  template <typename In, typename Out>
   endpoints::EndpointFunction grpc_adapter(const GrpcEndpoint<In, Out>& f)
   {
     return [f](endpoints::EndpointContext& ctx) {
@@ -198,6 +223,19 @@ namespace ccf
       grpc::set_grpc_response<grpc::EmptyResponse>(
         f(ctx,
           grpc::get_grpc_payload<In>(ctx.rpc_ctx),
+          grpc::make_stream<Out>(ctx.rpc_ctx)),
+        ctx.rpc_ctx);
+    };
+  }
+
+  template <typename In, typename Out>
+  endpoints::CommandEndpointFunction grpc_command_stream_stream_adapter(
+    const GrpcCommandStreamStreamEndpoint<In, Out>& f)
+  {
+    return [f](endpoints::CommandEndpointContext& ctx) {
+      grpc::set_grpc_response<grpc::EmptyResponse>(
+        f(ctx,
+          grpc::make_read_stream<In>(ctx.rpc_ctx),
           grpc::make_stream<Out>(ctx.rpc_ctx)),
         ctx.rpc_ctx);
     };

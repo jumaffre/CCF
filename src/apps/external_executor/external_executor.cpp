@@ -764,6 +764,32 @@ namespace externalexecutor
         ccf::no_auth_required)
         .set_forwarding_required(ccf::endpoints::ForwardingRequired::Never)
         .install();
+
+      auto client_stream =
+        [this](
+          ccf::endpoints::CommandEndpointContext& ctx,
+          ccf::grpc::ReadStreamPtr<temp::Event>&& in_stream,
+          ccf::grpc::StreamPtr<temp::EventInfo>&& out_stream) {
+          temp::EventInfo event_info;
+          static size_t count = 0;
+
+          auto event = in_stream->read_msg();
+          LOG_FAIL_FMT("Message: {}", event.SerializeAsString());
+          event_info.set_name("My event");
+          event_info.set_message(fmt::format("message: {}", count++));
+          out_stream->stream_msg(event_info);
+
+          // LOG_FAIL_FMT("Event: {}", payload.SerializeAsString());
+
+          return ccf::grpc::make_pending();
+        };
+      make_endpoint(
+        "/temp.Test/ClientStream",
+        HTTP_POST,
+        ccf::grpc_command_stream_stream_adapter<temp::Event, temp::EventInfo>(
+          client_stream),
+        {ccf::no_auth_required})
+        .install();
     }
 
     ccf::endpoints::EndpointDefinitionPtr find_endpoint(

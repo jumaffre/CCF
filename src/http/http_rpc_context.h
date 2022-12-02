@@ -48,6 +48,7 @@ namespace http
     http::HeaderMap request_headers = {};
 
     std::vector<uint8_t> request_body = {};
+    std::span<uint8_t> request_body_span;
 
     std::shared_ptr<HTTPResponder> responder = nullptr;
 
