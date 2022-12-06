@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/crypto/base64.h"
 #include "ccf/http_header_map.h"
 #include "message.h"
 #include "status.h"
@@ -64,10 +65,13 @@ namespace ccf::grpc
         throw std::logic_error("No gRPC message frame!");
       }
 
+      LOG_FAIL_FMT(
+        "Message frame: {}", crypto::b64_from_raw(message_frame.value()));
+
       auto& m = message_frame.value();
       const uint8_t* data = m.data();
       auto size = m.size();
-      LOG_FAIL_FMT("here");
+      LOG_FAIL_FMT("here: {}", size);
       auto message_length = impl::read_message_frame(data, size);
 
       LOG_FAIL_FMT("Message length: {}", message_length);

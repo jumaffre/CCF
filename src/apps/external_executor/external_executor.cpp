@@ -773,8 +773,21 @@ namespace externalexecutor
           temp::EventInfo event_info;
           static size_t count = 0;
 
-          auto event = in_stream->read_msg();
-          LOG_FAIL_FMT("Message: {}", event.SerializeAsString());
+          LOG_FAIL_FMT("/ClientStream handler");
+
+          temp::Event in = {};
+
+          try
+          {
+            in = in_stream->read_msg();
+          }
+          catch (const std::exception& e)
+          {
+            LOG_FAIL_FMT("Nothing to read yet");
+            return ccf::grpc::make_pending();
+          }
+
+          LOG_FAIL_FMT("Message: {}", in.SerializeAsString());
           event_info.set_name("My event");
           event_info.set_message(fmt::format("message: {}", count++));
           out_stream->stream_msg(event_info);

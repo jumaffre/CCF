@@ -226,6 +226,9 @@ namespace http2
   public:
     ServerParser(http::RequestProcessor& proc_) : Parser(false), proc(proc_) {}
 
+    // TODO: Use data source
+    size_t current_offset = 0;
+
     // TODO: Replace with std::span<const uint8_t>
     std::optional<std::vector<uint8_t>> read_stream(
       StreamId stream_id, size_t to_read)
@@ -240,9 +243,6 @@ namespace http2
           fmt::format("Stream {} no longer exists", stream_id));
       }
 
-      // TODO: Use data source
-      static size_t current_offset = 0;
-
       LOG_FAIL_FMT(
         "Reading: {} bytes, from offset {}", to_read, current_offset);
 
@@ -253,10 +253,12 @@ namespace http2
       if (data.size() - current_offset >= to_read)
       {
         LOG_FAIL_FMT("Returning {} bytes", to_read);
-        current_offset += to_read;
-        return std::vector<uint8_t>{
+        std::vector<uint8_t> ret = {
           data.begin() + current_offset,
           data.begin() + current_offset + to_read};
+        current_offset += to_read;
+        LOG_FAIL_FMT("Offset is now {}", current_offset);
+        return ret;
       }
 
       LOG_FAIL_FMT("Returning nothing");
@@ -356,8 +358,10 @@ namespace http2
 
       if (stream_data->outgoing.state != StreamResponseState::Streaming)
       {
-        throw std::logic_error(
-          fmt::format("Stream {} should be streaming to send data", stream_id));
+        throw std::logic_error(fmt::format(
+          "Stream {} should be streaming to send data, current state: {}",
+          stream_id,
+          stream_data->outgoing.state));
       }
 
       stream_data->outgoing.body = DataSource(data);

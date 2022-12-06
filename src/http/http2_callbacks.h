@@ -164,11 +164,18 @@ namespace http2
     size_t len,
     void* user_data)
   {
-    LOG_TRACE_FMT("http2::on_data_callback: {}", stream_id);
+    LOG_TRACE_FMT(
+      "http2::on_data_callback for stream {}: {} bytes", stream_id, len);
 
     auto* stream_data = get_stream_data(session, stream_id);
+
+    LOG_FAIL_FMT("Data: {}", crypto::b64_from_raw(data, len));
+
     stream_data->incoming.body.insert(
       stream_data->incoming.body.end(), data, data + len);
+
+    LOG_FAIL_FMT(
+      "Incoming body size is now: {}", stream_data->incoming.body.size());
 
     return 0;
   }

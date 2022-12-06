@@ -475,8 +475,14 @@ def test_async_streaming(network, args):
         LOG.error(len(events))
 
         LOG.error("Calling client stream!")
+        count = 0
+        max_count = 9
         for event_info in s.ClientStream(e for e in events):
-            LOG.error(event_info)
+            LOG.debug(event_info)
+            count += 1
+            if count >= max_count:
+                LOG.success(f"I have read {max_count} messages, that's enough")
+                break
         # q = queue.Queue()
 
         # def subscribe(event_name):
@@ -626,7 +632,7 @@ if __name__ == "__main__":
 
     args.package = "src/apps/external_executor/libexternal_executor"
     args.http2 = True  # gRPC interface
-    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.nodes = infra.e2e_args.min_nodes(args, f=0)  # TODO: f=1
 
     # Note: set following envvar for debug logs:
     # GRPC_VERBOSITY=DEBUG GRPC_TRACE=client_channel,http2_stream_state,http
