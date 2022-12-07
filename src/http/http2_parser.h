@@ -243,25 +243,16 @@ namespace http2
           fmt::format("Stream {} no longer exists", stream_id));
       }
 
-      LOG_FAIL_FMT(
-        "Reading: {} bytes, from offset {}", to_read, current_offset);
-
       auto const& data = stream_data->incoming.body;
-
-      LOG_FAIL_FMT("Current incoming data size: {}", data.size());
 
       if (data.size() - current_offset >= to_read)
       {
-        LOG_FAIL_FMT("Returning {} bytes", to_read);
         std::vector<uint8_t> ret = {
           data.begin() + current_offset,
           data.begin() + current_offset + to_read};
         current_offset += to_read;
-        LOG_FAIL_FMT("Offset is now {}", current_offset);
         return ret;
       }
-
-      LOG_FAIL_FMT("Returning nothing");
 
       return std::nullopt;
     }
@@ -332,7 +323,7 @@ namespace http2
 
       if (stream_data->outgoing.state != StreamResponseState::Uninitialised)
       {
-        LOG_FAIL_FMT("Stream already started");
+        LOG_TRACE_FMT("Stream already started");
         return;
         // throw std::logic_error(fmt::format(
         //   "Stream {} should be uninitialised to start stream", stream_id));

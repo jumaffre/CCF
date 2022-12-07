@@ -773,7 +773,9 @@ namespace externalexecutor
           temp::EventInfo event_info;
           static size_t count = 0;
 
-          LOG_FAIL_FMT("/ClientStream handler");
+          // TODO: Remove ReadStreamPtr as input
+
+          LOG_INFO_FMT("/ClientStream handler");
 
           temp::Event in = {};
 
@@ -787,12 +789,10 @@ namespace externalexecutor
             return ccf::grpc::make_pending();
           }
 
-          LOG_FAIL_FMT("Message: {}", in.SerializeAsString());
+          LOG_INFO_FMT("Message: {}", in.SerializeAsString());
           event_info.set_name("My event");
           event_info.set_message(fmt::format("message: {}", count++));
           out_stream->stream_msg(event_info);
-
-          // LOG_FAIL_FMT("Event: {}", payload.SerializeAsString());
 
           return ccf::grpc::make_pending();
         };

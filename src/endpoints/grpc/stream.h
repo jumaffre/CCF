@@ -65,16 +65,10 @@ namespace ccf::grpc
         throw std::logic_error("No gRPC message frame!");
       }
 
-      LOG_FAIL_FMT(
-        "Message frame: {}", crypto::b64_from_raw(message_frame.value()));
-
       auto& m = message_frame.value();
       const uint8_t* data = m.data();
       auto size = m.size();
-      LOG_FAIL_FMT("here: {}", size);
       auto message_length = impl::read_message_frame(data, size);
-
-      LOG_FAIL_FMT("Message length: {}", message_length);
 
       auto message = read_data(message_length);
       if (!message.has_value())

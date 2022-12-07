@@ -468,16 +468,10 @@ def test_async_streaming(network, args):
             for i in range(length):
                 yield Misc.Event(name=f"{event_name} [{i}]")
 
-        events = []
-        for e in generate_events(10):
-            events.append(e)
-
-        LOG.error(len(events))
-
         LOG.error("Calling client stream!")
         count = 0
         max_count = 9
-        for event_info in s.ClientStream(e for e in events):
+        for event_info in s.ClientStream(generate_events(10)):
             LOG.debug(event_info)
             count += 1
             if count >= max_count:

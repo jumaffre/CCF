@@ -148,7 +148,11 @@ namespace http2
   {
     auto k = std::string(name, name + namelen);
     auto v = std::string(value, value + valuelen);
-    LOG_TRACE_FMT("http2::on_header_callback: {}:{}", k, v);
+    LOG_TRACE_FMT(
+      "http2::on_header_callback for stream {}: {}:{}",
+      frame->hd.stream_id,
+      k,
+      v);
 
     auto* stream_data = get_stream_data(session, frame->hd.stream_id);
     stream_data->incoming.headers.emplace(k, v);
@@ -169,13 +173,8 @@ namespace http2
 
     auto* stream_data = get_stream_data(session, stream_id);
 
-    LOG_FAIL_FMT("Data: {}", crypto::b64_from_raw(data, len));
-
     stream_data->incoming.body.insert(
       stream_data->incoming.body.end(), data, data + len);
-
-    LOG_FAIL_FMT(
-      "Incoming body size is now: {}", stream_data->incoming.body.size());
 
     return 0;
   }
