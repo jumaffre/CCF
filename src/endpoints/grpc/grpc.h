@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ccf/odata_error.h"
+#include "grpc_handler.h"
 #include "message.h"
 #include "node/rpc/rpc_context_impl.h"
 #include "node/rpc/rpc_exception.h"

@@ -7,6 +7,8 @@
 #include <optional>
 #include <string>
 
+// TODO: Split this file
+
 // Mapping to HTTP errors as per
 // https://github.com/googleapis/googleapis/blob/master/google/rpc/code.proto
 #define GRPC_STATUS_MAP(XX) \
