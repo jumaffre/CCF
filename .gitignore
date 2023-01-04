@@ -39,4 +39,4 @@ doc/operations/generated_config.rst
 *.parquet
 tests/perf-system/analyzer/*.png
 **/*.ipynb*
-endpoints/grpc/protobuf/status.pb.*
+src/endpoints/grpc/protobuf/status.pb.*
