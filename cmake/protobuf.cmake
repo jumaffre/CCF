@@ -1,60 +1,58 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-set(protobuf_BUILD_SHARED_LIBS_DEFAULT OFF)
-set(protobuf_BUILD_TESTS OFF)
-set(protobuf_WITH_ZLIB OFF)
-set(protobuf_BUILD_PROTOC_BINARIES OFF)
-set(protobuf_INSTALL OFF)
+# TODO: 1. Move to another CMake file 2. Move protobuf helper functions to
+# common.cmake file
 
-set(CMAKE_POLICY_DEFAULT_CMP0077 NEW) # Removes warnings when setting
+include(${CCF_DIR}/cmake/libprotobuf.cmake)
 
-# "protobuf_..." variable above
-add_subdirectory(${CCF_3RD_PARTY_EXPORTED_DIR}/protobuf EXCLUDE_FROM_ALL)
+# protoc should be installed under /opt/protoc
+set(PROTOC_BINARY_PATH "/opt/protoc/bin/protoc")
 
-add_custom_target(dummy ALL DEPENDS libprotobuf)
-
-get_target_property(LIBPROTOBUF_SOURCES libprotobuf SOURCES)
-
-set(PROTOBUF_TARGETS "protobuf.virtual")
-add_host_library(protobuf.virtual ${LIBPROTOBUF_SOURCES})
-
-if(COMPILE_TARGET STREQUAL "sgx")
-  add_enclave_library(protobuf.enclave ${LIBPROTOBUF_SOURCES})
-  list(APPEND PROTOBUF_TARGETS "protobuf.enclave")
-  install(
-    TARGETS protobuf.enclave
-    EXPORT ccf
-    DESTINATION lib
-  )
-elseif(COMPILE_TARGET STREQUAL "snp")
-  add_host_library(protobuf.snp ${LIBPROTOBUF_SOURCES})
-  list(APPEND PROTOBUF_TARGETS "protobuf.snp")
-  install(
-    TARGETS protobuf.snp
-    EXPORT ccf
-    DESTINATION lib
-  )
+if(EXISTS ${PROTOC_BINARY_PATH})
+  message(STATUS "Found protobuf compiler: ${PROTOC_BINARY_PATH}")
 else()
+  message(FATAL_ERROR "Cannot find protobuf compiler: ${PROTOC_BINARY_PATH}")
+endif()
+
+add_custom_command(
+  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.h
+         ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
+  COMMAND
+    ${PROTOC_BINARY_PATH} --proto_path=${CCF_DIR}/src/endpoints/grpc/protobuf
+    --cpp_out=${CMAKE_CURRENT_BINARY_DIR}/protobuf
+    ${CCF_DIR}/src/endpoints/grpc/protobuf/status.proto
+  COMMENT "Generate C++ source files for status.proto file"
+  DEPENDS ${CCF_DIR}/src/endpoints/grpc/protobuf/status.proto
+)
+add_custom_target(
+  status_proto_cpp ALL
+  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.h
+          ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
+)
+
+# TODO: Also add SNP and SGX versions
+set(PROTOBUF_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/3rdparty/exported/protobuf/src/)
+
+add_host_library(
+  ccf_endpoints_grpc.host "${CCF_ENDPOINTS_GRPC_SOURCES}"
+  ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
+)
+target_link_libraries(ccf_endpoints_grpc.host PUBLIC protobuf.virtual)
+target_include_directories(
+  ccf_endpoints_grpc.host
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/3rdparty/exported/protobuf/src/>
+         $<INSTALL_INTERFACE:include/3rdparty/protobuf/src>
+)
+# Temporary fix until https://github.com/protocolbuffers/protobuf/pull/10107 is released
+target_compile_definitions(ccf_endpoints_grpc.host PRIVATE GOOGLE_PROTOBUF_INTERNAL_DONATE_STEAL_INLINE)
+add_san(ccf_endpoints_grpc.host)
+add_warning_checks(ccf_endpoints_grpc.host)
+
+if(INSTALL_VIRTUAL_LIBRARIES)
   install(
-    TARGETS protobuf.virtual
+    TARGETS ccf_endpoints_grpc.host
     EXPORT ccf
     DESTINATION lib
   )
 endif()
-
-foreach(TARGET ${PROTOBUF_TARGETS})
-  target_include_directories(
-    ${TARGET}
-    PUBLIC $<BUILD_INTERFACE:${CCF_3RD_PARTY_EXPORTED_DIR}/protobuf/src>
-           $<INSTALL_INTERFACE:include/3rdparty/protobuf>
-  )
-
-  target_compile_options(
-    ${TARGET}
-    PUBLIC
-      "-Wno-deprecated-enum-enum-conversion" # Remove warnings in
-      # generated_message_tctable_impl.h
-      "-Wno-invalid-noreturn" # https://github.com/protocolbuffers/protobuf/issues/9817
-  )
-endforeach()

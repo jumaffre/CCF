@@ -189,9 +189,7 @@ set(CCF_ENDPOINTS_SOURCES
 
 # TODO: Add compile time variable to automatically link this to libccf_endpoints
 # (off by default)
-set(CCF_ENDPOINTS_GRPC_SOURCES 
-    ${CCF_DIR}/src/endpoints/grpc_handler.cpp
-)
+set(CCF_ENDPOINTS_GRPC_SOURCES ${CCF_DIR}/src/endpoints/grpc_handler.cpp)
 
 find_library(CRYPTO_LIBRARY crypto)
 find_library(TLS_LIBRARY ssl)
@@ -401,47 +399,6 @@ add_warning_checks(ccf_endpoints.host)
 if(INSTALL_VIRTUAL_LIBRARIES)
   install(
     TARGETS ccf_endpoints.host
-    EXPORT ccf
-    DESTINATION lib
-  )
-endif()
-
-# TODO: 
-# 1. Move to another CMake file
-# 2. Move protobuf helper functions to common.cmake file
-
-# protoc should be installed under /opt/protoc
-set(PROTOC_BINARY_PATH "/opt/protoc/bin/protoc")
-
-if(EXISTS ${PROTOC_BINARY_PATH})
-  message(STATUS "Found protobuf compiler: ${PROTOC_BINARY_PATH}")
-else()
-  message(FATAL_ERROR "Cannot find protobuf compiler: ${PROTOC_BINARY_PATH}")
-endif()
-
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.h
-           ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
-    COMMAND ${PROTOC_BINARY_PATH} --proto_path=${CCF_DIR}/src/endpoints/grpc/protobuf
-    --cpp_out=${CMAKE_CURRENT_BINARY_DIR}/protobuf ${CCF_DIR}/src/endpoints/grpc/protobuf/status.proto
-    COMMENT "Generate C++ source files for status.proto file"
-    DEPENDS ${CCF_DIR}/src/endpoints/grpc/protobuf/status.proto
-)
-add_custom_target(
-    status_proto_cpp ALL
-    DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.h
-    ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
-)
-
-# TODO: Also add SNP and SGX versions
-add_host_library(ccf_endpoints_grpc.host "${CCF_ENDPOINTS_GRPC_SOURCES}" )
-target_include_directories(ccf_endpoints_grpc.host PUBLIC ${PROTOBUF_INCLUDE_DIR})
-add_san(ccf_endpoints_grpc.host)
-add_warning_checks(ccf_endpoints_grpc.host)
-
-if(INSTALL_VIRTUAL_LIBRARIES)
-  install(
-    TARGETS ccf_endpoints_grpc.host
     EXPORT ccf
     DESTINATION lib
   )
