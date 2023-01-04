@@ -5,8 +5,7 @@
 #include "ccf/endpoint_registry.h"
 #include "ccf/http_consts.h"
 #include "ccf/http_header_map.h"
-#include "grpc/status.h"
-// #include "grpc/stream.h" // TODO: Separate impl
+#include "grpc_status.h"
 
 #include <google/protobuf/empty.pb.h>
 #include <memory>
