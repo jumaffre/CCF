@@ -5,45 +5,30 @@
 
 #include "ccf/http_consts.h"
 #include "ccf/http_header_map.h"
-// #include "grpc/status.h"
+#include "grpc/status.h"
 
-namespace ccf
+namespace ccf::grpc
 {
-  // TODO: Remove following functions
-  static protobuf::Status make_grpc_status_ok()
+  template <typename T>
+  struct SuccessResponse
   {
-    return protobuf::Status{};
-  }
+    T body;
+    ccf::protobuf::Status status;
 
-  static protobuf::Status make_grpc_status(
-    grpc_status status, const std::optional<std::string>& msg = std::nullopt)
+    SuccessResponse(const T& body_, ccf::protobuf::Status status_) :
+      body(body_),
+      status(status_)
+    {}
+  };
+
+  struct ErrorResponse
   {
-    return protobuf::Status{};
-  }
+    ccf::protobuf::Status status;
+    ErrorResponse(ccf::protobuf::Status status_) : status(status_) {}
+  };
 
-  namespace grpchandler
-  {
-    template <typename T>
-    struct SuccessResponse
-    {
-      T body;
-      ccf::protobuf::Status status;
-
-      SuccessResponse(const T& body_, ccf::protobuf::Status status_) :
-        body(body_),
-        status(status_)
-      {}
-    };
-
-    struct ErrorResponse
-    {
-      ccf::protobuf::Status status;
-      ErrorResponse(ccf::protobuf::Status status_) : status(status_) {}
-    };
-
-    struct PendingResponse
-    {};
-  }
+  struct PendingResponse
+  {};
 
   static const http::HeaderMap default_response_headers = {
     {http::headers::CONTENT_TYPE, http::headervalues::contenttype::GRPC}};
@@ -62,32 +47,29 @@ namespace ccf
   }
 
   template <typename T>
-  grpchandler::GrpcAdapterResponse<T> make_success(const T& t)
+  GrpcAdapterResponse<T> make_success(const T& t)
   {
-    return grpchandler::SuccessResponse(t, make_grpc_status_ok());
+    return SuccessResponse(t, make_grpc_status_ok());
   }
 
-  grpchandler::GrpcAdapterEmptyResponse make_success()
+  GrpcAdapterEmptyResponse make_success()
   {
-    return grpchandler::SuccessResponse(
-      grpchandler::EmptyResponse{}, make_grpc_status_ok());
+    return SuccessResponse(EmptyResponse{}, make_grpc_status_ok());
   }
 
-  grpchandler::PendingResponse make_pending()
+  PendingResponse make_pending()
   {
-    return grpchandler::PendingResponse{};
+    return PendingResponse{};
   }
 
-  grpchandler::ErrorResponse make_error(
-    grpc_status code, const std::string& msg)
+  ErrorResponse make_error(grpc_status code, const std::string& msg)
   {
-    return grpchandler::ErrorResponse(make_grpc_status(code, msg));
+    return ErrorResponse(make_grpc_status(code, msg));
   }
 
   template <typename T>
-  grpchandler::GrpcAdapterResponse<T> make_error(
-    grpc_status code, const std::string& msg)
+  GrpcAdapterResponse<T> make_error(grpc_status code, const std::string& msg)
   {
-    return grpchandler::ErrorResponse(make_grpc_status(code, msg));
+    return ErrorResponse(make_grpc_status(code, msg));
   }
 }

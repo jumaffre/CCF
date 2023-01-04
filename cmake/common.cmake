@@ -187,10 +187,6 @@ set(CCF_ENDPOINTS_SOURCES
     ${CCF_DIR}/src/node/receipt.cpp
 )
 
-# TODO: Add compile time variable to automatically link this to libccf_endpoints
-# (off by default)
-set(CCF_ENDPOINTS_GRPC_SOURCES ${CCF_DIR}/src/endpoints/grpc_handler.cpp)
-
 find_library(CRYPTO_LIBRARY crypto)
 find_library(TLS_LIBRARY ssl)
 
@@ -393,6 +389,8 @@ endif()
 add_host_library(ccf_endpoints.host "${CCF_ENDPOINTS_SOURCES}")
 target_link_libraries(ccf_endpoints.host PUBLIC qcbor.host)
 target_link_libraries(ccf_endpoints.host PUBLIC t_cose.host)
+target_link_libraries(ccf_endpoints.host PUBLIC ccf_endpoints_grpc.host) # TODO: Optional? Also for SGX/SNP
+
 add_san(ccf_endpoints.host)
 add_warning_checks(ccf_endpoints.host)
 

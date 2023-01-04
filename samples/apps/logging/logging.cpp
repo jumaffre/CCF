@@ -3,6 +3,7 @@
 
 // This app's includes
 #include "logging_schema.h"
+#include "endpoints/grpc_handler.h"
 
 // CCF
 #include "ccf/app_interface.h"
@@ -15,6 +16,7 @@
 #include "ccf/indexing/strategy.h"
 #include "ccf/json_handler.h"
 #include "ccf/version.h"
+
 
 #include <charconv>
 #define FMT_HEADER_ONLY

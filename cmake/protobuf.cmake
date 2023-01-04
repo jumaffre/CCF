@@ -4,6 +4,9 @@
 # TODO: 1. Move to another CMake file 2. Move protobuf helper functions to
 # common.cmake file
 
+# TODO: Add compile time variable to automatically link this to libccf_endpoints
+# (off by default)
+
 include(${CCF_DIR}/cmake/libprotobuf.cmake)
 
 # protoc should be installed under /opt/protoc
@@ -16,27 +19,32 @@ else()
 endif()
 
 add_custom_command(
-  OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.h
-         ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
+  OUTPUT ${CCF_DIR}/src/endpoints/grpc/protobuf/status.pb.h
+         ${CCF_DIR}/src/endpoints/grpc/protobuf/status.pb.cc
   COMMAND
     ${PROTOC_BINARY_PATH} --proto_path=${CCF_DIR}/src/endpoints/grpc/protobuf
-    --cpp_out=${CMAKE_CURRENT_BINARY_DIR}/protobuf
+    --cpp_out=${CCF_DIR}/src/endpoints/grpc/protobuf
     ${CCF_DIR}/src/endpoints/grpc/protobuf/status.proto
   COMMENT "Generate C++ source files for status.proto file"
   DEPENDS ${CCF_DIR}/src/endpoints/grpc/protobuf/status.proto
 )
 add_custom_target(
   status_proto_cpp ALL
-  DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.h
-          ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
+  DEPENDS ${CCF_DIR}/src/endpoints/grpc/protobuf/status.pb.h
+          ${CCF_DIR}/src/endpoints/grpc/protobuf/status.pb.cc
 )
 
 # TODO: Also add SNP and SGX versions
 set(PROTOBUF_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/3rdparty/exported/protobuf/src/)
 
+# TODO: Add compile time variable to automatically link this to libccf_endpoints
+# (off by default)
+
+set(CCF_ENDPOINTS_GRPC_SOURCES ${CCF_DIR}/src/endpoints/grpc_handler.cpp)
+
 add_host_library(
   ccf_endpoints_grpc.host "${CCF_ENDPOINTS_GRPC_SOURCES}"
-  ${CMAKE_CURRENT_BINARY_DIR}/protobuf/status.pb.cc
+  ${CCF_DIR}/src/endpoints/grpc/protobuf/status.pb.cc
 )
 target_link_libraries(ccf_endpoints_grpc.host PUBLIC protobuf.virtual)
 target_include_directories(
@@ -44,8 +52,12 @@ target_include_directories(
   PUBLIC $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/3rdparty/exported/protobuf/src/>
          $<INSTALL_INTERFACE:include/3rdparty/protobuf/src>
 )
-# Temporary fix until https://github.com/protocolbuffers/protobuf/pull/10107 is released
-target_compile_definitions(ccf_endpoints_grpc.host PRIVATE GOOGLE_PROTOBUF_INTERNAL_DONATE_STEAL_INLINE)
+
+# Temporary fix until https://github.com/protocolbuffers/protobuf/pull/10107 is
+# released
+target_compile_definitions(
+  ccf_endpoints_grpc.host PUBLIC GOOGLE_PROTOBUF_INTERNAL_DONATE_STEAL_INLINE
+)
 add_san(ccf_endpoints_grpc.host)
 add_warning_checks(ccf_endpoints_grpc.host)
 
