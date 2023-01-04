@@ -2,8 +2,8 @@
 // Licensed under the Apache 2.0 License.
 
 // This app's includes
+#include "endpoints/grpc.h"
 #include "logging_schema.h"
-#include "endpoints/grpc_handler.h"
 
 // CCF
 #include "ccf/app_interface.h"
@@ -16,7 +16,6 @@
 #include "ccf/indexing/strategy.h"
 #include "ccf/json_handler.h"
 #include "ccf/version.h"
-
 
 #include <charconv>
 #define FMT_HEADER_ONLY

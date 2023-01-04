@@ -5,6 +5,8 @@
 #include "ccf/endpoint_registry.h"
 #include "ccf/http_consts.h"
 #include "ccf/http_header_map.h"
+#include "grpc/status.h" // TODO: Split file
+#include "grpc/stream.h" // TODO: Split file
 #include "grpc_status.h"
 
 #include <google/protobuf/empty.pb.h>
@@ -17,13 +19,27 @@ namespace ccf
   namespace grpc
   {
     template <typename T>
-    struct SuccessResponse;
+    struct SuccessResponse
+    {
+      T body;
+      ccf::protobuf::Status status;
 
-    struct ErrorResponse;
+      SuccessResponse(const T& body_, ccf::protobuf::Status status_) :
+        body(body_),
+        status(status_)
+      {}
+    };
+
+    struct ErrorResponse
+    {
+      ccf::protobuf::Status status;
+      ErrorResponse(ccf::protobuf::Status status_) : status(status_) {}
+    };
 
     // Used for server streaming endpoints. Successful response bodies are
     // streamed, not returned by the handler.
-    struct PendingResponse;
+    struct PendingResponse
+    {};
 
     using EmptyResponse = google::protobuf::Empty;
     using EmptySuccessResponse = SuccessResponse<EmptyResponse>;
@@ -42,12 +58,6 @@ namespace ccf
     template <typename T>
     GrpcAdapterResponse<T> make_error(grpc_status code, const std::string& msg);
     ErrorResponse make_error(grpc_status code, const std::string& msg);
-
-    template <typename T>
-    class Stream;
-
-    template <typename T>
-    using StreamPtr = std::unique_ptr<Stream<T>>;
   }
 
   template <typename In, typename Out>

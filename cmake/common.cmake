@@ -389,7 +389,7 @@ endif()
 add_host_library(ccf_endpoints.host "${CCF_ENDPOINTS_SOURCES}")
 target_link_libraries(ccf_endpoints.host PUBLIC qcbor.host)
 target_link_libraries(ccf_endpoints.host PUBLIC t_cose.host)
-target_link_libraries(ccf_endpoints.host PUBLIC ccf_endpoints_grpc.host) # TODO: Optional? Also for SGX/SNP
+# target_link_libraries(ccf_endpoints.host PUBLIC ccf_endpoints_grpc.host) # TODO: Optional? Also for SGX/SNP
 
 add_san(ccf_endpoints.host)
 add_warning_checks(ccf_endpoints.host)

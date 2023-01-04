@@ -221,6 +221,7 @@ elseif(COMPILE_TARGET STREQUAL "virtual")
            quickjs.host
            sss.host
            ccf_endpoints.host
+           ccf_endpoints_grpc.host
            ccfcrypto.host
            ccf_kv.host
            nghttp2.host

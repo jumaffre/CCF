@@ -40,7 +40,7 @@ set(PROTOBUF_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/3rdparty/exported/protobuf/src/)
 # TODO: Add compile time variable to automatically link this to libccf_endpoints
 # (off by default)
 
-set(CCF_ENDPOINTS_GRPC_SOURCES ${CCF_DIR}/src/endpoints/grpc_handler.cpp)
+set(CCF_ENDPOINTS_GRPC_SOURCES ${CCF_DIR}/src/endpoints/grpc/handler.cpp)
 
 add_host_library(
   ccf_endpoints_grpc.host "${CCF_ENDPOINTS_GRPC_SOURCES}"
@@ -53,7 +53,7 @@ target_include_directories(
          $<INSTALL_INTERFACE:include/3rdparty/protobuf/src>
 )
 
-# Temporary fix until https://github.com/protocolbuffers/protobuf/pull/10107 is
+# Temporary hack until https://github.com/protocolbuffers/protobuf/pull/10107 is
 # released
 target_compile_definitions(
   ccf_endpoints_grpc.host PUBLIC GOOGLE_PROTOBUF_INTERNAL_DONATE_STEAL_INLINE

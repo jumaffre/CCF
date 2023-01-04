@@ -1,39 +1,17 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 
-#include "grpc_handler.h"
-
 #include "ccf/http_consts.h"
 #include "ccf/http_header_map.h"
-#include "grpc/serdes.h"
-#include "grpc/status.h"
-#include "grpc/types.h"
+#include "endpoints/grpc.h"
+#include "serdes.h"
+#include "status.h"
+#include "types.h"
 
 namespace ccf
 {
   namespace grpc
   {
-    template <typename T>
-    struct SuccessResponse
-    {
-      T body;
-      ccf::protobuf::Status status;
-
-      SuccessResponse(const T& body_, ccf::protobuf::Status status_) :
-        body(body_),
-        status(status_)
-      {}
-    };
-
-    struct ErrorResponse
-    {
-      ccf::protobuf::Status status;
-      ErrorResponse(ccf::protobuf::Status status_) : status(status_) {}
-    };
-
-    struct PendingResponse
-    {};
-
     template <typename T>
     GrpcAdapterResponse<T> make_success(const T& t)
     {

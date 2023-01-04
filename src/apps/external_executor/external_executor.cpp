@@ -11,7 +11,7 @@
 #include "ccf/kv/map.h"
 #include "ccf/pal/locking.h"
 #include "ccf/service/tables/nodes.h"
-#include "endpoints/grpc/grpc.h"
+#include "endpoints/grpc.h"
 #include "executor_auth_policy.h"
 #include "executor_code_id.h"
 #include "executor_registration.pb.h"
