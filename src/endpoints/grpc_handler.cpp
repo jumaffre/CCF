@@ -5,71 +5,115 @@
 
 #include "ccf/http_consts.h"
 #include "ccf/http_header_map.h"
+#include "grpc/serdes.h"
 #include "grpc/status.h"
+#include "grpc/types.h"
 
-namespace ccf::grpc
+namespace ccf
 {
-  template <typename T>
-  struct SuccessResponse
+  namespace grpc
   {
-    T body;
-    ccf::protobuf::Status status;
+    template <typename T>
+    struct SuccessResponse
+    {
+      T body;
+      ccf::protobuf::Status status;
 
-    SuccessResponse(const T& body_, ccf::protobuf::Status status_) :
-      body(body_),
-      status(status_)
-    {}
-  };
+      SuccessResponse(const T& body_, ccf::protobuf::Status status_) :
+        body(body_),
+        status(status_)
+      {}
+    };
 
-  struct ErrorResponse
-  {
-    ccf::protobuf::Status status;
-    ErrorResponse(ccf::protobuf::Status status_) : status(status_) {}
-  };
+    struct ErrorResponse
+    {
+      ccf::protobuf::Status status;
+      ErrorResponse(ccf::protobuf::Status status_) : status(status_) {}
+    };
 
-  struct PendingResponse
-  {};
+    struct PendingResponse
+    {};
 
-  static const http::HeaderMap default_response_headers = {
-    {http::headers::CONTENT_TYPE, http::headervalues::contenttype::GRPC}};
+    template <typename T>
+    GrpcAdapterResponse<T> make_success(const T& t)
+    {
+      return SuccessResponse(t, make_grpc_status_ok());
+    }
 
-  static constexpr auto TRAILER_STATUS = "grpc-status";
-  static constexpr auto TRAILER_MESSAGE = "grpc-message";
+    GrpcAdapterEmptyResponse make_success()
+    {
+      return SuccessResponse(EmptyResponse{}, make_grpc_status_ok());
+    }
 
-  static http::HeaderKeyValue make_status_trailer(int32_t code)
-  {
-    return {TRAILER_STATUS, std::to_string(code)};
+    PendingResponse make_pending()
+    {
+      return PendingResponse{};
+    }
+
+    ErrorResponse make_error(grpc_status code, const std::string& msg)
+    {
+      return ErrorResponse(make_grpc_status(code, msg));
+    }
+
+    template <typename T>
+    GrpcAdapterResponse<T> make_error(grpc_status code, const std::string& msg)
+    {
+      return ErrorResponse(make_grpc_status(code, msg));
+    }
+
+    template <typename T>
+    static StreamPtr<T> make_stream(
+      const std::shared_ptr<ccf::RpcContext>& rpc_ctx,
+      http_status status = HTTP_STATUS_OK,
+      const http::HeaderMap& headers = default_response_headers);
   }
 
-  static http::HeaderKeyValue make_message_trailer(const std::string& msg)
+  template <typename In, typename Out>
+  endpoints::EndpointFunction grpc_adapter(const GrpcEndpoint<In, Out>& f)
   {
-    return {TRAILER_MESSAGE, msg};
+    return [f](endpoints::EndpointContext& ctx) {
+      grpc::set_grpc_response<Out>(
+        f(ctx, grpc::get_grpc_payload<In>(ctx.rpc_ctx)), ctx.rpc_ctx);
+    };
   }
 
-  template <typename T>
-  GrpcAdapterResponse<T> make_success(const T& t)
+  template <typename In, typename Out>
+  endpoints::ReadOnlyEndpointFunction grpc_read_only_adapter(
+    const GrpcReadOnlyEndpoint<In, Out>& f)
   {
-    return SuccessResponse(t, make_grpc_status_ok());
+    return [f](endpoints::ReadOnlyEndpointContext& ctx) {
+      grpc::set_grpc_response<Out>(
+        f(ctx, grpc::get_grpc_payload<In>(ctx.rpc_ctx)), ctx.rpc_ctx);
+    };
   }
 
-  GrpcAdapterEmptyResponse make_success()
+  template <typename In, typename Out>
+  endpoints::CommandEndpointFunction grpc_command_adapter(
+    const GrpcCommandEndpoint<In, Out>& f)
   {
-    return SuccessResponse(EmptyResponse{}, make_grpc_status_ok());
+    return [f](endpoints::CommandEndpointContext& ctx) {
+      grpc::set_grpc_response<Out>(
+        f(ctx, grpc::get_grpc_payload<In>(ctx.rpc_ctx)), ctx.rpc_ctx);
+    };
   }
 
-  PendingResponse make_pending()
+  // Note: For now, only command endpoints (i.e. with no kv::Tx) support gRPC
+  // server streaming.
+  template <typename In, typename Out>
+  endpoints::CommandEndpointFunction grpc_command_unary_stream_adapter(
+    const GrpcCommandUnaryStreamEndpoint<In, Out>& f)
   {
-    return PendingResponse{};
-  }
+    return [f](endpoints::CommandEndpointContext& ctx) {
+      grpc::set_grpc_default_headers(ctx.rpc_ctx);
+      const auto result =
+        f(ctx,
+          grpc::get_grpc_payload<In>(ctx.rpc_ctx),
+          grpc::make_stream<Out>(ctx.rpc_ctx));
 
-  ErrorResponse make_error(grpc_status code, const std::string& msg)
-  {
-    return ErrorResponse(make_grpc_status(code, msg));
-  }
-
-  template <typename T>
-  GrpcAdapterResponse<T> make_error(grpc_status code, const std::string& msg)
-  {
-    return ErrorResponse(make_grpc_status(code, msg));
+      if (auto error_response = std::get_if<grpc::ErrorResponse>(&result))
+      {
+        grpc::set_grpc_response_trailers(ctx.rpc_ctx, error_response->status);
+      }
+    };
   }
 }

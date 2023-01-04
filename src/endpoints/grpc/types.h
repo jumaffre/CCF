@@ -29,62 +29,20 @@ namespace ccf::grpc
     return {TRAILER_MESSAGE, msg};
   }
 
-  template <typename T>
-  struct SuccessResponse
+  inline void set_grpc_default_headers(
+    const std::shared_ptr<ccf::RpcContext>& ctx)
   {
-    T body;
-    ccf::protobuf::Status status;
-
-    SuccessResponse(const T& body_, ccf::protobuf::Status status_) :
-      body(body_),
-      status(status_)
-    {}
-  };
-  struct ErrorResponse
-  {
-    ccf::protobuf::Status status;
-    ErrorResponse(ccf::protobuf::Status status_) : status(status_) {}
-  };
-
-  template <typename T>
-  using GrpcAdapterResponse = std::variant<ErrorResponse, SuccessResponse<T>>;
-
-  // Used for server streaming endpoints. Successful response bodies are
-  // streamed, not returned by the handler.
-  struct PendingResponse
-  {};
-
-  using GrpcAdapterStreamingResponse =
-    std::variant<ErrorResponse, PendingResponse>;
-
-  using EmptyResponse = google::protobuf::Empty;
-  using EmptySuccessResponse = SuccessResponse<EmptyResponse>;
-  using GrpcAdapterEmptyResponse = GrpcAdapterResponse<EmptyResponse>;
-
-  template <typename T>
-  GrpcAdapterResponse<T> make_success(const T& t)
-  {
-    return SuccessResponse(t, make_grpc_status_ok());
+    for (auto const& h : default_response_headers)
+    {
+      ctx->set_response_header(h.first, h.second);
+    }
   }
 
-  GrpcAdapterEmptyResponse make_success()
+  inline void set_grpc_response_trailers(
+    const std::shared_ptr<ccf::RpcContext>& ctx,
+    const ccf::protobuf::Status& status)
   {
-    return SuccessResponse(EmptyResponse{}, make_grpc_status_ok());
-  }
-
-  PendingResponse make_pending()
-  {
-    return PendingResponse{};
-  }
-
-  ErrorResponse make_error(grpc_status code, const std::string& msg)
-  {
-    return ErrorResponse(make_grpc_status(code, msg));
-  }
-
-  template <typename T>
-  GrpcAdapterResponse<T> make_error(grpc_status code, const std::string& msg)
-  {
-    return ErrorResponse(make_grpc_status(code, msg));
+    ctx->set_response_trailer(make_status_trailer(status.code()));
+    ctx->set_response_trailer(make_message_trailer(status.message()));
   }
 }

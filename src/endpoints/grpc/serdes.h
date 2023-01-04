@@ -3,11 +3,9 @@
 #pragma once
 
 #include "ccf/odata_error.h"
-#include "grpc_handler.h"
+#include "ccf/rpc_context.h"
 #include "message.h"
-#include "node/rpc/rpc_context_impl.h"
 #include "node/rpc/rpc_exception.h"
-#include "stream.h"
 #include "types.h"
 
 #include <memory>
@@ -89,23 +87,6 @@ namespace ccf::grpc
     }
   }
 
-  inline void set_grpc_default_headers(
-    const std::shared_ptr<ccf::RpcContext>& ctx)
-  {
-    for (auto const& h : default_response_headers)
-    {
-      ctx->set_response_header(h.first, h.second);
-    }
-  }
-
-  inline void set_grpc_response_trailers(
-    const std::shared_ptr<ccf::RpcContext>& ctx,
-    const ccf::protobuf::Status& status)
-  {
-    ctx->set_response_trailer(make_status_trailer(status.code()));
-    ctx->set_response_trailer(make_message_trailer(status.message()));
-  }
-
   template <typename Out>
   void set_grpc_response(
     const GrpcAdapterResponse<Out>& r,
@@ -136,74 +117,5 @@ namespace ccf::grpc
 
       set_grpc_response_trailers(ctx, error_response.status);
     }
-  }
-}
-
-namespace ccf
-{
-  template <typename In, typename Out>
-  using GrpcEndpoint = std::function<grpc::GrpcAdapterResponse<Out>(
-    endpoints::EndpointContext&, In&&)>;
-
-  template <typename In, typename Out>
-  using GrpcReadOnlyEndpoint = std::function<grpc::GrpcAdapterResponse<Out>(
-    endpoints::ReadOnlyEndpointContext&, In&&)>;
-
-  template <typename In, typename Out>
-  using GrpcCommandEndpoint = std::function<grpc::GrpcAdapterResponse<Out>(
-    endpoints::CommandEndpointContext&, In&&)>;
-
-  template <typename In, typename Out>
-  using GrpcCommandUnaryStreamEndpoint =
-    std::function<grpc::GrpcAdapterStreamingResponse(
-      endpoints::CommandEndpointContext&, In&&, grpc::StreamPtr<Out>&&)>;
-
-  template <typename In, typename Out>
-  endpoints::EndpointFunction grpc_adapter(const GrpcEndpoint<In, Out>& f)
-  {
-    return [f](endpoints::EndpointContext& ctx) {
-      grpc::set_grpc_response<Out>(
-        f(ctx, grpc::get_grpc_payload<In>(ctx.rpc_ctx)), ctx.rpc_ctx);
-    };
-  }
-
-  template <typename In, typename Out>
-  endpoints::ReadOnlyEndpointFunction grpc_read_only_adapter(
-    const GrpcReadOnlyEndpoint<In, Out>& f)
-  {
-    return [f](endpoints::ReadOnlyEndpointContext& ctx) {
-      grpc::set_grpc_response<Out>(
-        f(ctx, grpc::get_grpc_payload<In>(ctx.rpc_ctx)), ctx.rpc_ctx);
-    };
-  }
-
-  template <typename In, typename Out>
-  endpoints::CommandEndpointFunction grpc_command_adapter(
-    const GrpcCommandEndpoint<In, Out>& f)
-  {
-    return [f](endpoints::CommandEndpointContext& ctx) {
-      grpc::set_grpc_response<Out>(
-        f(ctx, grpc::get_grpc_payload<In>(ctx.rpc_ctx)), ctx.rpc_ctx);
-    };
-  }
-
-  // Note: For now, only command endpoints (i.e. with no kv::Tx) support gRPC
-  // server streaming.
-  template <typename In, typename Out>
-  endpoints::CommandEndpointFunction grpc_command_unary_stream_adapter(
-    const GrpcCommandUnaryStreamEndpoint<In, Out>& f)
-  {
-    return [f](endpoints::CommandEndpointContext& ctx) {
-      grpc::set_grpc_default_headers(ctx.rpc_ctx);
-      const auto result =
-        f(ctx,
-          grpc::get_grpc_payload<In>(ctx.rpc_ctx),
-          grpc::make_stream<Out>(ctx.rpc_ctx));
-
-      if (auto error_response = std::get_if<grpc::ErrorResponse>(&result))
-      {
-        grpc::set_grpc_response_trailers(ctx.rpc_ctx, error_response->status);
-      }
-    };
   }
 }

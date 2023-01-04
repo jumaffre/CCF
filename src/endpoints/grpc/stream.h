@@ -5,6 +5,7 @@
 #include "ccf/http_header_map.h"
 #include "ccf/http_responder.h"
 #include "message.h"
+#include "node/rpc/rpc_context_impl.h"
 #include "status.h"
 #include "types.h"
 
