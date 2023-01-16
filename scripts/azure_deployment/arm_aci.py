@@ -29,6 +29,9 @@ from azure.mgmt.containerinstance.models import (
     ResourceRequests,
     ResourceRequirements,
     OperatingSystemTypes,
+    AzureFileVolume,
+    Volume,
+    VolumeMount,
 )
 
 # Public preview
@@ -190,12 +193,15 @@ def make_aci_deployment(parser: ArgumentParser) -> Deployment:
 
     # Python SDK
 
+    # TODO:
+    # 1. File share
+    # 2. Attestation container
+
     ## Container(s)
     container_resource_requests = ResourceRequests(memory_in_gb=16, cpu=4)
     container_resource_requirements = ResourceRequirements(
         requests=container_resource_requests
     )
-    # TODO: Also add volume
     containers = [
         Container(
             name=f"{args.deployment_name}-{i}",
@@ -206,11 +212,14 @@ def make_aci_deployment(parser: ArgumentParser) -> Deployment:
                 for p in args.ports
             ],
             command=make_dev_container_command(args),
+            volume_mounts=VolumeMount(name="ccfcivolume", mount_path="/ccfci")
+            if args.aci_file_share_name is not None
+            else None,
         )
         for i in range(args.count)
     ]
 
-    ## Container groups
+    ## Container group
     ports = [
         Port(port=p, protocol=ContainerGroupNetworkProtocol.tcp) for p in args.ports
     ]
@@ -229,6 +238,14 @@ def make_aci_deployment(parser: ArgumentParser) -> Deployment:
             cce_policy=base64.b64encode(security_policy.encode()).decode()
         )
 
+    if args.aci_file_share_name is not None:
+        file_volume = AzureFileVolume(
+            share_name=args.aci_file_share_name,
+            storage_account_name=args.aci_file_share_account_name,
+            storage_account_key=args.aci_storage_account_key,
+        )
+        volume = Volume(name="ccfcivolume", azure_file=file_volume)
+
     group = ContainerGroup(
         location=args.region,
         containers=containers,
@@ -236,6 +253,7 @@ def make_aci_deployment(parser: ArgumentParser) -> Deployment:
         ip_address=group_ip_address,
         sku=ContainerGroupSku.Confidential,  # TODO: Confidential here if non confidential deployment?
         confidential_compute_properties=confidential_compute_properties,
+        volumes=[volume] if args.aci_file_share_name else None,
     )
 
     container_client = ContainerInstanceManagementClient(
