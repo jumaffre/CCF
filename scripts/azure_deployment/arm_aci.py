@@ -15,6 +15,24 @@ from azure.mgmt.resource.resources.models import (
     DeploymentPropertiesExtended,
 )
 from azure.mgmt.containerinstance import ContainerInstanceManagementClient
+from azure.mgmt.containerinstance.models import (
+    Port,
+    IpAddress,
+    Container,
+    ContainerPort,
+    ContainerNetworkProtocol,
+    ContainerGroup,
+    ConfidentialComputeProperties,
+    ContainerGroupSku,
+    ContainerGroupNetworkProtocol,
+    Container,
+    ResourceRequests,
+    ResourceRequirements,
+    OperatingSystemTypes,
+)
+
+# Public preview
+ACI_SEV_SNP_API_VERSION = "2022-10-01-preview"
 
 
 def get_pubkey():
@@ -170,8 +188,75 @@ def make_aci_deployment(parser: ArgumentParser) -> Deployment:
 
     args = parser.parse_args()
 
-    # Note: Using ARM templates rather than Python SDK as ConfidentialComputeProperties does not work yet
-    # with Python SDK (it should but isolationType cannot be specified - bug has been reported!)
+    # Python SDK
+
+    ## Container(s)
+    container_resource_requests = ResourceRequests(memory_in_gb=16, cpu=4)
+    container_resource_requirements = ResourceRequirements(
+        requests=container_resource_requests
+    )
+    # TODO: Also add volume
+    containers = [
+        Container(
+            name=f"{args.deployment_name}-{i}",
+            image=args.aci_image,
+            resources=container_resource_requirements,
+            ports=[
+                ContainerPort(port=p, protocol=ContainerNetworkProtocol.tcp)
+                for p in args.ports
+            ],
+            command=make_dev_container_command(args),
+        )
+        for i in range(args.count)
+    ]
+
+    ## Container groups
+    ports = [
+        Port(port=p, protocol=ContainerGroupNetworkProtocol.tcp) for p in args.ports
+    ]
+    group_ip_address = IpAddress(ports=ports, type="Public")
+
+    confidential_compute_properties = None
+    if not args.non_confidential:
+        if args.security_policy_file is not None:
+            with open(args.security_policy_file, "r") as f:
+                security_policy = f.read()
+        else:
+            # If no policy is set, default to most permissive policy
+            security_policy = DEFAULT_REGO_SECURITY_POLICY
+
+        confidential_compute_properties = ConfidentialComputeProperties(
+            cce_policy=base64.b64encode(security_policy.encode()).decode()
+        )
+
+    group = ContainerGroup(
+        location=args.region,
+        containers=containers,
+        os_type=OperatingSystemTypes.linux,
+        ip_address=group_ip_address,
+        sku=ContainerGroupSku.Confidential,  # TODO: Confidential here if non confidential deployment?
+        confidential_compute_properties=confidential_compute_properties,
+    )
+
+    container_client = ContainerInstanceManagementClient(
+        DefaultAzureCredential(),
+        args.subscription_id,
+        api_version=ACI_SEV_SNP_API_VERSION,
+    )
+    container_client.container_groups.begin_create_or_update(
+        args.resource_group, args.deployment_name, group
+    ).wait()
+    container_group = container_client.container_groups.get(
+        args.resource_group, args.deployment_name
+    )
+    print(container_group)
+
+    print("Deployed")
+    return
+
+    # ARM TEMPLATE BELOW
+
+    # Note: Using ARM templates rather than Python SDK here to be able to specify confidentialComputeProperties
     arm_template = {
         "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
         "contentVersion": "1.0.0.0",
