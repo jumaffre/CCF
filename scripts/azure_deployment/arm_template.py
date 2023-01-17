@@ -67,20 +67,23 @@ deployment_type_to_funcs = {
 }
 
 
-def deploy(make_template, print_status) -> str:
+def deploy(deploy_items, print_status) -> str:
 
-    resource_client.deployments.begin_create_or_update(
+    # deploy_items(parser)
+    # print(resource_client.)
+    for r in resource_client.resources.list_by_resource_group(args.resource_group):
+        print(r)
+    resource_client.resources.get(
         args.resource_group,
         args.deployment_name,
-        make_template(parser),
-    ).wait()
-    print_status(
-        args,
-        resource_client.deployments.get(
-            args.resource_group,
-            args.deployment_name,
-        ),
     )
+    # print_status(
+    #     args,
+    #     resource_client.deployments.get(
+    #         args.resource_group,
+    #         args.deployment_name,
+    #     ),
+    # )
 
 
 def remove(args, remove_deployment_items):
