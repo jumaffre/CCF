@@ -293,7 +293,9 @@ endif()
 
 install(TARGETS cchost DESTINATION bin)
 
+# TODO: Remove ccfcrypto.host
 add_executable(ledger ${CCF_DIR}/src/host/ledger.cpp)
+target_link_libraries(ledger PRIVATE ccfcrypto.host)
 
 # Perf scenario executable
 add_executable(

@@ -3,13 +3,29 @@
 
 #include "ccf/ds/logger.h"
 #include "kv/generic_serialise_wrapper.h"
+#include "kv/raw_serialise.h"
 #include "kv/serialised_entry_format.h"
+#include "kv/test/null_encryptor.h"
 
 #include <filesystem>
 #include <iostream>
 #include <vector>
 
 namespace fs = std::filesystem;
+
+void display_entry(const std::vector<uint8_t>& entry)
+{
+  LOG_INFO_FMT("Displaying one entry of size: {}", entry.size());
+
+  auto e = std::make_shared<kv::NullTxEncryptor>();
+  kv::GenericDeserialiseWrapper<kv::RawReader> r(e, kv::SecurityDomain::PUBLIC);
+
+  kv::Term term;
+  // TODO: init() below requires crypto::Sha256Hash :(
+  r.init(entry.data(), entry.size(), term);
+
+  // TODO: Currently, init() fails
+}
 
 int main(int argc, char** argv)
 {
@@ -39,12 +55,11 @@ int main(int argc, char** argv)
 
     std::ifstream file(f.path(), std::ios::binary);
 
-    // 1. Read offset table
+    // Read offset table
     size_t offset_header_table;
     file.read(
       reinterpret_cast<char*>(&offset_header_table),
       sizeof(offset_header_table));
-    LOG_INFO_FMT("Offset header table: {}", offset_header_table);
 
     size_t total_len = sizeof(size_t);
     auto len = offset_header_table - total_len;
@@ -56,13 +71,12 @@ int main(int argc, char** argv)
     // TODO: Differentiate completed vs. uncompleted files
     while (file && len >= kv::serialised_entry_header_size)
     {
-      LOG_FAIL_FMT("len: {}", len);
+      // Peek entry header
+      auto pos = file.tellg();
       kv::SerialisedEntryHeader entry_header = {};
       file.read(
         reinterpret_cast<char*>(&entry_header),
         kv::serialised_entry_header_size);
-
-      len -= kv::serialised_entry_header_size;
 
       const auto& entry_size = entry_header.size;
       if (len < entry_size)
@@ -71,21 +85,26 @@ int main(int argc, char** argv)
         return 1;
       }
 
-      LOG_FAIL_FMT("Entry of size: {}", entry_size);
+      // Read full entry
+      const auto& full_entry_size =
+        kv::serialised_entry_header_size + entry_size;
+      file.seekg(pos);
 
-      std::vector<uint8_t> entry(entry_size);
-      file.read(reinterpret_cast<char*>(entry.data()), entry.size());
+      std::vector<uint8_t> entry(full_entry_size);
+      file.read(reinterpret_cast<char*>(entry.data()), full_entry_size);
+
+      display_entry(entry);
 
       entries.emplace_back(std::move(entry));
 
       // fseeko(file, entry_size, SEEK_CUR);
-      len -= entry_size;
+      len -= full_entry_size;
 
-      LOG_TRACE_FMT(
-        "Recovered one entry of size {}",
-        kv::serialised_entry_header_size + entry_size);
+      LOG_TRACE_FMT("Recovered one entry of size {}", full_entry_size);
 
-      total_len += (kv::serialised_entry_header_size + entry_size);
+      total_len += (full_entry_size);
     }
+
+    break; // TODO: Only one file for now
   }
 }
