@@ -27,7 +27,7 @@ const (
 	DEFAULT_ENDORSEMENT_ENVVAR = "UVM_HOST_AMD_CERTIFICATE" // SEV-SNP ACI deployments
 )
 
-type ACIEndorsements struct {
+type ACIEndorsement struct {
 	CacheControl     string `json:"cacheControl"`
 	VcekCert         string `json:"vcekCert"`
 	CertificateChain string `json:"certificateChain"`
@@ -140,29 +140,35 @@ func FetchAttestationEndorsement(server string, reportedTCBBytes []byte, chipIDB
 	}
 }
 
-func ParseEndorsementACI(endorsementACIBase64 string) (ACIEndorsements, error) {
+func ParseEndorsementACI(endorsementACIBase64 string) (ACIEndorsement, error) {
 	endorsementsRaw, err := base64.StdEncoding.DecodeString(endorsementACIBase64)
 	if err != nil {
-		return ACIEndorsements{}, fmt.Errorf("Failed to decode ACI endorsements: %s", err)
+		return ACIEndorsement{}, fmt.Errorf("Failed to decode ACI endorsements: %s", err)
 	}
 
-	endorsements := ACIEndorsements{}
+	endorsements := ACIEndorsement{}
 	err = json.Unmarshal([]byte(endorsementsRaw), &endorsements)
 	if err != nil {
-		return ACIEndorsements{}, fmt.Errorf("Failed to unmarshal JSON ACI endorsements: %s", err)
+		return ACIEndorsement{}, fmt.Errorf("Failed to unmarshal JSON ACI endorsements: %s", err)
 	}
 	return endorsements, nil
 }
 
-func ParseEndorsementACIFromEnvironment(endorsementEnvironmentVariable string) (ACIEndorsements, error) {
+func ParseEndorsementACIFromEnvironment(endorsementEnvironmentVariable string) (ACIEndorsement, error) {
 	endorsementEnvironment, ok := os.LookupEnv(endorsementEnvironmentVariable)
 	if !ok {
-		return ACIEndorsements{}, fmt.Errorf("Endorsement environment variable %s is not specified (or specify endorsement server)", endorsementEnvironmentVariable)
+		return ACIEndorsement{}, fmt.Errorf("Endorsement environment variable %s is not specified (or specify endorsement server)", endorsementEnvironmentVariable)
 	}
 
-	endorsement, err := ParseEndorsementACI(endorsementEnvironment)
+	endorsementsRaw, err := base64.StdEncoding.DecodeString(endorsementEnvironment)
 	if err != nil {
-		return ACIEndorsements{}, err
+		return ACIEndorsement{}, fmt.Errorf("Failed to decode ACI endorsements: %s", err)
+	}
+
+	endorsement := ACIEndorsement{}
+	err = json.Unmarshal([]byte(endorsementsRaw), &endorsement)
+	if err != nil {
+		return ACIEndorsement{}, fmt.Errorf("Failed to unmarshal JSON ACI endorsements: %s", err)
 	}
 	return endorsement, nil
 }

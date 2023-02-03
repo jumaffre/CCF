@@ -68,31 +68,45 @@ func TestInvalidChipID(t *testing.T) {
 }
 func TestGetAttestationEndorsementFromEnvironment(t *testing.T) {
 	const testDataHostAmdCertificate = "testdata/host_amd_certificate_env"
+	const envvar = DEFAULT_ENDORSEMENT_ENVVAR
+
 	endorsement, err := os.ReadFile(testDataHostAmdCertificate)
 	if err != nil {
 		t.Fatalf("Could not open file %s", testDataHostAmdCertificate)
 	}
 
 	// Valid
-	_, err = ParseEndorsementACI(string(endorsement))
+	if os.Setenv(envvar, string(endorsement)) != nil {
+		t.Fatalf("Could not set environment variable %s", envvar)
+	}
+	_, err = ParseEndorsementACIFromEnvironment(envvar)
 	if err != nil {
 		t.Fatalf("Could not parse ACI endorsement: %s", err)
 	}
 
 	// Empty
-	_, err = ParseEndorsementACI("")
+	if os.Setenv(envvar, "") != nil {
+		t.Fatalf("Could not set environment variable %s", envvar)
+	}
+	_, err = ParseEndorsementACIFromEnvironment(envvar)
 	if !strings.Contains(err.Error(), "unexpected end of JSON input") {
 		t.Fatalf("Could not parse ACI endorsement: %s", err)
 	}
 
 	// Invalid base64
-	_, err = ParseEndorsementACI(string(endorsement[:len(endorsement)-1]))
+	if os.Setenv(envvar, string(endorsement[:len(endorsement)-1])) != nil {
+		t.Fatalf("Could not set environment variable %s", envvar)
+	}
+	_, err = ParseEndorsementACIFromEnvironment(envvar)
 	if !strings.Contains(err.Error(), "illegal base64 data") {
 		t.Fatalf("Could not parse ACI endorsement: %s", err)
 	}
 
 	// Invalid JSON
-	_, err = ParseEndorsementACI(string(endorsement[:len(endorsement)-4]))
+	if os.Setenv(envvar, string(endorsement[:len(endorsement)-4])) != nil {
+		t.Fatalf("Could not set environment variable %s", envvar)
+	}
+	_, err = ParseEndorsementACIFromEnvironment(envvar)
 	if !strings.Contains(err.Error(), "unexpected end of JSON input") {
 		t.Fatalf("Could not parse ACI endorsement: %s", err)
 	}

@@ -22,7 +22,7 @@ var (
 	endorsementEnvironmentVariable = flag.String("endorsement-envvar", attest.DEFAULT_ENDORSEMENT_ENVVAR, "Name of environment variable containing report endorsements as base64-encoded JSON object")
 	endorsementServer              = flag.String("endorsement-server", "", "Server to fetch attestation endorsement. If set, endorsement-envvar is ignored. Value is either 'Azure' or 'AMD'")
 
-	endorsementEnvironmentValue *attest.ACIEndorsements = nil
+	endorsementEnvironmentValue *attest.ACIEndorsement = nil
 )
 
 type server struct {
@@ -78,7 +78,7 @@ func main() {
 
 	if *endorsementServer == "" {
 		log.Printf("Reading report endorsement from environment variable %s", *endorsementEnvironmentVariable)
-		endorsementEnvironmentValue = new(attest.ACIEndorsements)
+		endorsementEnvironmentValue = new(attest.ACIEndorsement)
 		var err error
 		*endorsementEnvironmentValue, err = attest.ParseEndorsementACIFromEnvironment(*endorsementEnvironmentVariable)
 		if err != nil {
