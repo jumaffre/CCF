@@ -91,6 +91,18 @@ QPHfbkH0CyPfhl1jWhJFZasCAwEAAQ==
 #pragma pack(pop)
 
 #pragma pack(push, 1)
+    constexpr static auto signing_key_vcek = 0;
+
+    struct Flags
+    {
+      uint8_t author_key_len : 1;
+      uint8_t mask_chip_key : 1;
+      uint8_t signing_key : 3;
+      uint32_t reserved : 27;
+    };
+#pragma pack(pop)
+
+#pragma pack(push, 1)
     // Table 21
     struct Attestation
     {
@@ -103,7 +115,7 @@ QPHfbkH0CyPfhl1jWhJFZasCAwEAAQ==
       SignatureAlgorithm signature_algo; /* 0x034 */
       struct TcbVersion platform_version; /* 0x038 */
       uint64_t platform_info; /* 0x040 */
-      uint32_t flags; /* 0x048 */
+      Flags flags; /* 0x048 */
       uint32_t reserved0; /* 0x04C */
       uint8_t report_data[snp_attestation_report_data_size]; /* 0x050 */
       uint8_t measurement[snp_attestation_measurement_size]; /* 0x090 */

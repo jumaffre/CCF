@@ -62,6 +62,13 @@ namespace ccf::pal
       std::end(quote.measurement),
       unique_id.begin());
 
+    if (quote.flags.signing_key != snp::signing_key_vcek)
+    {
+      throw std::logic_error(fmt::format(
+        "SEV-SNP attestation report is not signed by VCEK: {}",
+        static_cast<uint8_t>(quote.flags.signing_key)));
+    }
+
     auto certificates = crypto::split_x509_cert_bundle(std::string_view(
       reinterpret_cast<const char*>(quote_info.endorsements.data()),
       quote_info.endorsements.size()));
