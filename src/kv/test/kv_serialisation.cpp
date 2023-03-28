@@ -266,21 +266,21 @@ TEST_CASE(
     auto handle_ = tx.rw<MapTypes::StringString>("map2");
 
     // Key only exists in state
-    handle->remove("key1");
+    REQUIRE(handle->remove("key1"));
 
     // Key exists in write set as well as state
     handle_->put("key2", "value2");
-    handle_->remove("key2");
+    REQUIRE(handle_->remove("key2"));
 
     // Key doesn't exist in either write set or state
-    handle->remove("unknown_key");
+    REQUIRE_FALSE(handle->remove("unknown_key"));
 
     // Key only exists in write set
     handle_->put("uncommitted_key", "uncommitted_value");
-    handle_->remove("uncommitted_key");
+    REQUIRE(handle_->remove("uncommitted_key"));
 
     // Key is removed then added again
-    handle_->remove("key3");
+    REQUIRE(handle_->remove("key3"));
     handle_->put("key3", "value3");
 
     REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
