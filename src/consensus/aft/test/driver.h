@@ -123,6 +123,7 @@ private:
     const std::string& term_s,
     std::vector<uint8_t> data,
     const size_t lineno,
+    bool committable = false,
     const std::optional<kv::Configuration::Nodes>& configuration = std::nullopt)
   {
     const auto opt = find_primary_in_term(term_s, lineno);
@@ -165,8 +166,7 @@ private:
 
     auto s = nlohmann::json(aft::ReplicatedData{type, data}).dump();
     auto d = std::make_shared<std::vector<uint8_t>>(s.begin(), s.end());
-    // True means all these entries are committable
-    raft->replicate(kv::BatchVector{{idx, d, true, hooks}}, term);
+    raft->replicate(kv::BatchVector{{idx, d, committable, hooks}}, term);
   }
 
   void add_node(ccf::NodeId node_id)
@@ -180,7 +180,6 @@ private:
       std::make_unique<LedgerStubProxy_Mermaid>(node_id),
       std::make_shared<aft::ChannelStubProxy>(),
       std::make_shared<aft::State>(node_id),
-      nullptr,
       nullptr);
     raft->start_ticking();
 
@@ -241,7 +240,7 @@ public:
       configuration.try_emplace(node_id);
     }
 
-    _replicate(term_s, {}, lineno, configuration);
+    _replicate(term_s, {}, lineno, false, configuration);
   }
 
   void log(
@@ -624,6 +623,13 @@ public:
     _replicate(term_s, *data, lineno);
   }
 
+  void emit_signature(const std::string& term_s, const size_t lineno)
+  {
+    std::string sig_s = "signature";
+    std::vector<uint8_t> sig(sig_s.data(), sig_s.data() + sig_s.size());
+    _replicate(term_s, sig, lineno, true);
+  }
+
   void disconnect(ccf::NodeId left, ccf::NodeId right)
   {
     bool noop = true;
@@ -942,8 +948,10 @@ public:
              idx)
         << std::endl;
       throw std::runtime_error(fmt::format(
-        "Node not at expected commit idx on line {}",
-        std::to_string((int)lineno)));
+        "Node not at expected commit idx ({}) on line {} : {}",
+        idx,
+        std::to_string((int)lineno),
+        _nodes.at(node_id).raft->get_committed_seqno()));
     }
   }
 };

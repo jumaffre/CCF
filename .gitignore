@@ -1,5 +1,6 @@
 build*/
 *_build/
+!ccf_build/
 !doc/build_apps/
 Debug*/
 Release*/
@@ -35,8 +36,13 @@ src/host/config_schema.h
 workspace/*
 ledger_[0-9]*
 snapshot_[0-9]*
+!tests/testdata/**/ledger*
+!tests/testdata/**/snapshot*
 doc/operations/generated_config.rst
 *.parquet
 tests/perf-system/analyzer/*.png
 **/*.ipynb*
 scripts/azure_deployment/.env
+tests/external_executor/executors/ccf/protobuf/*.proto
+tests/external_executor/executors/attestation_container/protobuf/*.proto
+src/apps/external_executor/protobuf/attestation-container.proto

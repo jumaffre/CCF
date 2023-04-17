@@ -212,6 +212,8 @@ namespace ccf
 
       rpcsessions->update_listening_interface_options(ccf_config_.network);
 
+      node->set_n2n_message_limit(ccf_config_.node_to_node_message_limit);
+
       ccf::NodeCreateInfo r;
       try
       {
@@ -279,6 +281,11 @@ namespace ccf
           bp, AdminMessage::stop, [&bp](const uint8_t*, size_t) {
             bp.set_finished();
             threading::ThreadMessaging::instance().set_finished();
+          });
+
+        DISPATCHER_SET_MESSAGE_HANDLER(
+          bp, AdminMessage::stop_notice, [this](const uint8_t*, size_t) {
+            node->stop_notice();
           });
 
         last_tick_time = ccf::get_enclave_time();
@@ -374,15 +381,6 @@ namespace ccf
             {
               case consensus::LedgerRequestPurpose::Recovery:
               {
-                if (from_seqno != to_seqno)
-                {
-                  LOG_FAIL_FMT(
-                    "Unexpected range for Recovery response "
-                    "ledger_no_entry_range: {}->{} "
-                    "(expected single ledger entry)",
-                    from_seqno,
-                    to_seqno);
-                }
                 node->recover_ledger_end();
                 break;
               }

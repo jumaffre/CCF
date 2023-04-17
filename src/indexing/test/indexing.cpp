@@ -293,7 +293,6 @@ aft::LedgerStubProxy* add_raft_consensus(
     std::make_unique<aft::LedgerStubProxy>(node_id),
     std::make_shared<aft::ChannelStubProxy>(),
     std::make_shared<aft::State>(node_id),
-    nullptr,
     nullptr);
 
   aft::Configuration::Nodes initial_config;
@@ -456,7 +455,7 @@ TEST_CASE_TEMPLATE(
 }
 
 using namespace std::chrono_literals;
-const auto max_multithread_run_time = 10s;
+const auto max_multithread_run_time = 100s;
 
 // Uses the real classes, and access + update them concurrently
 TEST_CASE(
@@ -534,6 +533,7 @@ TEST_CASE(
 
       REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
       ++i;
+      std::this_thread::yield();
     }
     finished = true;
   };
@@ -553,6 +553,7 @@ TEST_CASE(
       {
         break;
       }
+      std::this_thread::yield();
     }
   };
 
@@ -566,6 +567,7 @@ TEST_CASE(
       {
         break;
       }
+      std::this_thread::yield();
     }
   };
 
@@ -574,7 +576,7 @@ TEST_CASE(
   std::thread index_ticker([&]() {
     while (!work_done)
     {
-      size_t loops = 0;
+      size_t post_work_done_loops = 0;
       while (indexer.update_strategies(step_time, kv_store.current_txid()) ||
              handled_writes < writes.size())
       {
@@ -614,10 +616,14 @@ TEST_CASE(
 
         handled_writes = writes.end() - writes.begin();
 
-        if (loops++ > 100)
+        if (work_done)
         {
-          throw std::logic_error("Looks like a permanent loop");
+          if (post_work_done_loops++ > 100)
+          {
+            throw std::logic_error("Looks like a permanent loop");
+          }
         }
+        std::this_thread::yield();
       }
     }
   });

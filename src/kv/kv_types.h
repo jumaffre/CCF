@@ -14,7 +14,6 @@
 #include "enclave/reconfiguration_type.h"
 #include "node/identity.h"
 #include "serialiser_declare.h"
-#include "service/tables/resharing_types.h"
 
 #include <array>
 #include <chrono>
@@ -238,10 +237,6 @@ namespace kv
     virtual Configuration::Nodes get_latest_configuration() = 0;
     virtual Configuration::Nodes get_latest_configuration_unsafe() const = 0;
     virtual ConsensusDetails get_details() = 0;
-    virtual void add_resharing_result(
-      ccf::SeqNo seqno,
-      ReconfigurationId rid,
-      const ccf::ResharingResult& result) = 0;
     virtual std::optional<Configuration::Nodes> orc(
       kv::ReconfigurationId rid, const NodeId& node_id) = 0;
     virtual void update_parameters(ConsensusParameters& params) = 0;
@@ -725,6 +720,8 @@ namespace kv
 
     virtual std::shared_ptr<AbstractMap> get_map(
       Version v, const std::string& map_name) = 0;
+    virtual std::shared_ptr<AbstractMap> get_map_unsafe(
+      Version v, const std::string& map_name) = 0;
     virtual void add_dynamic_map(
       Version v, const std::shared_ptr<AbstractMap>& map) = 0;
     virtual bool is_map_replicated(const std::string& map_name) = 0;
@@ -746,7 +743,10 @@ namespace kv
       std::unique_ptr<PendingTx> pending_tx,
       bool globally_committable) = 0;
 
-    virtual std::unique_ptr<AbstractSnapshot> snapshot(Version v) = 0;
+    virtual std::unique_ptr<AbstractSnapshot> snapshot_unsafe_maps(
+      Version v) = 0;
+    virtual void lock_maps() = 0;
+    virtual void unlock_maps() = 0;
     virtual std::vector<uint8_t> serialise_snapshot(
       std::unique_ptr<AbstractSnapshot> snapshot) = 0;
     virtual ApplyResult deserialise_snapshot(
@@ -773,6 +773,25 @@ namespace kv
     virtual void unset_flag_unsafe(Flag f) = 0;
     virtual bool flag_enabled_unsafe(Flag f) const = 0;
   };
+
+  template <class StorePointer>
+  class ScopedStoreMapsLock
+  {
+  public:
+    ScopedStoreMapsLock() = delete;
+    ScopedStoreMapsLock(StorePointer _store) : store(_store)
+    {
+      store->lock_maps();
+    }
+    ~ScopedStoreMapsLock()
+    {
+      store->unlock_maps();
+    }
+
+  private:
+    StorePointer store;
+  };
+
 }
 
 FMT_BEGIN_NAMESPACE

@@ -18,6 +18,8 @@ from e2e_logging import verify_receipt
 import infra.service_load
 import ccf.tx_id
 import tempfile
+import http
+import shutil
 
 from loguru import logger as LOG
 
@@ -244,36 +246,57 @@ def test_recover_service_with_wrong_identity(network, args):
     return recovered_network
 
 
-@reqs.description("Recover a service with expired service identity")
-def test_recover_service_with_expired_cert(args):
-    expired_service_dir = os.path.join(
-        os.path.dirname(os.path.realpath(__file__)), "expired_service"
+@reqs.description("Recover a service from local files")
+def test_recover_service_from_files(
+    args, directory, expected_recovery_count, test_receipt=True
+):
+    service_dir = os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "testdata", directory
     )
 
     new_common = infra.network.get_common_folder_name(args.workspace, args.label)
-    copy_tree(os.path.join(expired_service_dir, "common"), new_common)
+    copy_tree(os.path.join(service_dir, "common"), new_common)
 
     network = infra.network.Network(args.nodes, args.binary_dir)
 
     args.previous_service_identity_file = os.path.join(
-        expired_service_dir, "common", "service_cert.pem"
+        service_dir, "common", "service_cert.pem"
     )
 
     network.start_in_recovery(
         args,
-        ledger_dir=os.path.join(expired_service_dir, "0.ledger"),
-        committed_ledger_dirs=[os.path.join(expired_service_dir, "0.ledger")],
-        snapshots_dir=os.path.join(expired_service_dir, "0.snapshots"),
+        ledger_dir=os.path.join(service_dir, "ledger"),
+        committed_ledger_dirs=[os.path.join(service_dir, "ledger")],
+        snapshots_dir=os.path.join(service_dir, "snapshots"),
         common_dir=new_common,
     )
 
-    network.recover(args)
+    network.recover(args, expected_recovery_count=expected_recovery_count)
 
     primary, _ = network.find_primary()
-    infra.checker.check_can_progress(primary)
 
-    r = primary.get_receipt(2, 3)
-    verify_receipt(r.json(), network.cert)
+    # The member and user certs stored on this service are all currently expired.
+    # Remove user certs and add new users before attempting any user requests
+    primary, _ = network.find_primary()
+    with primary.client() as c:
+        r = c.get("/gov/kv/users/certs")
+        assert r.status_code == http.HTTPStatus.OK
+
+        user_ids = r.body.json().keys()
+        for user_id in user_ids:
+            LOG.info(f"Removing expired user {user_id}")
+            network.consortium.remove_user(primary, user_id)
+
+    new_user_local_id = "recovery_user"
+    new_user = network.create_user(new_user_local_id, args.participants_curve)
+    LOG.info(f"Adding new user {new_user.service_id}")
+    network.consortium.add_user(primary, new_user.local_id)
+
+    infra.checker.check_can_progress(primary, local_user_id=new_user_local_id)
+
+    if test_receipt:
+        r = primary.get_receipt(2, 3)
+        verify_receipt(r.json(), network.cert)
 
 
 @reqs.description("Attempt to recover a service but abort before recovery is complete")
@@ -343,6 +366,79 @@ def test_recover_service_aborted(network, args, from_snapshot=False):
         snapshots_dir=snapshots_dir,
     )
     recovered_network.recover(args)
+    return recovered_network
+
+
+# https://github.com/microsoft/CCF/issues/4557
+@reqs.description(
+    "Recover ledger after an isolated node restarted from an old snapshot"
+)
+def test_persistence_old_snapshot(network, args):
+    network.save_service_identity(args)
+    old_primary, _ = network.find_primary()
+
+    # Retrieve oldest snapshot
+    snapshots_dir = network.get_committed_snapshots(old_primary)
+    snapshots_to_delete = sorted(
+        os.listdir(snapshots_dir),
+        key=lambda x: infra.node.get_snapshot_seqnos(x)[0],
+    )[1:]
+    for s in snapshots_to_delete:
+        os.remove(os.path.join(snapshots_dir, s))
+
+    # All ledger files, including committed ones, are copied to the main
+    # ledger directory (note: they used to be marked as ".ignored" by the new node)
+    current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+    for committed_ledger_dir in committed_ledger_dirs:
+        for l in os.listdir(committed_ledger_dir):
+            shutil.copy(os.path.join(committed_ledger_dir, l), current_ledger_dir)
+
+    # Capture latest committed TxID on primary so we can check later that the
+    # entire ledger has been fully recovered
+    with old_primary.client() as c:
+        latest_txid = c.get("/node/commit").body.json()["transaction_id"]
+
+    new_node = network.create_node("local://localhost")
+    # Use invalid node-to-node interface so that the new node is isolated and does
+    # not receive any consensus updates.
+    new_node.n2n_interface = infra.interfaces.Interface(host="invalid", port=8000)
+    network.join_node(
+        new_node,
+        args.package,
+        args,
+        copy_ledger=False,
+        snapshots_dir=snapshots_dir,
+        ledger_dir=current_ledger_dir,
+    )
+
+    try:
+        network.trust_node(new_node, args, timeout=3)
+    except TimeoutError:
+        pass
+    else:
+        assert (
+            False
+        ), "Trusting new node should have failed as n2n interface is not valid"
+
+    new_node_ledger_path = new_node.remote.ledger_paths()[0]
+
+    network.stop_all_nodes()
+
+    recovered_network = infra.network.Network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        args.perf_nodes,
+        existing_network=network,
+    )
+    recovered_network.start_in_recovery(args, ledger_dir=new_node_ledger_path)
+    recovered_network.recover(args)
+
+    new_primary, _ = recovered_network.find_primary()
+    with new_primary.client() as c:
+        status = c.get(f"/node/tx?transaction_id={latest_txid}").body.json()["status"]
+        assert status == "Committed"
+
     return recovered_network
 
 
@@ -632,6 +728,7 @@ def run(args):
 
         ref_msg = get_and_verify_historical_receipt(network, None)
 
+        network = test_persistence_old_snapshot(network, args)
         network = test_recover_service_with_wrong_identity(network, args)
 
         for i in range(recoveries_count):
@@ -689,7 +786,14 @@ def run(args):
                         chunk_start_seqno == seqno
                     ), f"{service_status} service at seqno {seqno} did not start a new ledger chunk (started at {chunk_start_seqno})"
 
-    test_recover_service_with_expired_cert(args)
+    test_recover_service_from_files(
+        args, "expired_service", expected_recovery_count=1, test_receipt=True
+    )
+    # sgx_service is historical ledger, from 1.x -> 2.x -> 3.x -> main.
+    # This is used to test recovery from SGX to SNP.
+    test_recover_service_from_files(
+        args, "sgx_service", expected_recovery_count=3, test_receipt=False
+    )
 
 
 if __name__ == "__main__":

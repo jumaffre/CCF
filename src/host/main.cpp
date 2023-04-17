@@ -285,7 +285,7 @@ int main(int argc, char** argv)
       1ms, bp, circuit.read_from_inside(), non_blocking_factory);
 
     // graceful shutdown on sigterm
-    asynchost::Sigterm sigterm(writer_factory);
+    asynchost::Sigterm sigterm(writer_factory, config.ignore_first_sigterm);
 
     asynchost::Ledger ledger(
       config.ledger.directory,
@@ -414,17 +414,9 @@ int main(int argc, char** argv)
 
     enclave_config.writer_config = writer_config;
 
-    StartupConfig startup_config;
+    StartupConfig startup_config(config);
 
     startup_config.snapshot_tx_interval = config.snapshots.tx_count;
-    startup_config.consensus = config.consensus;
-    startup_config.ledger_signatures = config.ledger_signatures;
-    startup_config.jwt = config.jwt;
-    startup_config.network = config.network;
-    startup_config.worker_threads = config.worker_threads;
-    startup_config.node_certificate = config.node_certificate;
-    startup_config.attestation.snp_endorsements_servers =
-      config.attestation.snp_endorsements_servers;
 
     if (config.attestation.environment.security_policy.has_value())
     {

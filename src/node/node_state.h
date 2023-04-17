@@ -34,7 +34,6 @@
 #include "node/snapshotter.h"
 #include "node_to_node.h"
 #include "quote_endorsements_client.h"
-#include "resharing.h"
 #include "rpc/frontend.h"
 #include "rpc/serialization.h"
 #include "secret_broadcast.h"
@@ -96,6 +95,8 @@ namespace ccf
     std::vector<uint8_t> startup_snapshot;
     std::shared_ptr<QuoteEndorsementsClient> quote_endorsements_client =
       nullptr;
+
+    std::atomic<bool> stop_noticed = false;
 
     struct NodeStateMsg
     {
@@ -839,9 +840,10 @@ namespace ccf
 
       auto timer_msg = std::make_unique<threading::Tmsg<NodeStateMsg>>(
         [](std::unique_ptr<threading::Tmsg<NodeStateMsg>> msg) {
+          std::lock_guard<pal::Mutex> guard(msg->data.self.lock);
           if (msg->data.self.sm.check(NodeStartupState::pending))
           {
-            msg->data.self.initiate_join();
+            msg->data.self.initiate_join_unsafe();
             auto delay = std::chrono::milliseconds(
               msg->data.self.config.join.retry_timeout);
 
@@ -1591,6 +1593,16 @@ namespace ccf
       }
 
       consensus->periodic_end();
+    }
+
+    void stop_notice() override
+    {
+      stop_noticed = true;
+    }
+
+    bool has_received_stop_notice() override
+    {
+      return stop_noticed;
     }
 
     void recv_node_inbound(const uint8_t* data, size_t size)
@@ -2445,17 +2457,6 @@ namespace ccf
 
       auto shared_state = std::make_shared<aft::State>(self);
 
-      auto resharing_tracker = nullptr;
-      if (consensus_config.type == ConsensusType::BFT)
-      {
-        std::make_shared<SplitIdentityResharingTracker>(
-          shared_state,
-          rpc_map,
-          node_sign_kp,
-          self_signed_node_cert,
-          endorsed_node_cert);
-      }
-
       auto node_client = std::make_shared<HTTPNodeClient>(
         rpc_map, node_sign_kp, self_signed_node_cert, endorsed_node_cert);
 
@@ -2471,7 +2472,6 @@ namespace ccf
         std::make_unique<consensus::LedgerEnclave>(writer_factory),
         n2n_channels,
         shared_state,
-        std::move(resharing_tracker),
         node_client,
         public_only,
         membership_state,
@@ -2488,14 +2488,6 @@ namespace ccf
           [](kv::Version version, const Nodes::Write& w)
             -> kv::ConsensusHookPtr {
             return std::make_unique<ConfigurationChangeHook>(version, w);
-          }));
-
-      network.tables->set_map_hook(
-        network.resharings.get_name(),
-        network.resharings.wrap_map_hook(
-          [](kv::Version version, const Resharings::Write& w)
-            -> kv::ConsensusHookPtr {
-            return std::make_unique<ResharingsHook>(version, w);
           }));
 
       // Note: The Signatures hook and SerialisedMerkleTree hook are separate
@@ -2523,6 +2515,17 @@ namespace ccf
             assert(w.has_value());
             auto tree = w.value();
             s->record_serialised_tree(version, tree);
+            return kv::ConsensusHookPtr(nullptr);
+          }));
+
+      network.tables->set_map_hook(
+        network.snapshot_evidence.get_name(),
+        network.snapshot_evidence.wrap_map_hook(
+          [s = this->snapshotter](
+            kv::Version version, const SnapshotEvidence::Write& w) {
+            assert(w.has_value());
+            auto snapshot_evidence = w.value();
+            s->record_snapshot_evidence_idx(version, snapshot_evidence);
             return kv::ConsensusHookPtr(nullptr);
           }));
 
@@ -2621,6 +2624,11 @@ namespace ccf
     }
 
   public:
+    void set_n2n_message_limit(size_t message_limit)
+    {
+      n2n_channels->set_message_limit(message_limit);
+    }
+
     virtual const StartupConfig& get_node_config() const override
     {
       return config;

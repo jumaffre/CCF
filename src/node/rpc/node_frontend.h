@@ -390,7 +390,7 @@ namespace ccf
       openapi_info.description =
         "This API provides public, uncredentialed access to service and node "
         "state.";
-      openapi_info.document_version = "2.40.0";
+      openapi_info.document_version = "2.42.0";
     }
 
     void init_handlers() override
@@ -645,23 +645,17 @@ namespace ccf
         // This endpoint should only be called internally once it is certain
         // that all nodes recorded as Retired will no longer issue transactions.
         auto nodes = ctx.tx.rw(network.nodes);
-        auto node_endorsed_certificates =
-          ctx.tx.rw(network.node_endorsed_certificates);
-        nodes->foreach([this, &nodes, &node_endorsed_certificates](
-                         const auto& node_id, const auto& node_info) {
+        nodes->foreach([this, &nodes](const auto& node_id, auto node_info) {
           if (
             node_info.status == ccf::NodeStatus::RETIRED &&
-            node_id != this->context.get_node_id())
+            node_id != this->context.get_node_id() &&
+            !node_info.retired_committed)
           {
             // Set retired_committed on nodes for which RETIRED status
             // has been committed. This endpoint is only triggered for a
             // a given node once their retirement has been committed.
-            auto node = nodes->get(node_id);
-            if (node.has_value())
-            {
-              node->retired_committed = true;
-              nodes->put(node_id, node.value());
-            }
+            node_info.retired_committed = true;
+            nodes->put(node_id, node_info);
 
             LOG_DEBUG_FMT("Setting retired_committed on node {}", node_id);
           }
@@ -699,7 +693,19 @@ namespace ccf
           result.last_signed_seqno = sig.value().seqno;
         }
 
-        return result;
+        auto node_configuration_subsystem =
+          this->context.get_subsystem<NodeConfigurationSubsystem>();
+        if (!node_configuration_subsystem)
+        {
+          return make_error(
+            HTTP_STATUS_INTERNAL_SERVER_ERROR,
+            ccf::errors::InternalError,
+            "NodeConfigurationSubsystem is not available");
+        }
+        result.stop_notice =
+          node_configuration_subsystem->has_received_stop_notice();
+
+        return make_success(result);
       };
       make_read_only_endpoint(
         "/state", HTTP_GET, json_read_only_adapter(get_state), no_auth_required)
@@ -1668,48 +1674,6 @@ namespace ccf
         HTTP_POST,
         json_adapter(refresh_jwt_keys),
         {std::make_shared<NodeCertAuthnPolicy>()})
-        .set_openapi_hidden(true)
-        .install();
-
-      auto update_resharing = [this](auto& args, const nlohmann::json& params) {
-        const auto in = params.get<UpdateResharing::In>();
-        auto resharings = args.tx.rw(network.resharings);
-
-        bool exists = false;
-        resharings->foreach(
-          [rid = in.rid, &exists](
-            const kv::ReconfigurationId& trid, const ResharingResult& result) {
-            if (trid == rid)
-            {
-              exists = true;
-              return false;
-            }
-            return true;
-          });
-
-        if (exists)
-        {
-          return make_error(
-            HTTP_STATUS_BAD_REQUEST,
-            ccf::errors::ResharingAlreadyCompleted,
-            fmt::format(
-              "resharing for configuration {} already completed.", in.rid));
-        }
-
-        // For now, just pretend that we're done.
-        ResharingResult rr;
-        rr.reconfiguration_id = in.rid;
-        rr.seqno = 0;
-        resharings->put(in.rid, rr);
-        return make_success(true);
-      };
-
-      make_endpoint(
-        "/update-resharing",
-        HTTP_POST,
-        json_adapter(update_resharing),
-        {std::make_shared<NodeCertAuthnPolicy>()})
-        .set_forwarding_required(endpoints::ForwardingRequired::Always)
         .set_openapi_hidden(true)
         .install();
 
