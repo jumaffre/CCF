@@ -51,7 +51,8 @@ METADATA = {
                     "crv": "Ed25519",
                     "kid": "otddUaOI1h1V",
                     "kty": "OKP",
-                    "x": "uw1P3QaG2QfrsJA0bcSHV1xEcMWLUIqROKdOFue1nz4"                }
+                    "x": "uw1P3QaG2QfrsJA0bcSHV1xEcMWLUIqROKdOFue1nz4",
+                },
             },
             {
                 "id": "did:ccf:STHIGG-DEVBOX.europe.corp.microsoft.com:MxSnvo5Hth_4AIVQHwAV_HmteGAumE4ATubwD6Xk6ig#cyZCX5PgrXxw",
@@ -61,21 +62,24 @@ METADATA = {
                     "crv": "Ed25519",
                     "kid": "cyZCX5PgrXxw",
                     "kty": "OKP",
-                    "x": "u9as8VxfBXbYtRGRzVCYafaaX1sLJKFJcerLAS57rVU"                }
-            }
+                    "x": "u9as8VxfBXbYtRGRzVCYafaaX1sLJKFJcerLAS57rVU",
+                },
+            },
         ],
         "@context": [
             "https://www.w3.org/ns/did/v1",
             "https://w3id.org/security/suites/jws-2020/v1",
-            {
-                "@vocab": "https://github.com/microsoft/did-ccf/blob/main/DID_CCF.md#"            }
+            {"@vocab": "https://github.com/microsoft/did-ccf/blob/main/DID_CCF.md#"},
         ],
         "authentication": [
-            "did:ccf:STHIGG-DEVBOX.europe.corp.microsoft.com:MxSnvo5Hth_4AIVQHwAV_HmteGAumE4ATubwD6Xk6ig#otddUaOI1h1V"        ],
+            "did:ccf:STHIGG-DEVBOX.europe.corp.microsoft.com:MxSnvo5Hth_4AIVQHwAV_HmteGAumE4ATubwD6Xk6ig#otddUaOI1h1V"
+        ],
         "assertionMethod": [
-            "did:ccf:STHIGG-DEVBOX.europe.corp.microsoft.com:MxSnvo5Hth_4AIVQHwAV_HmteGAumE4ATubwD6Xk6ig#otddUaOI1h1V"        ],
+            "did:ccf:STHIGG-DEVBOX.europe.corp.microsoft.com:MxSnvo5Hth_4AIVQHwAV_HmteGAumE4ATubwD6Xk6ig#otddUaOI1h1V"
+        ],
         "keyAgreement": [
-            "did:ccf:STHIGG-DEVBOX.europe.corp.microsoft.com:MxSnvo5Hth_4AIVQHwAV_HmteGAumE4ATubwD6Xk6ig#cyZCX5PgrXxw"        ]
+            "did:ccf:STHIGG-DEVBOX.europe.corp.microsoft.com:MxSnvo5Hth_4AIVQHwAV_HmteGAumE4ATubwD6Xk6ig#cyZCX5PgrXxw"
+        ],
     },
     "keyPairs": [
         {
@@ -85,7 +89,8 @@ METADATA = {
             "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAuw1P3QaG2QfrsJA0bcSHV1xEcMWLUIqROKdOFue1nz4=\n-----END PUBLIC KEY-----\n",
             "privateKey": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIDKbBd5Qa9T5ffyYd9WWjWeVo8dmu4WrI4/1QsL/bOzF\n-----END PRIVATE KEY-----\n",
             "state": "current",
-            "curve": "curve25519"        },
+            "curve": "curve25519",
+        },
         {
             "id": "cyZCX5PgrXxw",
             "use": "enc",
@@ -93,29 +98,40 @@ METADATA = {
             "publicKey": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAu9as8VxfBXbYtRGRzVCYafaaX1sLJKFJcerLAS57rVU=\n-----END PUBLIC KEY-----\n",
             "privateKey": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIGxNAyyUXl+GTtBdoj627hjmZAG6gvK+/PwZ+UOcQTuD\n-----END PRIVATE KEY-----\n",
             "state": "current",
-            "curve": "curve25519"        }
+            "curve": "curve25519",
+        },
     ],
-    "controllerDelegate": "a6f2d6efa67192037a35548f1bbd7efdf26ba5b718ca5d423fc431147571e7a3"}
+    "controllerDelegate": "a6f2d6efa67192037a35548f1bbd7efdf26ba5b718ca5d423fc431147571e7a3",
+}
 
 METADATA_JSON = json.dumps(METADATA)
+
 
 @reqs.description("Running transactions against logging app and measuring memory usage")
 @reqs.supports_methods("/app/log/public")
 def test(network, args):
     primary, _ = network.find_primary()
 
+    print(f"Each entry is {len(METADATA_JSON) / 1024}KB")
+
     with primary.client("user0") as c:
         index = 0
         for k in range(1000):
             subi = 100
             for i in range(subi):
-                r = c.post("/app/log/public", {"id": index, "msg": METADATA_JSON}, log_capture=[])
+                r = c.post(
+                    "/app/log/public",
+                    {"id": index, "msg": METADATA_JSON},
+                    log_capture=[],
+                )
                 assert r.status_code == 200
                 index += 1
             r = c.get("/node/memory", log_capture=[])
-            peak_mb = r.body.json()["current_allocated_heap_size"] / 1024 ** 2
+            peak_mb = r.body.json()["current_allocated_heap_size"] / 1024**2
             extrapolated = (peak_mb / ((k + 1) * subi) * 1000000) / 1024
-            print(f"Using {peak_mb:.2f}Mb after {(k + 1) * subi} iterations (extrapolated: {extrapolated:.2f}Gb for 1m entries)")
+            print(
+                f"Using {peak_mb:.2f}Mb after {(k + 1) * subi} iterations (extrapolated: {extrapolated:.2f}Gb for 1m entries)"
+            )
     return network
 
 
