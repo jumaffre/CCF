@@ -1842,7 +1842,7 @@ namespace ccf
 #pragma clang diagnostic pop
 
       using AllMemberDetails = std::map<ccf::MemberId, FullMemberDetails>;
-      auto get_all_members =
+      auto get_consortium =
         [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
           auto members = ctx.tx.ro<ccf::MemberInfo>(ccf::Tables::MEMBER_INFO);
           auto member_certs =
@@ -1880,17 +1880,69 @@ namespace ccf
           return make_success(response);
         };
       make_read_only_endpoint(
-        "/members",
+        "/Consortium",
         HTTP_GET,
-        json_read_only_adapter(get_all_members),
+        json_read_only_adapter(get_consortium),
         ccf::no_auth_required)
         .set_auto_schema<void, AllMemberDetails>()
-        .set_openapi_deprecated(true)
-        .set_openapi_summary(
-          "This endpoint is deprecated. It is replaced by "
-          "/gov/kv/members/certs, /gov/kv/members/encryption_public_keys, "
-          "/gov/kv/members/info endpoints.")
+        // .set_openapi_deprecated(true)
+        .set_openapi_summary("Gets information for all consortium members")
         .install();
+
+      auto get_constitution =
+        [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
+          auto constitution =
+            ctx.tx.ro<ccf::Constitution>(Tables::CONSTITUTION);
+          return make_success(constitution->get());
+        };
+      make_read_only_endpoint(
+        "/Constitution",
+        HTTP_GET,
+        json_read_only_adapter(get_constitution),
+        ccf::no_auth_required)
+        .set_auto_schema<void, std::string>()
+        .set_openapi_summary("Gets constitution used by governance")
+        .install();
+
+      using AllNodesDetails = std::map<ccf::NodeId, ccf::NodeInfo>;
+      auto get_nodes =
+        [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
+          auto nodes = ctx.tx.ro<ccf::Nodes>(Tables::NODES);
+          AllNodesDetails response;
+          nodes->foreach([&response](const auto& k, const auto& v) {
+            response[k] = v;
+            return true;
+          });
+          return make_success(response);
+        };
+      make_read_only_endpoint(
+        "/Nodes",
+        HTTP_GET,
+        json_read_only_adapter(get_nodes),
+        ccf::no_auth_required)
+        .set_auto_schema<void, AllNodesDetails>()
+        .set_openapi_summary("Gets information for all nodes in the service")
+        .install();
+
+      // using AllNodesDetails = std::map<ccf::NodeId, ccf::NodeInfo>;
+      // auto get_js_app =
+      //   [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
+      //     auto nodes = ctx.tx.ro<ccf::Nodes>(Tables::NODES);
+      //     AllNodesDetails response;
+      //     nodes->foreach([&response](const auto& k, const auto& v) {
+      //       response[k] = v;
+      //       return true;
+      //     });
+      //     return make_success(response);
+      //   };
+      // make_read_only_endpoint(
+      //   "/JavaScriptApp",
+      //   HTTP_GET,
+      //   json_read_only_adapter(get_js_app),
+      //   ccf::no_auth_required)
+      //   .set_auto_schema<void, AllNodesDetails>()
+      //   .set_openapi_summary("Gets information for all nodes in the service")
+      //   .install();
 
       add_kv_wrapper_endpoints();
     }
