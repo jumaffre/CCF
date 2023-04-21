@@ -608,3 +608,14 @@ namespace proposals {
 @get op getTx(@query @pattern("^[0-9]+\\.[0-9]+$")transactionID: string): {
     @body tx: GetTxStatusOut;
 };
+
+@route("/gov/constitution")
+@summary("Gets the constitution used for governance.")
+@doc("The constitution is a script that assesses and applies proposals from consortium members.")
+@get op getConstitution(): {
+    @body 
+}
+
+@get op getTx(@query @pattern("^[0-9]+\\.[0-9]+$")transactionID: string): {
+    @body tx: GetTxStatusOut;
+};

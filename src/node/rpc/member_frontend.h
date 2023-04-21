@@ -1924,25 +1924,25 @@ namespace ccf
         .set_openapi_summary("Gets information for all nodes in the service")
         .install();
 
-      // using AllNodesDetails = std::map<ccf::NodeId, ccf::NodeInfo>;
-      // auto get_js_app =
-      //   [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
-      //     auto nodes = ctx.tx.ro<ccf::Nodes>(Tables::NODES);
-      //     AllNodesDetails response;
-      //     nodes->foreach([&response](const auto& k, const auto& v) {
-      //       response[k] = v;
-      //       return true;
-      //     });
-      //     return make_success(response);
-      //   };
-      // make_read_only_endpoint(
-      //   "/JavaScriptApp",
-      //   HTTP_GET,
-      //   json_read_only_adapter(get_js_app),
-      //   ccf::no_auth_required)
-      //   .set_auto_schema<void, AllNodesDetails>()
-      //   .set_openapi_summary("Gets information for all nodes in the service")
-      //   .install();
+      using AllNodesDetails = std::map<ccf::NodeId, ccf::NodeInfo>;
+      auto get_js_app =
+        [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
+          auto nodes = ctx.tx.ro<ccf::Nodes>(Tables::NODES);
+          AllNodesDetails response;
+          nodes->foreach([&response](const auto& k, const auto& v) {
+            response[k] = v;
+            return true;
+          });
+          return make_success(response);
+        };
+      make_read_only_endpoint(
+        "/JavaScriptApp",
+        HTTP_GET,
+        json_read_only_adapter(get_js_app),
+        ccf::no_auth_required)
+        .set_auto_schema<void, AllNodesDetails>()
+        .set_openapi_summary("Gets information for all nodes in the service")
+        .install();
 
       add_kv_wrapper_endpoints();
     }
