@@ -78,8 +78,44 @@ namespace ccf
     std::optional<crypto::Pem> public_encryption_key;
   };
   DECLARE_JSON_TYPE(FullMemberDetails);
-  DECLARE_JSON_REQUIRED_FIELDS(
-    FullMemberDetails, status, member_data, cert, public_encryption_key);
+  DECLARE_JSON_REQUIRED_FIELDS_WITH_RENAMES(
+    FullMemberDetails,
+    status,
+    "status",
+    member_data,
+    "memberData",
+    cert,
+    "certificate",
+    public_encryption_key,
+    "publicEncryptionKey");
+
+  struct NodesDetails : public ccf::NodeInfo
+  {
+    crypto::Pem certificate;
+  };
+  DECLARE_JSON_TYPE(NodesDetails);
+  DECLARE_JSON_REQUIRED_FIELDS_WITH_RENAMES(
+    NodesDetails,
+    quote_info,
+    "QuoteInfo",
+    status,
+    "status",
+    encryption_pub_key,
+    "publicEncryptionKey",
+    code_digest,
+    "codeDigest",
+    node_data,
+    "nodeData",
+    // certificate_signing_request,
+    // "certificateSigningRequest",
+    // public_key,
+    // "publicKey",
+    // public_encryption_key,
+    // "publicEncryptionKey",
+    // retired_committed,
+    // "retiredCommitted",
+    certificate,
+    "certificate");
 
   enum class ProposalSubmissionStatus
   {
@@ -1880,12 +1916,11 @@ namespace ccf
           return make_success(response);
         };
       make_read_only_endpoint(
-        "/Consortium",
+        "/service/consortium",
         HTTP_GET,
         json_read_only_adapter(get_consortium),
         ccf::no_auth_required)
         .set_auto_schema<void, AllMemberDetails>()
-        // .set_openapi_deprecated(true)
         .set_openapi_summary("Gets information for all consortium members")
         .install();
 
@@ -1896,7 +1931,7 @@ namespace ccf
           return make_success(constitution->get());
         };
       make_read_only_endpoint(
-        "/Constitution",
+        "/service/constitution",
         HTTP_GET,
         json_read_only_adapter(get_constitution),
         ccf::no_auth_required)
@@ -1904,19 +1939,32 @@ namespace ccf
         .set_openapi_summary("Gets constitution used by governance")
         .install();
 
-      using AllNodesDetails = std::map<ccf::NodeId, ccf::NodeInfo>;
+      using AllNodesDetails = std::map<ccf::NodeId, ccf::NodesDetails>;
       auto get_nodes =
         [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
           auto nodes = ctx.tx.ro<ccf::Nodes>(Tables::NODES);
+          auto node_endorsed_certificates =
+            ctx.tx.ro<ccf::NodeEndorsedCertificates>(
+              Tables::NODE_ENDORSED_CERTIFICATES);
+          ;
+          // TODO: Add endorsed certificate
+          // TODO: It's OK to return all the value fields
           AllNodesDetails response;
-          nodes->foreach([&response](const auto& k, const auto& v) {
+          nodes->foreach([&response, &node_endorsed_certificates](
+                           const auto& k, const auto& v) {
+            // TODO: camelCase returned v
             response[k] = v;
+            auto c = node_endorsed_certificates->get(k);
+            if (c.has_value())
+            {
+              response[k].certificate = c.value();
+            }
             return true;
           });
           return make_success(response);
         };
       make_read_only_endpoint(
-        "/Nodes",
+        "/service/nodes",
         HTTP_GET,
         json_read_only_adapter(get_nodes),
         ccf::no_auth_required)
@@ -1924,25 +1972,28 @@ namespace ccf
         .set_openapi_summary("Gets information for all nodes in the service")
         .install();
 
-      using AllNodesDetails = std::map<ccf::NodeId, ccf::NodeInfo>;
-      auto get_js_app =
-        [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
-          auto nodes = ctx.tx.ro<ccf::Nodes>(Tables::NODES);
-          AllNodesDetails response;
-          nodes->foreach([&response](const auto& k, const auto& v) {
-            response[k] = v;
-            return true;
-          });
-          return make_success(response);
-        };
-      make_read_only_endpoint(
-        "/JavaScriptApp",
-        HTTP_GET,
-        json_read_only_adapter(get_js_app),
-        ccf::no_auth_required)
-        .set_auto_schema<void, AllNodesDetails>()
-        .set_openapi_summary("Gets information for all nodes in the service")
-        .install();
+      // using AllNodesDetails = std::map<ccf::NodeId, ccf::NodeInfo>;
+      // auto get_js_app =
+      //   [this](endpoints::ReadOnlyEndpointContext& ctx, nlohmann::json&&) {
+      //     auto endpoints = ctx.tx.ro<ccf::EndpointsMap>(Tables::ENDPOINTS);
+      //     auto modules = ctx.tx.ro<ccf::Modules>(Tables::MODULES);
+      //     auto config = ctx.tx.ro<ccf::JSEngine>(Tables::JSENGINE);
+
+      //     AllNodesDetails response;
+      //     nodes->foreach([&response](const auto& k, const auto& v) {
+      //       response[k] = v;
+      //       return true;
+      //     });
+      //     return make_success(response);
+      //   };
+      // make_read_only_endpoint(
+      //   "/service/javascriptApp",
+      //   HTTP_GET,
+      //   json_read_only_adapter(get_js_app),
+      //   ccf::no_auth_required)
+      //   .set_auto_schema<void, AllNodesDetails>()
+      //   .set_openapi_summary("Gets information for all nodes in the service")
+      //   .install();
 
       add_kv_wrapper_endpoints();
     }
