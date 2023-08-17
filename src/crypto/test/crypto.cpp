@@ -342,7 +342,8 @@ TEST_CASE("Sign, fail to verify with wrong key on correct curve (EdDSA)")
 
 TEST_CASE("base64")
 {
-  for (size_t length = 1; length < 20; ++length)
+  srand(time(nullptr));
+  for (size_t length = 0; length < 1024; ++length)
   {
     std::vector<uint8_t> raw(length);
     std::generate(raw.begin(), raw.end(), rand);
@@ -779,6 +780,8 @@ TEST_CASE("hmac")
 
 TEST_CASE("PEM to JWK and back")
 {
+  logger::config::default_init();
+
   // More complete tests in end-to-end JS modules test
   // to compare with JWK reference implementation.
   auto kid = "my_kid";

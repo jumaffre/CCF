@@ -31,6 +31,10 @@ if(COMPILE_TARGET STREQUAL "sgx")
   target_link_libraries(ccfcrypto.enclave PUBLIC qcbor.enclave)
   target_link_libraries(ccfcrypto.enclave PUBLIC t_cose.enclave)
 
+  target_compile_definitions(
+    ccfcrypto.enclave PUBLIC OPENSSL_API_COMPAT=0x10101000L
+  )
+
   install(
     TARGETS ccfcrypto.enclave
     EXPORT ccf
