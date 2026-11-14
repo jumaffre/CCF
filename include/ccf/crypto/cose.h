@@ -1,0 +1,77 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+#pragma once
+
+#include <cstdint>
+#include <span>
+#include <variant>
+#include <vector>
+
+namespace ccf::cose::edit
+{
+  namespace pos
+  {
+    struct InArray
+    {};
+
+    struct AtKey
+    {
+      /// @brief  The sub-key at which to insert the value.
+      int64_t key;
+    };
+
+    using Type = std::variant<InArray, AtKey>;
+  }
+
+  namespace desc
+  {
+    struct Empty
+    {};
+
+    struct Value
+    {
+      /// @brief The type of position at which to insert the value.
+      pos::Type position;
+      /// @brief The top-level key at which to insert the value.
+      int64_t key;
+      /// @brief The value to insert in the unprotected header.
+      const std::vector<uint8_t>& value;
+    };
+
+    using Type = std::variant<Empty, Value>;
+  }
+
+  /**
+   * Set the unprotected header of a COSE_Sign1 message, according to a
+   * descriptor.
+   *
+   * Useful to add a proof to a signature to turn it into a receipt, to
+   * add a receipt to a signed statement to turn it into a transparent
+   * statement, or simply to strip the unprotected header from a COSE Sign1.
+   * All bytes outside the unprotected header are preserved, including
+   * non-preferred length encodings. An empty replacement map is encoded as
+   * the single byte 0xa0. The input must be a valid, tagged COSE_Sign1 with
+   * definite-length items; malformed or unsupported encodings are rejected.
+   *
+   * @param cose_input The COSE_Sign1 message to edit.
+   * @param descriptor An object describing whether and how to set the
+   * unprotected header.
+   */
+  std::vector<uint8_t> set_unprotected_header(
+    const std::span<const uint8_t>& cose_input, const desc::Type& descriptor);
+
+  /**
+   * Detach the payload of a COSE_Sign1 message, replacing it with nil as
+   * described in RFC 9052 section 4.1.
+   *
+   * The protected header and signature are preserved byte-for-byte, and the
+   * unprotected header is retained, so the result still verifies against the
+   * original payload with ccf::crypto::COSEVerifier::verify_detached. Useful
+   * to avoid storing a payload twice when it is already recorded elsewhere.
+   * Detaching an already detached message is a no-op.
+   *
+   * @param cose_input The COSE_Sign1 message to edit.
+   */
+  std::vector<uint8_t> detach_payload(
+    const std::span<const uint8_t>& cose_input);
+}

@@ -3,13 +3,13 @@
 
 #include "ccf/tx.h"
 
-#include "ccf/ccf_assert.h"
+#include "ds/ccf_assert.h"
 #include "kv/compacted_version_conflict.h"
 #include "kv/kv_types.h"
 #include "kv/tx_pimpl.h"
 #include "kv/untyped_map.h"
 
-namespace kv
+namespace ccf::kv
 {
   MapChanges::MapChanges(
     const std::shared_ptr<AbstractMap>& m,
@@ -49,19 +49,24 @@ namespace kv
   MapChanges BaseTx::get_map_and_change_set_by_name(
     const std::string& map_name, bool track_deletes_on_missing_keys)
   {
-    if (!pimpl->read_txid.has_value())
+    auto& read_txid = pimpl->read_txid;
+#ifdef CCF_KV_TRACING
+    trace::Context trace_context(pimpl->trace_attempt.id);
+#endif
+
+    if (!read_txid.has_value())
     {
       // Grab opacity version that all Maps should be queried at.
       // Note: It is by design that we delay acquiring a read version to now
       // rather than earlier, at Tx construction. This is to minimise the
       // window during which concurrent transactions can write to the same map
       // and cause this transaction to conflict on commit.
-      std::tie(pimpl->read_txid, pimpl->commit_view) =
-        pimpl->store->current_txid_and_commit_term();
+      auto p = pimpl->store->current_txid_and_commit_term();
+      read_txid = p.first;
+      pimpl->commit_view = p.second;
     }
 
-    auto abstract_map =
-      pimpl->store->get_map(pimpl->read_txid->version, map_name);
+    auto abstract_map = pimpl->store->get_map(read_txid->seqno, map_name);
     if (abstract_map == nullptr)
     {
       // Store doesn't know this map yet - create it dynamically
@@ -75,15 +80,15 @@ namespace kv
 
       // NB: The created maps are always untyped. Only the handles over them
       // are typed
-      auto new_map = std::make_shared<kv::untyped::Map>(
-        pimpl->store, map_name, kv::get_security_domain(map_name));
+      auto new_map =
+        std::make_shared<ccf::kv::untyped::Map>(pimpl->store, map_name);
       pimpl->created_maps[map_name] = new_map;
 
       abstract_map = new_map;
     }
 
     auto untyped_map =
-      std::dynamic_pointer_cast<kv::untyped::Map>(abstract_map);
+      std::dynamic_pointer_cast<ccf::kv::untyped::Map>(abstract_map);
     if (untyped_map == nullptr)
     {
       throw std::logic_error(
@@ -93,7 +98,7 @@ namespace kv
     return {
       abstract_map,
       untyped_map->create_change_set(
-        pimpl->read_txid->version, track_deletes_on_missing_keys)};
+        read_txid->seqno, track_deletes_on_missing_keys)};
   }
 
   std::list<AbstractHandle*> BaseTx::get_possible_handles(
@@ -113,18 +118,23 @@ namespace kv
 
   void BaseTx::compacted_version_conflict(const std::string& map_name)
   {
-    CCF_ASSERT_FMT(
-      pimpl->read_txid.has_value(), "read_txid should have already been set");
+    auto& read_txid = pimpl->read_txid;
+    if (!read_txid.has_value())
+    {
+      throw std::logic_error(
+        fmt::format("read_txid should have already been set"));
+    }
     throw CompactedVersionConflict(fmt::format(
       "Unable to retrieve state over map {} at {}",
       map_name,
-      pimpl->read_txid->version));
+      read_txid->seqno));
   }
 
   BaseTx::BaseTx(AbstractStore* store_)
   {
     pimpl = std::make_unique<PrivateImpl>();
     pimpl->store = store_;
+    KV_TRACE(pimpl->trace_attempt.bind(store_));
   }
 
   // Use default destructor, but instantiate here where PrivateImpl is not

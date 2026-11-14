@@ -4,7 +4,8 @@
 /**
  * This module provides converters to and from `ArrayBuffer` objects.
  *
- * Converters are commonly used as {@linkcode kv.typedKv} arguments.
+ * Converters are commonly used as {@linkcode kv.typedKv} or
+ * {@linkcode kv.typedKvSet} arguments.
  * Another use case is {@linkcode crypto.wrapKey} to convert
  * PEM-encoded keys to `ArrayBuffer`.
  *
@@ -21,6 +22,7 @@
  */
 
 import { ccf } from "./global.js";
+import { toArrayBuffer } from "./utils.js";
 
 // This should eventually cover all JSON-compatible values.
 // There are attempts at https://github.com/microsoft/TypeScript/issues/1897
@@ -44,6 +46,13 @@ function checkNumber(val: any) {
   }
 }
 
+function checkInt(val: any) {
+  checkNumber(val);
+  if (!Number.isInteger(val)) {
+    throw new TypeError(`Value ${val} is not an integer`);
+  }
+}
+
 function checkBigInt(val: any) {
   if (typeof val !== "bigint") {
     throw new TypeError(`Value ${val} is not a bigint`);
@@ -53,6 +62,25 @@ function checkBigInt(val: any) {
 function checkString(val: any) {
   if (typeof val !== "string") {
     throw new TypeError(`Value ${val} is not a string`);
+  }
+}
+
+function checkJsonSafe(val: any) {
+  // Hard to be exhaustive, but throw errors for any Map or Date elements found
+  if (val instanceof Map) {
+    throw TypeError(`Value contains a Map, which cannot be converted to JSON`);
+  }
+  if (val instanceof Date) {
+    throw TypeError(
+      `Value contains a Date, which cannot be converted back from JSON`,
+    );
+  }
+  if (typeof val === "object") {
+    if (Array.isArray(val)) {
+      val.every((e) => checkJsonSafe(e));
+    } else if (val !== null) {
+      Object.entries(val).every(([k, v]) => checkJsonSafe(v));
+    }
   }
 }
 
@@ -69,7 +97,7 @@ class BoolConverter implements DataConverter<boolean> {
 }
 class Int8Converter implements DataConverter<number> {
   encode(val: number): ArrayBuffer {
-    checkNumber(val);
+    checkInt(val);
     if (val < -128 || val > 127) {
       throw new RangeError("value is not within int8 range");
     }
@@ -83,7 +111,7 @@ class Int8Converter implements DataConverter<number> {
 }
 class Uint8Converter implements DataConverter<number> {
   encode(val: number): ArrayBuffer {
-    checkNumber(val);
+    checkInt(val);
     if (val < 0 || val > 255) {
       throw new RangeError("value is not within uint8 range");
     }
@@ -97,7 +125,7 @@ class Uint8Converter implements DataConverter<number> {
 }
 class Int16Converter implements DataConverter<number> {
   encode(val: number): ArrayBuffer {
-    checkNumber(val);
+    checkInt(val);
     if (val < -32768 || val > 32767) {
       throw new RangeError("value is not within int16 range");
     }
@@ -111,7 +139,7 @@ class Int16Converter implements DataConverter<number> {
 }
 class Uint16Converter implements DataConverter<number> {
   encode(val: number): ArrayBuffer {
-    checkNumber(val);
+    checkInt(val);
     if (val < 0 || val > 65535) {
       throw new RangeError("value is not within uint16 range");
     }
@@ -125,7 +153,7 @@ class Uint16Converter implements DataConverter<number> {
 }
 class Int32Converter implements DataConverter<number> {
   encode(val: number): ArrayBuffer {
-    checkNumber(val);
+    checkInt(val);
     if (val < -2147483648 || val > 2147483647) {
       throw new RangeError("value is not within int32 range");
     }
@@ -139,7 +167,7 @@ class Int32Converter implements DataConverter<number> {
 }
 class Uint32Converter implements DataConverter<number> {
   encode(val: number): ArrayBuffer {
-    checkNumber(val);
+    checkInt(val);
     if (val < 0 || val > 4294967295) {
       throw new RangeError("value is not within uint32 range");
     }
@@ -212,6 +240,14 @@ class JSONConverter<T extends JsonCompatible<T>> implements DataConverter<T> {
     return ccf.bufToJsonCompatible(buf);
   }
 }
+class CheckedJSONConverter<
+  T extends JsonCompatible<T>,
+> extends JSONConverter<T> {
+  encode(val: T): ArrayBuffer {
+    checkJsonSafe(val);
+    return super.encode(val);
+  }
+}
 
 export type TypedArray = ArrayBufferView;
 
@@ -222,7 +258,9 @@ export interface TypedArrayConstructor<T extends TypedArray> {
 class TypedArrayConverter<T extends TypedArray> implements DataConverter<T> {
   constructor(private clazz: TypedArrayConstructor<T>) {}
   encode(val: T): ArrayBuffer {
-    return val.buffer.slice(val.byteOffset, val.byteOffset + val.byteLength);
+    return toArrayBuffer(
+      val.buffer.slice(val.byteOffset, val.byteOffset + val.byteLength),
+    );
   }
   decode(buf: ArrayBuffer): T {
     return new this.clazz(buf);
@@ -402,6 +440,36 @@ export const string: DataConverter<string> = new StringConverter();
 export const json: <T extends JsonCompatible<T>>() => DataConverter<T> = <
   T extends JsonCompatible<T>,
 >() => new JSONConverter<T>();
+
+/**
+ * Returns a converter for JSON-compatible objects or values, with errors for
+ * known-incompatible types.
+ *
+ * Based on {@linkcode json}, but additionally runs a check during every encode
+ * call, throwing an error if the object contains fields which cannot be round-tripped
+ * to JSON (Date, Map). This incurs some cost in checking each instance, but gives
+ * clear errors rather than late serdes mismatches.
+ *
+ * Example:
+ * ```
+ * interface Data {
+ *   m: Map<string, string>
+ * }
+ * const d: Data = { m: new Map<string, string>() };
+ * d.m.set("hello", "John");
+ *
+ * const conv = ccfapp.json<Data>();
+ * const buffer = conv.encode(d); // ArrayBuffer, but contents of map silently lost!
+ * const d2 = conv.decode(buffer); // Data, but doesn't match d!
+ *
+ * const convChecked = ccfapp.checkedJson<Data>();
+ * const buffer2 = convChecked.encode(d); // Throws TypeError
+ * ```
+ */
+export const checkedJson: <
+  T extends JsonCompatible<T>,
+>() => DataConverter<T> = <T extends JsonCompatible<T>>() =>
+  new CheckedJSONConverter<T>();
 
 /**
  * Returns a converter for [TypedArray](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypedArray) objects.

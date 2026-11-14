@@ -7,16 +7,17 @@
 
 #include <memory>
 
-namespace kv
+namespace ccf::kv
 {
   class ReadOnlyStore
   {
   public:
     virtual ~ReadOnlyStore() = default;
 
-    virtual ccf::TxID get_txid() = 0;
-    virtual kv::ReadOnlyTx create_read_only_tx() = 0;
-    virtual kv::TxDiff create_tx_diff() = 0;
+    virtual ccf::TxID current_txid() = 0;
+    virtual ccf::kv::ReadOnlyTx create_read_only_tx() = 0;
+    virtual std::unique_ptr<ccf::kv::ReadOnlyTx> create_read_only_tx_ptr() = 0;
+    virtual ccf::kv::TxDiff create_tx_diff() = 0;
   };
 
   using ReadOnlyStorePtr = std::shared_ptr<ReadOnlyStore>;

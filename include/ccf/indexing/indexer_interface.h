@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/ds/locking.h"
 #include "ccf/indexing/strategy.h"
 #include "ccf/node_subsystem_interface.h"
 
@@ -19,10 +20,11 @@ namespace ccf::indexing
   class IndexingStrategies : public ccf::AbstractNodeSubSystem
   {
   protected:
+    ccf::ds::Mutex lock;
     std::set<StrategyPtr> strategies;
 
   public:
-    virtual ~IndexingStrategies() = default;
+    ~IndexingStrategies() override = default;
 
     static char const* get_subsystem_name()
     {
@@ -36,11 +38,13 @@ namespace ccf::indexing
         throw std::logic_error("Tried to install null strategy");
       }
 
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
       return strategies.insert(strategy).second;
     }
 
     void uninstall_strategy(const StrategyPtr& strategy)
     {
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
       if (strategy == nullptr || strategies.find(strategy) == strategies.end())
       {
         throw std::logic_error("Strategy doesn't exist");
@@ -49,8 +53,9 @@ namespace ccf::indexing
       strategies.erase(strategy);
     }
 
-    nlohmann::json describe() const
+    nlohmann::json describe()
     {
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
       auto j = nlohmann::json::array();
 
       for (const auto& strategy : strategies)

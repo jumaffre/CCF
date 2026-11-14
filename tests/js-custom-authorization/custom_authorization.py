@@ -1,26 +1,31 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import base64
+import datetime
 import http
+import json
+import os
+import re
+import subprocess
+import tempfile
+import time
+import uuid
+from contextlib import contextmanager
+from functools import partial
+from http import HTTPStatus
+
+import infra.clients
+import infra.e2e_args
+import infra.net
 import infra.network
 import infra.path
 import infra.proc
-import infra.net
-import infra.e2e_args
 import suite.test_requirements as reqs
+from infra.jwt_issuer import JwtAlg, JwtAuthType, JwtIssuer, make_bearer_header
 from infra.runner import ConcurrentRunner
-import os
-import tempfile
-import base64
-import json
-import time
-import infra.jwt_issuer
-import datetime
-import re
-from http import HTTPStatus
-import subprocess
-from contextlib import contextmanager
-
 from loguru import logger as LOG
+
+utctime = partial(datetime.datetime, tzinfo=datetime.UTC)
 
 
 @reqs.description("Test custom authorization")
@@ -37,7 +42,7 @@ def test_custom_auth(network, args):
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network = test_custom_auth(network, args)
@@ -72,10 +77,84 @@ def temporary_js_limits(network, primary, **kwargs):
         **temp_kwargs,
     )
 
-    yield
+    try:
+        yield
+    finally:
+        network.consortium.set_js_runtime_options(primary, **default_kwargs)
 
-    # Restore defaults
-    network.consortium.set_js_runtime_options(primary, **default_kwargs)
+
+def set_issuer_with_a_key(primary, network, issuer, kid, constraint):
+    with tempfile.NamedTemporaryFile(prefix="ccf", mode="w+") as metadata_fp:
+        jwt_cert_der = infra.crypto.cert_pem_to_der(issuer.cert_pem)
+        der_b64 = base64.b64encode(jwt_cert_der).decode("ascii")
+        data = {
+            "issuer": issuer.issuer_url,
+            "auto_refresh": False,
+            "jwks": {
+                "keys": [
+                    {
+                        "kty": "RSA",
+                        "kid": kid,
+                        "x5c": [der_b64],
+                        "issuer": constraint,
+                    }
+                ]
+            },
+        }
+        json.dump(data, metadata_fp)
+        metadata_fp.flush()
+        network.consortium.set_jwt_issuer(primary, metadata_fp.name)
+
+
+def parse_error_message(r):
+    return r.body.json()["error"]["details"][0]["message"]
+
+
+class FixedPublicKey:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+    def public_numbers(self):
+        return self
+
+
+class FixedPublicKeyIssuer(JwtIssuer):
+    @property
+    def public_key(self):
+        return self._public_key
+
+
+def assert_es256_raw_jwk_coordinates_are_fixed_width():
+    x_bytes = b"\x00" + bytes(range(1, 32))
+    y_bytes = b"\x00" + bytes(range(32, 63))
+
+    # Use fixed public numbers rather than generated keys.
+    issuer = object.__new__(FixedPublicKeyIssuer)
+    issuer.name = "https://noautorefresh.example/issuer"
+    issuer._auth_type = JwtAuthType.KEY
+    issuer._alg = JwtAlg.ES256
+    issuer._public_key = FixedPublicKey(
+        int.from_bytes(x_bytes, "big"), int.from_bytes(y_bytes, "big")
+    )
+    jwk = issuer.create_jwks("my_key_id")["keys"][0]
+
+    assert jwk["crv"] == "P-256"
+
+    # Expected unpadded base64url, preserving the leading zero byte.
+    assert jwk["x"] == "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+    assert jwk["y"] == "ACAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4"
+
+
+def try_auth(primary, issuer, kid, iss, tid):
+    with primary.client("user0") as c:
+        LOG.info(f"Creating JWT with kid={kid} iss={iss} tenant={tid}")
+        return c.get(
+            "/app/jwt",
+            headers=make_bearer_header(
+                issuer.issue_jwt(kid, claims={"iss": iss, "tid": tid})
+            ),
+        )
 
 
 @reqs.description("Test stack size limit")
@@ -98,7 +177,7 @@ def test_stack_size_limit(network, args):
                 depth *= 2
                 r = c.post("/app/recursive", body={"depth": depth})
                 if r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR:
-                    message = r.body.json()["error"]["details"][0]["message"]
+                    message = parse_error_message(r)
                     assert message == "InternalError: stack overflow", message
                     LOG.info(
                         f"Stack overflow at depth={depth} with max_stack_bytes={max_stack_bytes}"
@@ -109,6 +188,26 @@ def test_stack_size_limit(network, args):
 
         r = c.post("/app/recursive", body={"depth": safe_depth})
         assert r.status_code == http.HTTPStatus.OK, r
+
+        # Lower the cap until we likely run out of stack out of user code,
+        # and check that we don't crash. Check we return an error message
+        cap = max_stack_bytes
+        while cap > 0:
+            cap //= 2
+            LOG.info(f"Max stack size: {cap}")
+            with temporary_js_limits(network, primary, max_stack_bytes=cap):
+                r = c.post("/app/recursive", body={"depth": 1})
+                if r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR:
+                    message = r.body.json()["error"]["message"]
+                    assert message == "Exception thrown while executing.", message
+                    break
+
+        # Cap is so low that we must run out before we enter user code
+        with temporary_js_limits(network, primary, max_stack_bytes=100):
+            r = c.post("/app/recursive", body={"depth": 1})
+            assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR
+            message = r.body.json()["error"]["message"]
+            assert message == "Exception thrown while executing.", message
 
     return network
 
@@ -127,15 +226,35 @@ def test_heap_size_limit(network, args):
         with temporary_js_limits(network, primary, max_heap_bytes=3 * 1024 * 1024):
             r = c.post("/app/alloc", body={"size": safe_size})
             assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
-            message = r.body.json()["error"]["details"][0]["message"]
+            message = parse_error_message(r)
             assert message == "InternalError: out of memory", message
 
         r = c.post("/app/alloc", body={"size": safe_size})
         assert r.status_code == http.HTTPStatus.OK, r
 
         r = c.post("/app/alloc", body={"size": unsafe_size})
-        message = r.body.json()["error"]["details"][0]["message"]
+        message = parse_error_message(r)
         assert message == "InternalError: out of memory", message
+
+        # Lower the cap until we likely run out of heap out of user code,
+        # and check that we don't crash and return an error message
+        cap = safe_size
+        while cap > 0:
+            cap //= 2
+            LOG.info(f"Heap max size: {cap}")
+            with temporary_js_limits(network, primary, max_heap_bytes=cap):
+                r = c.post("/app/alloc", body={"size": 1})
+                if r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR:
+                    message = r.body.json()["error"]["message"]
+                    assert message == "Exception thrown while executing.", message
+                    break
+
+        # Cap is so low that we must run out before we enter user code
+        with temporary_js_limits(network, primary, max_heap_bytes=100):
+            r = c.post("/app/alloc", body={"size": 1})
+            assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR
+            message = r.body.json()["error"]["message"]
+            assert message == "Exception thrown while executing.", message
 
     return network
 
@@ -145,7 +264,7 @@ def test_execution_time_limit(network, args):
     primary, _ = network.find_nodes()
 
     safe_time = 50
-    unsafe_time = 5000
+    unsafe_time = 10000
 
     with primary.client("user0") as c:
         r = c.post("/app/sleep", body={"time": safe_time})
@@ -154,7 +273,7 @@ def test_execution_time_limit(network, args):
         with temporary_js_limits(network, primary, max_execution_time_ms=30):
             r = c.post("/app/sleep", body={"time": safe_time})
             assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
-            message = r.body.json()["error"]["details"][0]["message"]
+            message = parse_error_message(r)
             assert message == "InternalError: interrupted", message
 
         r = c.post("/app/sleep", body={"time": safe_time})
@@ -162,20 +281,91 @@ def test_execution_time_limit(network, args):
 
         r = c.post("/app/sleep", body={"time": unsafe_time})
         assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
-        message = r.body.json()["error"]["details"][0]["message"]
+        message = parse_error_message(r)
         assert message == "InternalError: interrupted", message
+
+        # Lower the cap until we likely run out of heap out of user code,
+        # and check that we don't crash and return an error message
+        cap = safe_time
+        while cap > 0:
+            cap //= 2
+            LOG.info(f"Max exec time: {cap}")
+            with temporary_js_limits(network, primary, max_execution_time_ms=cap):
+                r = c.post("/app/sleep", body={"time": 10})
+                if r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR:
+                    message = r.body.json()["error"]["message"]
+                    assert message == "Operation took too long to complete.", message
+                    break
+
+        # Cap is so low that we must run out before we enter user code
+        with temporary_js_limits(network, primary, max_execution_time_ms=0):
+            r = c.post("/app/sleep", body={"time": 10})
+            assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR
+            message = r.body.json()["error"]["message"]
+            assert message == "Operation took too long to complete.", message
+
+    return network
+
+
+@reqs.description("Test execution time limit in nested and response JS")
+def test_execution_time_limit_across_request(network, args):
+    primary, _ = network.find_nodes()
+
+    with temporary_js_limits(
+        network, primary, max_execution_time_ms=30
+    ), primary.client("user0") as c:
+        for path in (
+            "nested_eval",
+            "nested_function",
+            "response_body_getter",
+            "response_headers_getter",
+            "response_header_value_getter",
+            "response_headers_proxy",
+            "response_status_code_getter",
+        ):
+            r = c.post(f"/app/{path}")
+            assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
+            message = r.body.json()["error"]["message"]
+            assert message == "Operation took too long to complete.", message
+
+    return network
+
+
+@reqs.description("Test regular exceptions are not masked by the timeout message")
+def test_response_exception_message(network, args):
+    primary, _ = network.find_nodes()
+
+    # Each of these raises an ordinary Error, well within the execution time
+    # limit. The reported message must describe the actual failure, and must
+    # never be the timeout message.
+    cases = {
+        "handler_throws": "Exception thrown while executing.",
+        "response_getter_throws": (
+            "Invalid endpoint function return value (error reading body)."
+        ),
+    }
+
+    with primary.client("user0") as c:
+        for path, expected in cases.items():
+            r = c.post(f"/app/{path}")
+            assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
+            message = r.body.json()["error"]["message"]
+            assert message != "Operation took too long to complete.", message
+            assert message == expected, message
 
     return network
 
 
 def run_limits(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network = test_stack_size_limit(network, args)
         network = test_heap_size_limit(network, args)
         network = test_execution_time_limit(network, args)
+        network = test_execution_time_limit_across_request(network, args)
+        network = test_response_exception_message(network, args)
 
 
 @reqs.description("Cert authentication")
@@ -206,94 +396,393 @@ def test_cert_auth(network, args):
     LOG.info("User with old cert cannot call user-authenticated endpoint")
     local_user_id = "in_the_past"
     create_keypair(
-        local_user_id, datetime.datetime.utcnow() - datetime.timedelta(days=50), 3
+        local_user_id,
+        datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=50),
+        3,
     )
     network.consortium.add_user(primary, local_user_id)
 
     with primary.client(local_user_id) as c:
         r = c.get("/app/cert")
         assert r.status_code == HTTPStatus.UNAUTHORIZED, r
-        assert "Not After" in r.body.json()["error"]["details"][0]["message"], r
+        assert "Not After" in parse_error_message(r), r
 
     LOG.info("User with future cert cannot call user-authenticated endpoint")
     local_user_id = "in_the_future"
     create_keypair(
-        local_user_id, datetime.datetime.utcnow() + datetime.timedelta(days=50), 3
+        local_user_id,
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=50),
+        3,
     )
     network.consortium.add_user(primary, local_user_id)
 
     with primary.client(local_user_id) as c:
         r = c.get("/app/cert")
         assert r.status_code == HTTPStatus.UNAUTHORIZED, r
-        assert "Not Before" in r.body.json()["error"]["details"][0]["message"], r
+        assert "Not Before" in parse_error_message(r), r
 
     LOG.info("No leeway added to cert time evaluation")
     local_user_id = "just_expired"
-    valid_from = datetime.datetime.utcnow() - datetime.timedelta(days=1, seconds=2)
+    valid_from = datetime.datetime.now(datetime.UTC) - datetime.timedelta(
+        days=1, seconds=2
+    )
     create_keypair(local_user_id, valid_from, 1)
     network.consortium.add_user(primary, local_user_id)
 
     with primary.client(local_user_id) as c:
         r = c.get("/app/cert")
         assert r.status_code == HTTPStatus.UNAUTHORIZED, r
-        assert "Not After" in r.body.json()["error"]["details"][0]["message"], r
+        assert "Not After" in parse_error_message(r), r
+
+    LOG.info("Long-lived cert doesn't wraparound")
+    local_user_id = "long_lived"
+    valid_from = datetime.datetime.now(datetime.UTC)
+    create_keypair(local_user_id, valid_from, 1_000_000)
+    network.consortium.add_user(primary, local_user_id)
+
+    with primary.client(local_user_id) as c:
+        r = c.get("/app/cert")
+        assert r.status_code == HTTPStatus.OK, r
+
+    LOG.info("Future Not-Before doesn't wraparound")
+    local_user_id = "distant_future"
+    # system_clock max representable time is currently 2262-04-11, so use a date after that to check for wraparound
+    valid_from = utctime(year=2262, month=4, day=12)
+    create_keypair(local_user_id, valid_from, 4)
+    network.consortium.add_user(primary, local_user_id)
+
+    with primary.client(local_user_id) as c:
+        r = c.get("/app/cert")
+        assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+        expected = (
+            f"certificate's Not Before validity period {int(valid_from.timestamp())}"
+        )
+        actual = parse_error_message(r)
+        assert expected in actual, r
+
+    LOG.info("Representable range")
+    local_user_id = "representable"
+    # Python crypto enforces minimum Not-Before of 1950-01-01
+    valid_from = utctime(year=1950, month=1, day=1)
+    # Probe maximum validity range
+    validity_days = (utctime(year=9999, month=12, day=31) - valid_from).days
+    create_keypair(local_user_id, valid_from, validity_days)
+    network.consortium.add_user(primary, local_user_id)
+
+    with primary.client(local_user_id) as c:
+        r = c.get("/app/cert")
+        assert r.status_code == HTTPStatus.OK, r
 
     return network
 
 
-@reqs.description("JWT authentication")
+@reqs.description("JWT authentication as by OpenID spec")
 def test_jwt_auth(network, args):
     primary, _ = network.find_nodes()
 
-    issuer = infra.jwt_issuer.JwtIssuer("https://example.issuer")
+    issuer = JwtIssuer("https://example.issuer")
 
     jwt_kid = "my_key_id"
 
     LOG.info("Add JWT issuer with initial keys")
-    with tempfile.NamedTemporaryFile(prefix="ccf", mode="w+") as metadata_fp:
-        jwt_cert_der = infra.crypto.cert_pem_to_der(issuer.cert_pem)
-        der_b64 = base64.b64encode(jwt_cert_der).decode("ascii")
-        data = {
-            "issuer": issuer.name,
-            "jwks": {"keys": [{"kty": "RSA", "kid": jwt_kid, "x5c": [der_b64]}]},
-        }
-        json.dump(data, metadata_fp)
-        metadata_fp.flush()
-        network.consortium.set_jwt_issuer(primary, metadata_fp.name)
+
+    set_issuer_with_a_key(primary, network, issuer, jwt_kid, issuer.name)
 
     LOG.info("Calling jwt endpoint after storing keys")
     with primary.client("user0") as c:
-        r = c.get("/app/jwt", headers=infra.jwt_issuer.make_bearer_header("garbage"))
+        r = c.get("/app/jwt", headers=make_bearer_header("garbage"))
         assert r.status_code == HTTPStatus.UNAUTHORIZED, r.status_code
+        assert "Malformed JWT" in parse_error_message(r), r
 
         jwt_mismatching_key_priv_pem, _ = infra.crypto.generate_rsa_keypair(2048)
         jwt = infra.crypto.create_jwt({}, jwt_mismatching_key_priv_pem, jwt_kid)
-        r = c.get("/app/jwt", headers=infra.jwt_issuer.make_bearer_header(jwt))
+        r = c.get("/app/jwt", headers=make_bearer_header(jwt))
         assert r.status_code == HTTPStatus.UNAUTHORIZED, r.status_code
+        assert "JWT payload is missing required field" in parse_error_message(r), r
 
         r = c.get(
             "/app/jwt",
-            headers=infra.jwt_issuer.make_bearer_header(issuer.issue_jwt(jwt_kid)),
+            headers=make_bearer_header(issuer.issue_jwt(jwt_kid)),
         )
         assert r.status_code == HTTPStatus.OK, r.status_code
 
         LOG.info("Calling JWT with too-late nbf")
         r = c.get(
             "/app/jwt",
-            headers=infra.jwt_issuer.make_bearer_header(
+            headers=make_bearer_header(
                 issuer.issue_jwt(jwt_kid, claims={"nbf": time.time() + 60})
             ),
         )
         assert r.status_code == HTTPStatus.UNAUTHORIZED, r.status_code
+        assert "is before token's Not Before" in parse_error_message(r), r
 
         LOG.info("Calling JWT with too-early exp")
         r = c.get(
             "/app/jwt",
-            headers=infra.jwt_issuer.make_bearer_header(
+            headers=make_bearer_header(
                 issuer.issue_jwt(jwt_kid, claims={"exp": time.time() - 60})
             ),
         )
         assert r.status_code == HTTPStatus.UNAUTHORIZED, r.status_code
+        assert "is after token's Expiration Time" in parse_error_message(r), r
+
+    network.consortium.remove_jwt_issuer(primary, issuer.name)
+    return network
+
+
+@reqs.description("JWT authentication as by OpenID spec with raw public key")
+def test_jwt_auth_raw_key(network, args):
+    assert_es256_raw_jwk_coordinates_are_fixed_width()
+    primary, _ = network.find_nodes()
+
+    for alg in [JwtAlg.RS256, JwtAlg.ES256]:
+        issuer = JwtIssuer(
+            "https://noautorefresh.example/issuer",
+            alg=alg,
+            auth_type=JwtAuthType.KEY,
+        )
+        jwt_kid = "my_key_id"
+        issuer.register(network, kid=jwt_kid)
+
+        LOG.info("Calling jwt endpoint after storing keys")
+        with primary.client("user0") as c:
+            token = issuer.issue_jwt(jwt_kid)
+            r = c.get(
+                "/app/jwt",
+                headers=make_bearer_header(token),
+            )
+            assert r.status_code == HTTPStatus.OK, r.status_code
+
+            # Change client's key only, new token shouldn't pass validation.
+            issuer.refresh_keys(kid=jwt_kid, send_update=False)
+            token = issuer.issue_jwt(jwt_kid)
+            r = c.get(
+                "/app/jwt",
+                headers=make_bearer_header(token),
+            )
+            assert r.status_code == HTTPStatus.UNAUTHORIZED, r.status_code
+
+    network.consortium.remove_jwt_issuer(primary, issuer.name)
+    return network
+
+
+@reqs.description("JWT authentication as by MSFT Entra (single tenant)")
+def test_jwt_auth_msft_single_tenant(network, args):
+    """For a specific tenant, only tokens with this issuer+tenant can auth."""
+
+    primary, _ = network.find_nodes()
+
+    TENANT_ID = "9188050d-6c67-4c5b-b112-36a304b66da"
+    ISSUER_TENANT = (
+        "https://login.microsoftonline.com/9188050d-6c67-4c5b-b112-36a304b66da/v2.0"
+    )
+
+    issuer = JwtIssuer(name="https://login.microsoftonline.com")
+    jwt_kid = "my_key_id"
+
+    set_issuer_with_a_key(primary, network, issuer, jwt_kid, ISSUER_TENANT)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, "garbage_tenant")
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert "failed issuer constraint validation" in parse_error_message(r), r
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, "{tenantid}")
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert "failed issuer constraint validation" in parse_error_message(r), r
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    network.consortium.remove_jwt_issuer(primary, issuer.name)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert f"key not found for kid {jwt_kid}" in parse_error_message(r), r
+
+    return network
+
+
+@reqs.description("JWT authentication as by MSFT Entra (multiple tenants)")
+def test_jwt_auth_msft_multitenancy(network, args):
+    """For a common tenant, all tokens from this issuer can auth,
+    no matter which tenant is specified."""
+
+    primary, _ = network.find_nodes()
+
+    COMMNON_ISSUER = "https://login.microsoftonline.com/{tenantid}/v2.0"
+    TENANT_ID = "9188050d-6c67-4c5b-b112-36a304b66da"
+    ISSUER_TENANT = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
+    ANOTHER_TENANT_ID = "deadbeef-6c67-4c5b-b112-36a304b66da"
+    ISSUER_ANOTHER = f"https://login.microsoftonline.com/{ANOTHER_TENANT_ID}/v2.0"
+
+    issuer = JwtIssuer(name="https://login.microsoftonline.com")
+
+    jwt_kid_1 = "my_key_id_1"
+    jwt_kid_2 = "my_key_id_2"
+
+    with tempfile.NamedTemporaryFile(prefix="ccf", mode="w+") as metadata_fp:
+        jwt_cert_der = infra.crypto.cert_pem_to_der(issuer.cert_pem)
+        der_b64 = base64.b64encode(jwt_cert_der).decode("ascii")
+        data = {
+            "issuer": issuer.issuer_url,
+            "auto_refresh": False,
+            "jwks": {
+                "keys": [
+                    {
+                        "kty": "RSA",
+                        "kid": jwt_kid_1,
+                        "x5c": [der_b64],
+                        "issuer": COMMNON_ISSUER,
+                    },
+                    {
+                        "kty": "RSA",
+                        "kid": jwt_kid_2,
+                        "x5c": [der_b64],
+                        "issuer": ISSUER_TENANT,
+                    },
+                ]
+            },
+        }
+        json.dump(data, metadata_fp)
+        metadata_fp.flush()
+        network.consortium.set_jwt_issuer(primary, metadata_fp.name)
+
+    r = try_auth(primary, issuer, jwt_kid_1, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    r = try_auth(primary, issuer, jwt_kid_1, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    r = try_auth(primary, issuer, jwt_kid_1, ISSUER_TENANT, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert "failed issuer constraint validation" in parse_error_message(r), r
+
+    r = try_auth(primary, issuer, jwt_kid_2, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    r = try_auth(primary, issuer, jwt_kid_2, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert "failed issuer constraint validation" in parse_error_message(r), r
+
+    network.consortium.remove_jwt_issuer(primary, issuer.name)
+
+    r = try_auth(primary, issuer, jwt_kid_1, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert f"key not found for kid {jwt_kid_1}" in parse_error_message(r), r
+
+    r = try_auth(primary, issuer, jwt_kid_2, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert f"key not found for kid {jwt_kid_2}" in parse_error_message(r), r
+
+    return network
+
+
+@reqs.description("JWT authentication with same kids for different issuers")
+def test_jwt_auth_msft_same_kids_different_issuers(network, args):
+    """Multiple issuer can share same kid with their own constraints specified.
+    So when issuer1 adds it with constraint1, and issuer2 added it with constraint2,
+    then tokens from both issuer1 and issuer2 can go.
+    However, when issuer1 is removed, issuer2 has to remain capable of
+    authenticating with their tokens."""
+
+    primary, _ = network.find_nodes()
+
+    TENANT_ID = "9188050d-6c67-4c5b-b112-36a304b66da"
+    ISSUER_TENANT = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
+    ANOTHER_TENANT_ID = "deadbeef-6c67-4c5b-b112-36a304b66da"
+    ISSUER_ANOTHER = f"https://login.microsoftonline.com/{ANOTHER_TENANT_ID}/v2.0"
+
+    issuer = JwtIssuer(name=ISSUER_TENANT)
+    another = JwtIssuer(name=ISSUER_ANOTHER)
+
+    # Immitate same key sharing
+    another.cert_pem, another.key_priv_pem = issuer.cert_pem, issuer.key_priv_pem
+
+    jwt_kid = "my_key_id"
+
+    set_issuer_with_a_key(primary, network, issuer, jwt_kid, ISSUER_TENANT)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    r = try_auth(primary, another, jwt_kid, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert "failed issuer constraint validation" in parse_error_message(r), r
+
+    set_issuer_with_a_key(primary, network, another, jwt_kid, ISSUER_ANOTHER)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    r = try_auth(primary, another, jwt_kid, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    network.consortium.remove_jwt_issuer(primary, issuer.name)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert "failed issuer constraint validation" in parse_error_message(r), r
+
+    r = try_auth(primary, another, jwt_kid, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    network.consortium.remove_jwt_issuer(primary, another.name)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert f"key not found for kid {jwt_kid}" in parse_error_message(r), r
+
+    r = try_auth(primary, another, jwt_kid, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert f"key not found for kid {jwt_kid}" in parse_error_message(r), r
+
+    return network
+
+
+@reqs.description("JWT authentication with same kid with constraint overwrite")
+def test_jwt_auth_msft_same_kids_overwrite_constraint(network, args):
+    """If issuer sets the same kid with different constraint we have to
+    overwrite it. Test exists because this was found as a bug during feature
+    development and was very easy to miss updating the constraint for
+    existing kids."""
+
+    primary, _ = network.find_nodes()
+
+    COMMNON_ISSUER = "https://login.microsoftonline.com/{tenantid}/v2.0"
+    TENANT_ID = "9188050d-6c67-4c5b-b112-36a304b66da"
+    ISSUER_TENANT = f"https://login.microsoftonline.com/{TENANT_ID}/v2.0"
+    ANOTHER_TENANT_ID = "deadbeef-6c67-4c5b-b112-36a304b66da"
+    ISSUER_ANOTHER = f"https://login.microsoftonline.com/{ANOTHER_TENANT_ID}/v2.0"
+
+    issuer = JwtIssuer(name=ISSUER_TENANT)
+    jwt_kid = "my_key_id"
+
+    set_issuer_with_a_key(primary, network, issuer, jwt_kid, COMMNON_ISSUER)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    set_issuer_with_a_key(primary, network, issuer, jwt_kid, ISSUER_TENANT)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.OK, r
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert "failed issuer constraint validation" in parse_error_message(r), r
+
+    network.consortium.remove_jwt_issuer(primary, issuer.name)
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_TENANT, TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert f"key not found for kid {jwt_kid}" in parse_error_message(r), r
+
+    r = try_auth(primary, issuer, jwt_kid, ISSUER_ANOTHER, ANOTHER_TENANT_ID)
+    assert r.status_code == HTTPStatus.UNAUTHORIZED, r
+    assert f"key not found for kid {jwt_kid}" in parse_error_message(r), r
 
     return network
 
@@ -386,11 +875,16 @@ def test_role_based_access(network, args):
 
 def run_authn(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network = test_cert_auth(network, args)
         network = test_jwt_auth(network, args)
+        network = test_jwt_auth_raw_key(network, args)
+        network = test_jwt_auth_msft_single_tenant(network, args)
+        network = test_jwt_auth_msft_multitenancy(network, args)
+        network = test_jwt_auth_msft_same_kids_different_issuers(network, args)
+        network = test_jwt_auth_msft_same_kids_overwrite_constraint(network, args)
         network = test_role_based_access(network, args)
 
 
@@ -449,10 +943,6 @@ def test_accept_header(network, args):
         assert r.status_code == http.HTTPStatus.OK.value
         assert r.headers["content-type"] == "application/json"
 
-        r = c.get("/node/commit", headers={"accept": "application/msgpack"})
-        assert r.status_code == http.HTTPStatus.OK.value
-        assert r.headers["content-type"] == "application/msgpack"
-
         r = c.get(
             "/node/commit",
             headers={"accept": "text/html;q=0.9,image/jpeg;video/mpeg;q=0.8,*/*;q=0.1"},
@@ -467,15 +957,6 @@ def test_accept_header(network, args):
         )
         assert r.status_code == http.HTTPStatus.OK.value
         assert r.headers["content-type"] == "application/json"
-
-        r = c.get(
-            "/node/commit",
-            headers={
-                "accept": "text/html;q=0.9,image/jpeg;video/mpeg;q=0.8,application/msgpack;q=0.1"
-            },
-        )
-        assert r.status_code == http.HTTPStatus.OK.value
-        assert r.headers["content-type"] == "application/msgpack"
 
     return network
 
@@ -543,7 +1024,7 @@ def test_unknown_path(network, args):
 
 def run_content_types(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network = test_content_types(network, args)
@@ -568,7 +1049,7 @@ def test_random_api(args):
     n_repeats = 3
     for _ in range(n_repeats):
         with infra.network.network(
-            args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+            args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
         ) as network:
             network.start_and_open(args)
             primary, _ = network.find_nodes()
@@ -576,7 +1057,7 @@ def test_random_api(args):
                 with primary.client() as c:
                     r = c.get("/app/make_randoms")
                     assert r.status_code == 200, r
-                    for _, n in r.body.json().items():
+                    for n in r.body.json().values():
                         assert_fresh(n)
 
 
@@ -663,26 +1144,27 @@ def test_datetime_api(network, args):
 
     with primary.client() as c:
         r = c.get("/time_now")
-        local_time = datetime.datetime.now(datetime.timezone.utc)
+        local_time = datetime.datetime.now(datetime.UTC)
         assert r.status_code == http.HTTPStatus.OK, r
         body = r.body.json()
 
-        # Python datetime "ISO" doesn't parse Z suffix, so replace it
-        default = body["default"].replace("Z", "+00:00")
-        definitely_now = body["definitely_now"].replace("Z", "+00:00")
-        definitely_1970 = body["definitely_1970"].replace("Z", "+00:00")
+        definitely_now = body["definitely_now"]
+        definitely_1970 = body["definitely_1970"]
 
-        # Assume less than 5ms of execution time between grabbing timestamps, and confirm that default call gets real timestamp from global activation
-        default_time = datetime.datetime.fromisoformat(default)
+        # Assume less than 5ms of execution time between grabbing timestamps, and confirm that untrustedDateTime has no effect
         service_time = datetime.datetime.fromisoformat(definitely_now)
-        diff = (service_time - default_time).total_seconds()
+        untrusted_on = datetime.datetime.fromisoformat(body["untrusted_on"])
+        untrusted_off = datetime.datetime.fromisoformat(body["untrusted_off"])
+        diff = (untrusted_on - service_time).total_seconds()
+        assert diff < 0.005, diff
+        diff = (untrusted_off - untrusted_on).total_seconds()
         assert diff < 0.005, diff
 
-        # Assume less than 1 second of clock skew + execution time
+        # Assume less than 1 second of clock skew + execution time, and that service time is now
         diff = (local_time - service_time).total_seconds()
         assert abs(diff) < 1, diff
 
-        local_epoch_start = datetime.datetime.fromtimestamp(0, datetime.timezone.utc)
+        local_epoch_start = datetime.datetime.fromtimestamp(0, datetime.UTC)
         service_epoch_start = datetime.datetime.fromisoformat(definitely_1970)
         assert local_epoch_start == service_epoch_start, service_epoch_start
     return network
@@ -693,11 +1175,12 @@ def test_metrics_logging(network, args):
     primary, _ = network.find_nodes()
 
     # Add and test on a new node, so we can kill it to safely read its logs
-    new_node = network.create_node("local://localhost")
+    new_node = network.create_node()
     network.join_node(
         new_node,
         args.package,
         args,
+        from_snapshot=False,
     )
     network.trust_node(new_node, args)
 
@@ -728,15 +1211,16 @@ def test_metrics_logging(network, args):
         r".*\[js\].*\| JS execution complete: Method=(?P<Method>.*), Path=(?P<Path>.*), Status=(?P<Status>\d+), ExecMilliseconds=(?P<ExecMilliseconds>\d+)$"
     )
     out_path, _ = new_node.get_logs()
-    for line in open(out_path, "r", encoding="utf-8").readlines():
-        match = metrics_regex.match(line)
-        if match is not None:
-            expected_groups = assertions.pop(0)
-            for k, v in expected_groups.items():
-                actual_match = match.group(k)
-                assert actual_match == v
-            LOG.success(f"Found metrics logging line: {line}")
-            LOG.info(f"Parsed to: {match.groups()}")
+    with open(out_path, "r", encoding="utf-8") as output:
+        for line in output:
+            match = metrics_regex.match(line)
+            if match is not None:
+                expected_groups = assertions.pop(0)
+                for k, v in expected_groups.items():
+                    actual_match = match.group(k)
+                    assert actual_match == v
+                LOG.success(f"Found metrics logging line: {line}")
+                LOG.info(f"Parsed to: {match.groups()}")
 
     assert len(assertions) == 0
 
@@ -747,7 +1231,7 @@ def run_api(args):
     test_random_api(args)
 
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         network = test_request_object_api(network, args)
@@ -759,9 +1243,9 @@ def test_reused_interpreter_behaviour(network, args):
     primary, _ = network.find_nodes()
 
     def timed(fn):
-        start = datetime.datetime.now()
+        start = datetime.datetime.now(datetime.UTC)
         result = fn()
-        end = datetime.datetime.now()
+        end = datetime.datetime.now(datetime.UTC)
         duration = (end - start).total_seconds()
         LOG.debug(f"({duration:.2f}s)")
         return duration, result
@@ -902,6 +1386,110 @@ def test_reused_interpreter_behaviour(network, args):
     return network
 
 
+def test_caching_of_kv_handles(network, args):
+    primary, _ = network.find_nodes()
+    with primary.client() as c:
+        LOG.info("Testing caching of KV handles")
+        r = c.post("/app/increment")
+        assert r.status_code == http.HTTPStatus.OK, r
+        r = c.post("/app/increment")
+        assert r.status_code == http.HTTPStatus.OK, r
+        r = c.post("/app/increment")
+        assert r.status_code == http.HTTPStatus.OK, r
+        r = c.post("/app/increment")
+        assert r.status_code == http.HTTPStatus.OK, r
+        r = c.post("/app/increment")
+        assert r.status_code == http.HTTPStatus.OK, r
+
+        LOG.info("Testing caching of ccf JS globals")
+
+        def make_body():
+            return {str(uuid.uuid4()): str(uuid.uuid4())}
+
+        body = make_body()
+        r = c.post("/app/globals", body)
+        assert r.status_code == http.HTTPStatus.OK, r
+        assert r.body.json() == body
+
+        body = make_body()
+        r = c.post("/app/globals", body)
+        assert r.status_code == http.HTTPStatus.OK, r
+        assert r.body.json() == body
+
+        body = make_body()
+        r = c.post("/app/globals", body)
+        assert r.status_code == http.HTTPStatus.OK, r
+        assert r.body.json() == body
+
+    return network
+
+
+@reqs.description("Historical state remains available through response conversion")
+def test_historical_response_conversion(network, args):
+    primary, _ = network.find_nodes()
+    with primary.client() as c:
+        writes = []
+        for _ in range(2):
+            r = c.post("/app/increment")
+            assert r.status_code == http.HTTPStatus.OK, r
+            c.wait_for_commit(r)
+            writes.append(r)
+
+        for write in writes:
+            expected_value = write.body.json()["value"]
+            for path in ("/app/historical", f"/app/historical/range/{write.seqno}"):
+                headers = {
+                    infra.clients.CCF_TX_ID_HEADER: f"{write.view}.{write.seqno}"
+                }
+                timeout = time.time() + 10
+                while True:
+                    r = c.get(path, headers=headers)
+                    if r.status_code != http.HTTPStatus.ACCEPTED:
+                        break
+                    assert time.time() < timeout, r
+                    time.sleep(0.1)
+
+                assert r.status_code == http.HTTPStatus.OK, r
+                assert r.body.json() == {"value": expected_value}, r
+                assert r.headers["x-historical-value"] == str(expected_value), r
+
+                for fail in ("body", "json"):
+                    r = c.get(path, headers={**headers, "x-throw": fail})
+                    assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
+                    r = c.get(path, headers=headers)
+                    assert r.status_code == http.HTTPStatus.OK, r
+                    assert r.body.json() == {"value": expected_value}, r
+
+    return network
+
+
+def test_caching_of_app_code(network, args):
+    primary, backups = network.find_nodes()
+    LOG.info(
+        "Testing that interpreter reuse does not persist functions past app update"
+    )
+
+    def set_app_with_placeholder(new_val):
+        LOG.info(f"Replacing placeholder with {new_val}")
+        bundle = network.consortium.read_bundle_from_dir(args.js_app_bundle)
+        # Replace placeholder blindly, in the raw bundle JSON as string
+        s = json.dumps(bundle).replace("<func_caching_placeholder>", new_val)
+        bundle = json.loads(s)
+        return network.consortium.set_js_app_from_bundle(primary, bundle)
+
+    for _ in range(5):
+        v = str(uuid.uuid4())
+        p = set_app_with_placeholder(v)
+        for node in [primary, *backups]:
+            with node.client() as c:
+                infra.commit.wait_for_commit(client=c, view=p.view, seqno=p.seqno)
+                r = c.get("/app/func_caching")
+                assert r.status_code == http.HTTPStatus.OK, r
+                assert r.body.text() == v
+
+    return network
+
+
 def run_interpreter_reuse(args):
     # The js_app_bundle arg includes TS and Node dependencies, so must be built here
     # before deploying (and then we deploy the produces /dist folder)
@@ -912,11 +1500,14 @@ def run_interpreter_reuse(args):
     args.js_app_bundle = os.path.join(js_src_dir, "dist")
 
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
         network = test_reused_interpreter_behaviour(network, args)
+        network = test_caching_of_kv_handles(network, args)
+        network = test_historical_response_conversion(network, args)
+        network = test_caching_of_app_code(network, args)
 
 
 if __name__ == "__main__":
@@ -962,7 +1553,7 @@ if __name__ == "__main__":
     cr.add(
         "interpreter_reuse",
         run_interpreter_reuse,
-        nodes=infra.e2e_args.nodes(cr.args, 1),
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
         js_app_bundle=os.path.join(cr.args.js_app_bundle, "js-interpreter-reuse"),
     )
 

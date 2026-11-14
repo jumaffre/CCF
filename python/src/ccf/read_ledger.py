@@ -1,0 +1,397 @@
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the Apache 2.0 License.
+
+import argparse
+import json
+import re
+import sys
+from collections.abc import Callable, Sized
+from datetime import UTC, datetime
+from enum import Enum, auto
+from typing import TypedDict
+
+import ccf.ledger
+
+
+class PrintMode(Enum):
+    Quiet = auto()
+    Digests = auto()
+    Contents = auto()
+
+
+class FormatRule(TypedDict):
+    """Formatters for a table's binary keys and values."""
+
+    key: Callable[[bytes], str]
+    value: Callable[[bytes], str]
+
+
+TablesFormatRules = list[tuple[str, FormatRule]]
+CompiledTablesFormatRules = list[tuple[re.Pattern[str], FormatRule]]
+
+
+def indent(n: int) -> str:
+    """Return n spaces."""
+    return " " * n
+
+
+def fmt_uint_le(data: bytes) -> str:
+    """Format a little-endian unsigned integer with its bit width."""
+    return (
+        f'<u{8 * len(data)}: {int.from_bytes(data, byteorder="little", signed=False)}>'
+    )
+
+
+def fmt_raw(data: bytes) -> str:
+    """Format bytes using their Python representation."""
+    return str(data)
+
+
+def fmt_hex(data: bytes) -> str:
+    """Format bytes as hexadecimal."""
+    return data.hex()
+
+
+def fmt_str(data: bytes) -> str:
+    """Decode a UTF-8 string."""
+    return data.decode()
+
+
+def fmt_json(data: bytes) -> str:
+    """Pretty-print a JSON-encoded value."""
+    return json.dumps(json.loads(data), indent=2)
+
+
+def fmt_cose_recent_timestamp(data: bytes) -> str:
+    """Format a recent-proposal key with its creation timestamp."""
+    s = data.decode()
+    ts, _ = s.split(":")
+    dt = datetime.fromtimestamp(int(ts), UTC)
+    return f"[{dt.isoformat()}] {s}"
+
+
+# List of table name regex to key and value format functions (first match is used)
+# Callers can specify additional rules (e.g. for application-specific
+# public tables) which get looked up first.
+default_format_rule: FormatRule = {"key": fmt_raw, "value": fmt_raw}
+default_tables_format_rules: TablesFormatRules = [
+    (
+        "^public:ccf\\.gov\\.cose_recent_proposals$",
+        {
+            "key": fmt_cose_recent_timestamp,
+            "value": fmt_json,
+        },
+    ),
+    (
+        "^public:ccf\\.internal\\..*$",
+        {
+            "key": fmt_uint_le,
+            "value": fmt_json,
+        },
+    ),
+    (
+        "^public:ccf\\.gov\\..*(service|network|constitution).*$",
+        {
+            "key": fmt_uint_le,
+            "value": fmt_json,
+        },
+    ),
+    ("^public:ccf\\.gov\\..*$", {"key": fmt_str, "value": fmt_json}),
+    (".*", {"key": fmt_raw, "value": fmt_raw}),
+]
+
+
+def find_rule(
+    tables_format_rules: CompiledTablesFormatRules, target_table_name: str
+) -> FormatRule:
+    """Return the first matching table rule, or the default binary formatters."""
+    for table_name_re, format_rules in tables_format_rules:
+        if table_name_re.match(target_table_name):
+            return format_rules
+    return default_format_rule
+
+
+def print_key(
+    key: bytes,
+    table_name: str,
+    tables_format_rules: CompiledTablesFormatRules,
+    indent_s: str,
+    is_removed: bool = False,
+) -> None:
+    """Print a table key, indicating deletions when requested."""
+    k = find_rule(tables_format_rules, table_name)["key"](key)
+
+    if is_removed:
+        print(f"{indent_s}Removed {k}")
+    else:
+        print(f"{indent_s}{k}:")
+
+
+def counted_string(string: Sized, name: str) -> str:
+    """Format an object's length with a pluralised label."""
+    return f"{len(string)} {name}{'s' * bool(len(string) != 1)}"
+
+
+def dump_entry(
+    entry: ccf.ledger.Transaction | ccf.ledger.Snapshot,
+    table_filter: re.Pattern[str] | None,
+    tables_format_rules: CompiledTablesFormatRules,
+) -> None:
+    """Print an entry's public writes and private-domain size."""
+    public_transaction = entry.get_public_domain()
+    public_tables = public_transaction.get_tables()
+    flags = entry.get_transaction_header().flags
+    flags_msg = "" if flags == 0 else f", flags={hex(flags)}"
+    tx_header = f"{indent(2)}txid {entry.get_txid()} ({counted_string(public_tables, 'public table')}) [{entry.get_len()} bytes{flags_msg}]"
+    printed_tx_header = False
+
+    private_table_size = entry.get_private_domain_size()
+    if private_table_size and table_filter is None:
+        if not printed_tx_header:
+            print(tx_header)
+            printed_tx_header = True
+
+        print(f"{indent(2)}-- private: {private_table_size} bytes")
+
+    for table_name, records in public_tables.items():
+        if table_filter is not None and not table_filter.match(table_name):
+            continue
+
+        if not printed_tx_header:
+            print(tx_header)
+            printed_tx_header = True
+
+        print(f'{indent(4)}table "{table_name}" ({counted_string(records, "write")}):')
+        key_indent = indent(6)
+        value_indent = indent(8)
+        for key, value in records.items():
+            if value is not None:
+                display_value: bytes | str = value
+                try:
+                    formatted_value = find_rule(tables_format_rules, table_name)[
+                        "value"
+                    ](value)
+                    display_value = formatted_value.replace(
+                        "\n", f"\n{value_indent}"
+                    )  # Indent every line within stringified JSON
+                except (json.decoder.JSONDecodeError, UnicodeDecodeError):
+                    pass
+                finally:
+                    print_key(key, table_name, tables_format_rules, key_indent)
+                    print(f"{value_indent}{display_value}")
+            else:
+                print_key(
+                    key, table_name, tables_format_rules, key_indent, is_removed=True
+                )
+
+
+def run(
+    paths: list[str],
+    print_mode: PrintMode,
+    is_snapshot: bool = False,
+    tables_regex: str | None = None,
+    verification_level: ccf.ledger.VerificationLevel | None = None,
+    uncommitted: bool = False,
+    read_recovery_files: bool = False,
+    tables_format_rules: TablesFormatRules | None = None,
+    # Deprecated parameter, kept for backward compatibility
+    insecure_skip_verification: bool | None = None,
+) -> bool:
+    """Read and optionally verify ledger chunks or a snapshot, reporting failures."""
+    # Handle backward compatibility
+    if insecure_skip_verification is not None and verification_level is None:
+        verification_level = (
+            ccf.ledger.VerificationLevel.NONE
+            if insecure_skip_verification
+            else ccf.ledger.VerificationLevel.FULL
+        )
+    elif verification_level is None:
+        # Default to FULL if neither is specified
+        verification_level = ccf.ledger.VerificationLevel.FULL
+
+    table_filter = re.compile(tables_regex) if tables_regex is not None else None
+
+    # Extend and compile rules, without modifying the caller's rules
+    all_tables_format_rules = [
+        *(tables_format_rules or []),
+        *default_tables_format_rules,
+    ]
+    compiled_tables_format_rules = [
+        (re.compile(table_name_re), _) for (table_name_re, _) in all_tables_format_rules
+    ]
+
+    if is_snapshot:
+        snapshot_file = paths[0]
+        with ccf.ledger.Snapshot(snapshot_file) as snapshot:
+            print(
+                f"Reading snapshot from {snapshot_file} ({'' if snapshot.is_committed() else 'un'}committed)"
+            )
+            dump_entry(snapshot, table_filter, compiled_tables_format_rules)
+        return True
+    else:
+        # Create validator if verification level is not NONE
+        validator = (
+            ccf.ledger.LedgerValidator(verification_level=verification_level)
+            if verification_level != ccf.ledger.VerificationLevel.NONE
+            else None
+        )
+        ledger_paths = paths
+        ledger = ccf.ledger.Ledger(
+            ledger_paths,
+            committed_only=not uncommitted,
+            read_recovery_files=read_recovery_files,
+            verification_level=verification_level,
+        )
+
+        print(f"Reading ledger from {ledger_paths}")
+        print(f"Contains {counted_string(ledger, 'chunk')}")
+
+        try:
+            for chunk in ledger:
+                print(
+                    f"chunk {chunk.filename()} ({'' if chunk.is_committed() else 'un'}committed)"
+                )
+                for transaction in chunk:
+                    if print_mode == PrintMode.Quiet:
+                        pass
+                    elif print_mode == PrintMode.Digests:
+                        print(
+                            f"{transaction.get_txid()} {transaction.get_write_set_digest().hex()}"
+                        )
+                    elif print_mode == PrintMode.Contents:
+                        dump_entry(
+                            transaction, table_filter, compiled_tables_format_rules
+                        )
+
+                    if validator:
+                        validator.add_transaction(transaction)
+        except Exception as e:
+            print(f"Error parsing ledger: {e}")
+            has_error = True
+        else:
+            print("Ledger verification complete")
+            has_error = False
+        finally:
+            if not validator:
+                print("Skipped ledger integrity verification")
+            else:
+                # Build appropriate message based on verification level
+                if verification_level >= ccf.ledger.VerificationLevel.MERKLE:
+                    # For MERKLE and FULL, report signature verification
+                    print(
+                        f"Verified {verification_level.name} - {validator.transaction_count} transactions, "
+                        f"{validator.signature_count} signatures, until {validator.last_verified_txid()}"
+                    )
+                else:
+                    # For OFFSETS and HEADERS, just report transaction count
+                    print(
+                        f"Verified {verification_level.name} - {validator.transaction_count} transactions"
+                    )
+        return not has_error
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read CCF ledger or snapshot",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "paths",
+        help="Path to ledger directories, ledger chunks, or snapshot file. "
+        "Note that parsing individual ledger chunks requires --verification-level=MERKLE or lower "
+        "(FULL verification requires context from the complete ledger)",
+        nargs="+",
+    )
+    parser.add_argument(
+        "-s",
+        "--snapshot",
+        help="Indicates that the path to read is a snapshot",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--uncommitted",
+        help="Also parse uncommitted ledger files. Note that if these are in a live node directory, they may be being modified.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--recovery",
+        help="Also parse .recovery ledger files. Note that if these are in a live node directory, they may be being modified.",
+        action="store_true",
+    )
+
+    display_options = parser.add_mutually_exclusive_group()
+    display_options.add_argument(
+        "-q",
+        "--quiet",
+        help="Don't print transaction digests or contents",
+        action="store_true",
+    )
+    display_options.add_argument(
+        "-d",
+        "--digests-only",
+        help="Only print transaction digests",
+        action="store_true",
+    )
+    display_options.add_argument(
+        "-t",
+        "--tables",
+        help="Regex filter for tables to display",
+        type=str,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--verification-level",
+        help=(
+            "Ledger verification level (ordered by increasing computation cost). "
+            "NONE: No verification, just parse; "
+            "OFFSETS: Validate offset table consistency; "
+            "HEADERS: Validate transaction headers (size, version, flags); "
+            "MERKLE: Validate merkle tree (trust first signature); "
+            "FULL: Full cryptographic verification including signatures (default)"
+        ),
+        type=str,
+        choices=[level.name for level in ccf.ledger.VerificationLevel],
+        default=None,
+    )
+
+    parser.add_argument(
+        "--insecure-skip-verification",
+        help="DEPRECATED: Use --verification-level=NONE instead. INSECURE: skip all ledger verification",
+        action="store_true",
+        default=False,
+    )
+
+    args = parser.parse_args()
+
+    # Parse verification level
+    verification_level = None
+    if args.verification_level:
+        verification_level = ccf.ledger.VerificationLevel[args.verification_level]
+
+    # Handle deprecated flag
+    insecure_skip_verification = (
+        args.insecure_skip_verification if not args.verification_level else None
+    )
+
+    print_mode = PrintMode.Contents
+    if args.quiet:
+        print_mode = PrintMode.Quiet
+    elif args.digests_only:
+        print_mode = PrintMode.Digests
+
+    if not run(
+        args.paths,
+        print_mode,
+        is_snapshot=args.snapshot,
+        tables_regex=args.tables,
+        verification_level=verification_level,
+        insecure_skip_verification=insecure_skip_verification,
+        uncommitted=args.uncommitted,
+        read_recovery_files=args.recovery,
+    ):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

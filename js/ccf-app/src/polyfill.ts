@@ -21,7 +21,7 @@ import { TextEncoder, TextDecoder } from "util";
 
 // Note: It is important that only types are imported here to prevent executing
 // the module at this point (which would query the ccf global before we polyfilled it).
-import {
+import type {
   CCF,
   KvMaps,
   KvMap,
@@ -29,11 +29,10 @@ import {
   CryptoKeyPair,
   WrapAlgoParams,
   DigestAlgorithm,
-  EvidenceClaims,
-  OpenEnclave,
   SnpAttestation,
   SnpAttestationResult,
   SigningAlgorithm,
+  JsonWebKey,
   JsonWebKeyECPublic,
   JsonWebKeyECPrivate,
   JsonWebKeyRSAPublic,
@@ -41,6 +40,7 @@ import {
   JsonWebKeyEdDSAPublic,
   JsonWebKeyEdDSAPrivate,
 } from "./global.js";
+import { toArrayBuffer } from "./utils.js";
 
 // JavaScript's Map uses reference equality for non-primitive types,
 // whereas CCF compares the content of the ArrayBuffer.
@@ -138,14 +138,14 @@ class CCFPolyfill implements CCF {
           .replace("-", "")
           .toLowerCase();
         const hmac = jscrypto.createHmac(hashAlg, key);
-        hmac.update(new Uint8Array(data));
-        return hmac.digest();
+        hmac.update(new Uint8Array<ArrayBuffer>(data));
+        return nodeBufToArrBuf(hmac.digest());
       }
       let padding = undefined;
       const privKey = jscrypto.createPrivateKey(key);
       if (privKey.asymmetricKeyType == "rsa") {
-        if (algorithm.name === "RSASSA-PKCS1-v1_5") {
-          padding = jscrypto.constants.RSA_PKCS1_PADDING;
+        if (algorithm.name === "RSA-PSS") {
+          padding = jscrypto.constants.RSA_PKCS1_PSS_PADDING;
         } else {
           throw new Error("incompatible signing algorithm for given key type");
         }
@@ -161,16 +161,21 @@ class CCFPolyfill implements CCF {
         throw new Error("unrecognized signing algorithm");
       }
       if (algorithm.name === "EdDSA") {
-        return jscrypto.sign(null, new Uint8Array(data), privKey);
+        return nodeBufToArrBuf(
+          jscrypto.sign(null, new Uint8Array(data), privKey),
+        );
       }
       const hashAlg = (algorithm.hash as string).replace("-", "").toLowerCase();
       const signer = jscrypto.createSign(hashAlg);
       signer.update(new Uint8Array(data));
-      return signer.sign({
-        key: privKey,
-        dsaEncoding: "ieee-p1363",
-        padding: padding,
-      });
+      return nodeBufToArrBuf(
+        signer.sign({
+          key: privKey,
+          dsaEncoding: "ieee-p1363",
+          padding: padding,
+          saltLength: algorithm.saltLength ?? 0,
+        }),
+      );
     },
     verifySignature(
       algorithm: SigningAlgorithm,
@@ -181,8 +186,8 @@ class CCFPolyfill implements CCF {
       let padding = undefined;
       const pubKey = jscrypto.createPublicKey(key);
       if (pubKey.asymmetricKeyType == "rsa") {
-        if (algorithm.name === "RSASSA-PKCS1-v1_5") {
-          padding = jscrypto.constants.RSA_PKCS1_PADDING;
+        if (algorithm.name === "RSA-PSS") {
+          padding = jscrypto.constants.RSA_PKCS1_PSS_PADDING;
         } else {
           throw new Error("incompatible signing algorithm for given key type");
         }
@@ -213,6 +218,7 @@ class CCFPolyfill implements CCF {
           key: pubKey,
           dsaEncoding: "ieee-p1363",
           padding: padding,
+          saltLength: algorithm.saltLength ?? 0,
         },
         new Uint8Array(signature),
       );
@@ -252,19 +258,33 @@ class CCFPolyfill implements CCF {
       return ecdsaKeyPair;
     },
     generateEddsaKeyPair(curve: string): CryptoKeyPair {
-      // `type` is always "ed25519" because currently only "curve25519" is supported for `curve`.
-      const type = "ed25519";
-      const ecdsaKeyPair = jscrypto.generateKeyPairSync(type, {
-        publicKeyEncoding: {
-          type: "spki",
-          format: "pem",
-        },
-        privateKeyEncoding: {
-          type: "pkcs8",
-          format: "pem",
-        },
-      });
-      return ecdsaKeyPair;
+      if (curve === "curve25519") {
+        return jscrypto.generateKeyPairSync("ed25519", {
+          publicKeyEncoding: {
+            type: "spki",
+            format: "pem",
+          },
+          privateKeyEncoding: {
+            type: "pkcs8",
+            format: "pem",
+          },
+        });
+      } else {
+        if (curve !== "x25519")
+          throw new Error(
+            "Unsupported curve for EdDSA key pair generation: " + curve,
+          );
+        return jscrypto.generateKeyPairSync("x25519", {
+          publicKeyEncoding: {
+            type: "spki",
+            format: "pem",
+          },
+          privateKeyEncoding: {
+            type: "pkcs8",
+            format: "pem",
+          },
+        });
+      }
     },
     wrapKey(
       key: ArrayBuffer,
@@ -309,6 +329,58 @@ class CCFPolyfill implements CCF {
         );
       } else {
         throw new Error("unsupported wrapAlgo.name");
+      }
+    },
+    unwrapKey(
+      wrappedKey: ArrayBuffer,
+      unwrappingKey: ArrayBuffer,
+      unwrapAlgo: WrapAlgoParams,
+    ): ArrayBuffer {
+      if (unwrapAlgo.name == "RSA-OAEP") {
+        return nodeBufToArrBuf(
+          jscrypto.privateDecrypt(
+            {
+              key: Buffer.from(unwrappingKey),
+              oaepHash: "sha256",
+              padding: jscrypto.constants.RSA_PKCS1_OAEP_PADDING,
+            },
+            new Uint8Array(wrappedKey),
+          ),
+        );
+      } else if (unwrapAlgo.name == "AES-KWP") {
+        const iv = Buffer.from("A65959A6", "hex"); // defined in RFC 5649
+        const decipher = jscrypto.createDecipheriv(
+          "id-aes256-wrap-pad",
+          new Uint8Array(unwrappingKey),
+          iv,
+        );
+        return nodeBufToArrBuf(
+          Buffer.concat([
+            decipher.update(new Uint8Array(wrappedKey)),
+            decipher.final(),
+          ]),
+        );
+      } else if (unwrapAlgo.name == "RSA-OAEP-AES-KWP") {
+        const keyInfo = jscrypto.createPrivateKey(Buffer.from(unwrappingKey));
+        // asymmetricKeyDetails added in Node.js 15.7.0, we're at 16.
+        console.log(
+          `Modulus length: `,
+          keyInfo?.asymmetricKeyDetails?.modulusLength,
+        );
+        const modulusLengthInBytes =
+          (keyInfo?.asymmetricKeyDetails?.modulusLength || 2048) / 8;
+
+        const wrap1 = wrappedKey.slice(0, modulusLengthInBytes);
+        const wrap2 = wrappedKey.slice(modulusLengthInBytes);
+        const aesKey = this.unwrapKey(wrap1, unwrappingKey, {
+          name: "RSA-OAEP",
+          label: unwrapAlgo.label,
+        });
+        return this.unwrapKey(wrap2, aesKey, {
+          name: "AES-KWP",
+        });
+      } else {
+        throw new Error("unsupported unwrapAlgo.name");
       }
     },
     digest(algorithm: DigestAlgorithm, data: ArrayBuffer): ArrayBuffer {
@@ -391,6 +463,34 @@ class CCFPolyfill implements CCF {
         return false;
       }
     },
+    isValidX509RootCACert(pem: string): boolean {
+      if (!("X509Certificate" in jscrypto)) {
+        throw new Error(
+          "X509 validation unsupported, Node.js version too old (< 15.6.0)",
+        );
+      }
+      try {
+        const sep = "-----END CERTIFICATE-----";
+        const items = pem.split(sep);
+        // Expect exactly one certificate.
+        if (items.length !== 2 || items[0].trim() === "") {
+          return false;
+        }
+        const cert = new (<any>jscrypto).X509Certificate(items[0] + sep);
+        // Must be a CA certificate.
+        if (!cert.ca) {
+          return false;
+        }
+        // Must be self-signed: the certificate's public key must verify its own signature.
+        if (!cert.verify(cert.publicKey)) {
+          return false;
+        }
+        return true;
+      } catch (e: any) {
+        console.error(`isValidX509RootCACert validation failed: ${e.message}`);
+        return false;
+      }
+    },
     pubPemToJwk(pem: string, kid?: string): JsonWebKeyECPublic {
       const key = jscrypto.createPublicKey({
         key: pem,
@@ -398,8 +498,14 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyECPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        y: jwk.y,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyECPublic;
     },
     pemToJwk(pem: string, kid?: string): JsonWebKeyECPrivate {
       const key = jscrypto.createPrivateKey({
@@ -408,8 +514,15 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyECPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        y: jwk.y,
+        d: jwk.d,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyECPrivate;
     },
     pubRsaPemToJwk(pem: string, kid?: string): JsonWebKeyRSAPublic {
       const key = jscrypto.createPublicKey({
@@ -418,8 +531,13 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyRSAPublic;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        n: jwk.n,
+        e: jwk.e,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyRSAPublic;
     },
     rsaPemToJwk(pem: string, kid?: string): JsonWebKeyRSAPrivate {
       const key = jscrypto.createPrivateKey({
@@ -428,8 +546,19 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyRSAPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        n: jwk.n,
+        e: jwk.e,
+        d: jwk.d,
+        p: jwk.p,
+        q: jwk.q,
+        dp: jwk.dp,
+        dq: jwk.dq,
+        qi: jwk.qi,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyRSAPrivate;
     },
     pubEddsaPemToJwk(pem: string, kid?: string): JsonWebKeyEdDSAPublic {
       const key = jscrypto.createPublicKey({
@@ -438,8 +567,13 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyEdDSAPublic;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyEdDSAPublic;
     },
     eddsaPemToJwk(pem: string, kid?: string): JsonWebKeyEdDSAPrivate {
       const key = jscrypto.createPrivateKey({
@@ -448,47 +582,53 @@ class CCFPolyfill implements CCF {
       const jwk = key.export({
         format: "jwk",
       });
-      jwk.kid = kid;
-      return jwk as JsonWebKeyEdDSAPrivate;
+      const jwkWithKid = {
+        kty: jwk.kty,
+        crv: jwk.crv,
+        x: jwk.x,
+        d: jwk.d,
+        kid: kid,
+      };
+      return jwkWithKid as JsonWebKeyEdDSAPrivate;
     },
     pubJwkToPem(jwk: JsonWebKeyECPublic): string {
       const key = jscrypto.createPublicKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "spki", format: "pem" }).toString();
     },
     jwkToPem(jwk: JsonWebKeyECPrivate): string {
       const key = jscrypto.createPrivateKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "pkcs8", format: "pem" }).toString();
     },
     pubRsaJwkToPem(jwk: JsonWebKeyRSAPublic): string {
       const key = jscrypto.createPublicKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "spki", format: "pem" }).toString();
     },
     rsaJwkToPem(jwk: JsonWebKeyRSAPrivate): string {
       const key = jscrypto.createPrivateKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "pkcs8", format: "pem" }).toString();
     },
     pubEddsaJwkToPem(jwk: JsonWebKeyEdDSAPublic): string {
       const key = jscrypto.createPublicKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "spki", format: "pem" }).toString();
     },
     eddsaJwkToPem(jwk: JsonWebKeyEdDSAPrivate): string {
       const key = jscrypto.createPrivateKey({
-        key: jwk as jscrypto.JsonWebKey,
+        key: jwk as JsonWebKey,
         format: "jwk",
       });
       return key.export({ type: "pkcs8", format: "pem" }).toString();
@@ -533,6 +673,14 @@ class CCFPolyfill implements CCF {
     return this.crypto.wrapKey(key, wrappingKey, parameters);
   }
 
+  unwrapKey(
+    key: ArrayBuffer,
+    wrappingKey: ArrayBuffer,
+    parameters: WrapAlgoParams,
+  ): ArrayBuffer {
+    return this.crypto.unwrapKey(key, wrappingKey, parameters);
+  }
+
   digest(algorithm: DigestAlgorithm, data: ArrayBuffer): ArrayBuffer {
     return this.crypto.digest(algorithm, data);
   }
@@ -545,6 +693,10 @@ class CCFPolyfill implements CCF {
     return this.crypto.isValidX509CertChain(chain, trusted);
   }
 
+  isValidX509RootCACert(pem: string): boolean {
+    return this.crypto.isValidX509RootCACert(pem);
+  }
+
   enableUntrustedDateTime(enable: boolean): boolean {
     throw new Error("Not implemented");
   }
@@ -555,18 +707,6 @@ class CCFPolyfill implements CCF {
 }
 
 (<any>globalThis).ccf = new CCFPolyfill();
-
-class OpenEnclavePolyfill implements OpenEnclave {
-  verifyOpenEnclaveEvidence(
-    format: string | undefined,
-    evidence: ArrayBuffer,
-    endorsements?: ArrayBuffer,
-  ): EvidenceClaims {
-    throw new Error("Method not implemented.");
-  }
-}
-
-(<any>globalThis).openenclave = new OpenEnclavePolyfill();
 
 class SnpAttestationPolyfill implements SnpAttestation {
   verifySnpAttestation(
@@ -588,8 +728,10 @@ function nodeBufToArrBuf(buf: Buffer): ArrayBuffer {
   return arrBuf;
 }
 
-function typedArrToArrBuf(ta: ArrayBufferView) {
-  return ta.buffer.slice(ta.byteOffset, ta.byteOffset + ta.byteLength);
+function typedArrToArrBuf(ta: ArrayBufferView): ArrayBuffer {
+  return toArrayBuffer(
+    ta.buffer.slice(ta.byteOffset, ta.byteOffset + ta.byteLength),
+  );
 }
 
 function base64(buf: ArrayBuffer): string {

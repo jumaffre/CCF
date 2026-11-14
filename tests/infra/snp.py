@@ -1,11 +1,12 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import os
 import base64
+import glob
+import os
 from hashlib import sha256
 
-IS_SNP = os.path.exists("/dev/sev")
+from infra.platform_detection import SNP_SUPPORT
 
 # It is the responsibility of the infra spinning up ACI container
 # to populate this file with relevant environment variables
@@ -31,10 +32,19 @@ EMPTY_SNP_SECURITY_POLICY = ""
 
 def get_aci_env():
     env = {}
-    with open(WELL_KNOWN_ACI_ENVIRONMENT_FILE_PATH, "r", encoding="utf-8") as f:
-        for line in f.read().splitlines():
-            env_key, env_value = line.partition("=")[::2]
-            env[env_key] = env_value
+    # If the well-known file exists, read the environment variables from it
+    # Otherwise, try to discover the security context directory
+    if os.path.exists(WELL_KNOWN_ACI_ENVIRONMENT_FILE_PATH):
+        with open(WELL_KNOWN_ACI_ENVIRONMENT_FILE_PATH, "r", encoding="utf-8") as f:
+            for line in f.read().splitlines():
+                env_key, env_value = line.partition("=")[::2]
+                env[env_key] = env_value
+    else:
+        (security_context_dir,) = glob.glob("/security-context-*")
+        env[ACI_SEV_SNP_ENVVAR_UVM_SECURITY_CONTEXT_DIR] = security_context_dir
+    # If Fabric_NodeIPOrFQDN is set, pick it up
+    if "Fabric_NodeIPOrFQDN" in os.environ:
+        env["Fabric_NodeIPOrFQDN"] = os.environ["Fabric_NodeIPOrFQDN"]
     return env
 
 
@@ -44,7 +54,7 @@ def _read_aci_environment_variable(envvar_name):
 
 
 def get_security_context_dir():
-    assert IS_SNP
+    assert SNP_SUPPORT
     try:
         return _read_aci_environment_variable(
             ACI_SEV_SNP_ENVVAR_UVM_SECURITY_CONTEXT_DIR
@@ -54,7 +64,7 @@ def get_security_context_dir():
 
 
 def get_container_group_security_policy_base64():
-    assert IS_SNP
+    assert SNP_SUPPORT
     security_context_dir = get_security_context_dir()
     return open(
         os.path.join(security_context_dir, ACI_SEV_SNP_FILENAME_SECURITY_POLICY),
@@ -72,7 +82,7 @@ def get_container_group_security_policy_digest():
 
 
 def get_container_group_uvm_endorsements_base64():
-    assert IS_SNP
+    assert SNP_SUPPORT
     security_context_dir = get_security_context_dir()
     return open(
         os.path.join(security_context_dir, ACI_SEV_SNP_FILENAME_UVM_ENDORSEMENTS),

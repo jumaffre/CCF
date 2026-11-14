@@ -192,7 +192,7 @@ static void conv(picobench::state& s)
   clobber_memory();
   picobench::scope scope(s);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
     nlohmann::json j = entries[i];
     const auto b = j.get<T>();
@@ -209,7 +209,7 @@ void valmacro(picobench::state& s)
   clobber_memory();
   picobench::scope scope(s);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
     const auto b = entries[i].get<T>();
     do_not_optimize(b);
@@ -220,15 +220,15 @@ void valmacro(picobench::state& s)
 const std::vector<int> sizes = {200, 2'000};
 
 PICOBENCH_SUITE("simple");
-PICOBENCH(conv<Simple_manual>).iterations(sizes).samples(10);
-PICOBENCH(conv<Simple_macros>).iterations(sizes).samples(10);
+PICOBENCH(conv<Simple_manual>).iterations(sizes);
+PICOBENCH(conv<Simple_macros>).iterations(sizes);
 
 PICOBENCH_SUITE("complex");
-PICOBENCH(conv<Complex_manual>).iterations(sizes).samples(10);
-PICOBENCH(conv<Complex_macros>).iterations(sizes).samples(10);
+PICOBENCH(conv<Complex_manual>).iterations(sizes);
+PICOBENCH(conv<Complex_macros>).iterations(sizes);
 
 PICOBENCH_SUITE("validation simple");
-PICOBENCH(valmacro<Simple_macros>).iterations(sizes).samples(10);
+PICOBENCH(valmacro<Simple_macros>).iterations(sizes);
 
 PICOBENCH_SUITE("validation complex");
-PICOBENCH(valmacro<Complex_macros>).iterations(sizes).samples(10);
+PICOBENCH(valmacro<Complex_macros>).iterations(sizes);

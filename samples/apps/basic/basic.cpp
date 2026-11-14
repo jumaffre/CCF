@@ -1,6 +1,9 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 
+// Sample apps common
+#include "../common/default_on_commit.h"
+
 // CCF
 #include "ccf/app_interface.h"
 #include "ccf/common_auth_policies.h"
@@ -18,19 +21,24 @@ using namespace nlohmann;
 
 namespace basicapp
 {
-  using RecordsMap = kv::Map<string, std::vector<uint8_t>>;
+  using RecordsMap = ccf::kv::Map<string, std::vector<uint8_t>>;
   static constexpr auto PRIVATE_RECORDS = "records";
 
   class BasicHandlers : public ccf::UserEndpointRegistry
   {
   public:
-    BasicHandlers(ccfapp::AbstractNodeContext& context) :
+    BasicHandlers(ccf::AbstractNodeContext& context) :
       ccf::UserEndpointRegistry(context)
     {
       openapi_info.title = "CCF Basic App";
       openapi_info.description =
         "Lightweight application for benchmarking purposes";
       openapi_info.document_version = "0.0.1";
+    }
+
+    void init_handlers() override
+    {
+      CommonEndpointRegistry::init_handlers();
 
       auto put = [this](ccf::endpoints::EndpointContext& ctx) {
         std::string key;
@@ -45,13 +53,26 @@ namespace basicapp
           return;
         }
 
-        auto records_handle = ctx.tx.template rw<RecordsMap>(PRIVATE_RECORDS);
+        auto* records_handle = ctx.tx.template rw<RecordsMap>(PRIVATE_RECORDS);
         records_handle->put(key, ctx.rpc_ctx->get_request_body());
         ctx.rpc_ctx->set_response_status(HTTP_STATUS_NO_CONTENT);
       };
       make_endpoint(
         "/records/{key}", HTTP_PUT, put, {ccf::user_cert_auth_policy})
-        .set_forwarding_required(ccf::endpoints::ForwardingRequired::Never)
+        .set_redirection_strategy(ccf::endpoints::RedirectionStrategy::None)
+        .install();
+
+      auto blocking_put = [put](ccf::endpoints::EndpointContext& ctx) {
+        ctx.rpc_ctx->set_consensus_committed_function(
+          ccf::samples::default_respond_on_commit);
+        put(ctx);
+      };
+      make_endpoint(
+        "/records/blocking/{key}",
+        HTTP_PUT,
+        blocking_put,
+        {ccf::user_cert_auth_policy})
+        .set_redirection_strategy(ccf::endpoints::RedirectionStrategy::None)
         .install();
 
       auto get = [this](ccf::endpoints::ReadOnlyEndpointContext& ctx) {
@@ -67,14 +88,15 @@ namespace basicapp
           return;
         }
 
-        auto records_handle = ctx.tx.template ro<RecordsMap>(PRIVATE_RECORDS);
+        auto* records_handle = ctx.tx.template ro<RecordsMap>(PRIVATE_RECORDS);
         auto record = records_handle->get(key);
 
         if (record.has_value())
         {
           ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
           ctx.rpc_ctx->set_response_header(
-            http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
+            ccf::http::headers::CONTENT_TYPE,
+            ccf::http::headervalues::contenttype::TEXT);
           ctx.rpc_ctx->set_response_body(record.value());
           return;
         }
@@ -86,16 +108,29 @@ namespace basicapp
       };
       make_read_only_endpoint(
         "/records/{key}", HTTP_GET, get, {ccf::user_cert_auth_policy})
-        .set_forwarding_required(ccf::endpoints::ForwardingRequired::Never)
+        .set_redirection_strategy(ccf::endpoints::RedirectionStrategy::None)
         .install();
 
-      auto post = [this](ccf::endpoints::EndpointContext& ctx) {
+      auto blocking_get = [get](ccf::endpoints::ReadOnlyEndpointContext& ctx) {
+        ctx.rpc_ctx->set_consensus_committed_function(
+          ccf::samples::default_respond_on_commit);
+        get(ctx);
+      };
+      make_read_only_endpoint(
+        "/records/blocking/{key}",
+        HTTP_GET,
+        blocking_get,
+        {ccf::user_cert_auth_policy})
+        .set_redirection_strategy(ccf::endpoints::RedirectionStrategy::None)
+        .install();
+
+      auto post = [](ccf::endpoints::EndpointContext& ctx) {
         const nlohmann::json body =
-          nlohmann::json::parse(ctx.rpc_ctx->get_request_body());
+          ccf::parse_json_safe(ctx.rpc_ctx->get_request_body());
 
         const auto records = body.get<std::map<std::string, std::string>>();
 
-        auto records_handle = ctx.tx.template rw<RecordsMap>(PRIVATE_RECORDS);
+        auto* records_handle = ctx.tx.template rw<RecordsMap>(PRIVATE_RECORDS);
         for (const auto& [key, value] : records)
         {
           const std::vector<uint8_t> value_vec(value.begin(), value.end());
@@ -109,10 +144,10 @@ namespace basicapp
   };
 }
 
-namespace ccfapp
+namespace ccf
 {
   std::unique_ptr<ccf::endpoints::EndpointRegistry> make_user_endpoints(
-    ccfapp::AbstractNodeContext& context)
+    ccf::AbstractNodeContext& context)
   {
     return std::make_unique<basicapp::BasicHandlers>(context);
   }

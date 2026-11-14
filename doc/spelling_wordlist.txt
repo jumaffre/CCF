@@ -1,4 +1,3 @@
-Ansible
 auditability
 auditable
 Boolean
@@ -9,13 +8,10 @@ Diffie
 IPv
 js
 kv
-Lua
-mbedTLS
+MbedTLS
 Merkle
 npm
 plaintext
-ringbuffer
-ringbuffers
 Rollup
 schemas
 SGX

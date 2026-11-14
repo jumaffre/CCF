@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace crypto
+namespace ccf::crypto
 {
   class EdDSAPublicKey
   {
@@ -23,7 +23,7 @@ namespace crypto
      */
     EdDSAPublicKey(const Pem& pem);
 
-    virtual Pem public_key_pem() const = 0;
+    [[nodiscard]] virtual Pem public_key_pem() const = 0;
 
     /**
      * Verify that a signature was produced on contents with the private key
@@ -48,9 +48,9 @@ namespace crypto
       const uint8_t* signature,
       size_t signature_size) = 0;
 
-    virtual CurveID get_curve_id() const = 0;
+    [[nodiscard]] virtual CurveID get_curve_id() const = 0;
 
-    virtual JsonWebKeyEdDSAPublic public_key_jwk_eddsa(
+    [[nodiscard]] virtual JsonWebKeyEdDSAPublic public_key_jwk_eddsa(
       const std::optional<std::string>& kid = std::nullopt) const = 0;
   };
 }

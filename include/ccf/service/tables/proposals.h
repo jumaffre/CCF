@@ -6,6 +6,7 @@
 #include "ccf/service/map.h"
 
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace ccf
@@ -15,7 +16,7 @@ namespace ccf
    * stored in the KV, and passed to the JS constitution functions for
    * validation and execution.
    */
-  enum class ProposalState
+  enum class ProposalState : uint8_t
   {
     OPEN, //< Proposal is active and can be voted on
     ACCEPTED, //< Proposal passed a successful vote and was enacted
@@ -41,6 +42,7 @@ namespace ccf
 }
 
 FMT_BEGIN_NAMESPACE
+
 template <>
 struct formatter<ccf::ProposalState>
 {
@@ -72,15 +74,21 @@ struct formatter<ccf::ProposalState>
       {
         return format_to(ctx.out(), "rejected");
       }
+      case (ccf::ProposalState::FAILED):
+      {
+        return format_to(ctx.out(), "failed");
+      }
       case (ccf::ProposalState::DROPPED):
       {
         return format_to(ctx.out(), "dropped");
       }
       default:
       {
-        return format_to(ctx.out(), "UNKNOWN");
+        throw std::logic_error(
+          fmt::format("Unknown proposal state {}", std::to_underlying(state)));
       }
     }
   }
 };
+
 FMT_END_NAMESPACE

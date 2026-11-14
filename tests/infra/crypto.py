@@ -1,38 +1,40 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-from typing import Tuple, Optional
 import base64
-from enum import IntEnum
-import secrets
 import datetime
 import hashlib
-from pyasn1.type.useful import UTCTime
+import ipaddress
+import secrets
+import uuid
+from enum import IntEnum
 
-
+import cwt
+import cwt.utils
+import jwt
 from cryptography import x509
-from cryptography.x509.oid import NameOID
-from cryptography.x509 import (
-    load_pem_x509_certificate,
-    load_der_x509_certificate,
-)
-from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding, ed25519
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes, keywrap
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, x25519
 from cryptography.hazmat.primitives.asymmetric.utils import (
     decode_dss_signature,
     encode_dss_signature,
 )
 from cryptography.hazmat.primitives.serialization import (
-    load_pem_private_key,
-    load_pem_public_key,
     Encoding,
+    NoEncryption,
     PrivateFormat,
     PublicFormat,
-    NoEncryption,
+    load_der_public_key,
+    load_pem_private_key,
+    load_pem_public_key,
 )
-from cryptography.hazmat.primitives import hashes, keywrap
-from cryptography.hazmat.backends import default_backend
-
-import jwt
+from cryptography.x509 import (
+    load_der_x509_certificate,
+    load_pem_x509_certificate,
+)
+from cryptography.x509.oid import NameOID
+from pyasn1.type.useful import UTCTime
 
 RECOMMENDED_RSA_PUBLIC_EXPONENT = 65537
 
@@ -69,7 +71,9 @@ def generate_aes_key(key_bits: int) -> bytes:
     return secrets.token_bytes(key_bits // 8)
 
 
-def generate_rsa_keypair(key_size: int) -> Tuple[str, str]:
+def generate_rsa_keypair(key_size: int) -> tuple[str, str]:
+    assert key_size >= 2048
+    # CodeQL [SM04455] False positive: The key size is asserted to be at least 2048 bytes
     priv = rsa.generate_private_key(
         public_exponent=RECOMMENDED_RSA_PUBLIC_EXPONENT,
         key_size=key_size,
@@ -85,9 +89,9 @@ def generate_rsa_keypair(key_size: int) -> Tuple[str, str]:
     return priv_pem, pub_pem
 
 
-def generate_ec_keypair(curve: ec.EllipticCurve = ec.SECP256R1) -> Tuple[str, str]:
+def generate_ec_keypair(curve: ec.EllipticCurve = ec.SECP256R1) -> tuple[str, str]:
     priv = ec.generate_private_key(
-        curve=curve,
+        curve=curve(),
         backend=default_backend(),
     )
     pub = priv.public_key()
@@ -100,9 +104,14 @@ def generate_ec_keypair(curve: ec.EllipticCurve = ec.SECP256R1) -> Tuple[str, st
     return priv_pem, pub_pem
 
 
-def generate_eddsa_keypair() -> Tuple[str, str]:
-    # Currently only Curve25519 is supported
-    priv = ed25519.Ed25519PrivateKey.generate()
+def generate_eddsa_keypair(curve: str) -> tuple[str, str]:
+    key_class = {
+        "curve25519": ed25519.Ed25519PrivateKey,
+        "x25519": x25519.X25519PrivateKey,
+    }
+    if curve not in key_class:
+        raise ValueError(f"Unsupported curve: {curve}")
+    priv = key_class[curve].generate()
     pub = priv.public_key()
     priv_pem = priv.private_bytes(
         Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()
@@ -121,6 +130,7 @@ def generate_cert(
     ca=False,
     valid_from=None,
     validity_days=10,
+    san: str | None = None,
 ) -> str:
     cn = cn or "dummy"
     if issuer_priv_key_pem is None:
@@ -128,7 +138,7 @@ def generate_cert(
     if issuer_cn is None:
         issuer_cn = cn
     if valid_from is None:
-        valid_from = datetime.datetime.utcnow()
+        valid_from = datetime.datetime.now(datetime.UTC)
     priv = load_pem_private_key(priv_key_pem.encode("ascii"), None, default_backend())
     pub = priv.public_key()
     issuer_priv = load_pem_private_key(
@@ -136,12 +146,17 @@ def generate_cert(
     )
     subject = x509.Name(
         [
-            x509.NameAttribute(NameOID.COMMON_NAME, cn),
+            x509.NameAttribute(
+                NameOID.COMMON_NAME, hashlib.sha256(cn.encode("ascii")).hexdigest()
+            ),
         ]
     )
     issuer = x509.Name(
         [
-            x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn),
+            x509.NameAttribute(
+                NameOID.COMMON_NAME,
+                hashlib.sha256(issuer_cn.encode("ascii")).hexdigest(),
+            ),
         ]
     )
     builder = (
@@ -158,6 +173,19 @@ def generate_cert(
             x509.BasicConstraints(ca=True, path_length=None),
             critical=True,
         )
+    if san is not None:
+        # Emit an iPAddress SAN entry when the value is an IP literal (e.g.
+        # "127.0.0.1"), and a dNSName otherwise. TLS verification against an IP
+        # literal (as libcurl does with CURLOPT_SSL_VERIFYHOST=2) only matches
+        # iPAddress entries, not dNSName entries that happen to hold an IP.
+        try:
+            san_entry: x509.GeneralName = x509.IPAddress(ipaddress.ip_address(san))
+        except ValueError:
+            san_entry = x509.DNSName(san)
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([san_entry]),
+            critical=False,
+        )
 
     cert = builder.sign(issuer_priv, hashes.SHA256(), default_backend())
 
@@ -165,7 +193,7 @@ def generate_cert(
 
 
 def unwrap_key_rsa_oaep(
-    wrapped_key: bytes, wrapping_key_priv_pem: str, label: Optional[bytes] = None
+    wrapped_key: bytes, wrapping_key_priv_pem: str, label: bytes | None = None
 ) -> bytes:
     wrapping_key = load_pem_private_key(
         wrapping_key_priv_pem.encode("ascii"), None, default_backend()
@@ -186,7 +214,7 @@ def unwrap_key_aes_pad(wrapped_key: bytes, wrapping_key: bytes) -> bytes:
 
 
 def unwrap_key_rsa_oaep_aes_pad(
-    data: bytes, oaep_key_priv_pem: str, label: Optional[bytes] = None
+    data: bytes, oaep_key_priv_pem: str, label: bytes | None = None
 ) -> bytes:
     oaep_key = load_pem_private_key(
         oaep_key_priv_pem.encode("ascii"), None, default_backend()
@@ -207,8 +235,15 @@ def sign(algorithm: dict, key_pem: str, data: bytes) -> bytes:
     else:
         raise ValueError("Unsupported hash algorithm")
     if isinstance(key, rsa.RSAPrivateKey):
-        if algorithm["name"] == "RSASSA-PKCS1-v1_5":
-            return key.sign(data, padding.PKCS1v15(), hash_alg)
+        if algorithm["name"] == "RSA-PSS":
+            return key.sign(
+                data,
+                padding=padding.PSS(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    salt_length=algorithm.get("saltLength", 0),
+                ),
+                algorithm=hash_alg,
+            )
         else:
             raise ValueError("Unsupported signing algorithm")
     elif isinstance(key, ec.EllipticCurvePrivateKey):
@@ -230,13 +265,13 @@ def sign(algorithm: dict, key_pem: str, data: bytes) -> bytes:
     elif isinstance(key, ed25519.Ed25519PrivateKey):
         return key.sign(data)
     else:
-        raise ValueError("Unsupported key type")
+        raise TypeError("Unsupported key type")
 
 
 def convert_ecdsa_signature_from_der_to_p1363(
     signature_der: bytes, key_size_bits: int
 ) -> bytes:
-    (r, s) = decode_dss_signature(signature_der)
+    r, s = decode_dss_signature(signature_der)
     assert key_size_bits % 8 == 0
     n = key_size_bits // 8
     signature_p1363 = r.to_bytes(n, byteorder="big") + s.to_bytes(n, byteorder="big")
@@ -248,7 +283,15 @@ def verify_signature(algorithm: dict, signature: bytes, data: bytes, key_pub_pem
     if isinstance(key_pub, rsa.RSAPublicKey):
         if algorithm["hash"] != "SHA-256":
             raise ValueError("Unsupported hash algorithm")
-        key_pub.verify(signature, data, padding.PKCS1v15(), hashes.SHA256())
+        key_pub.verify(
+            signature,
+            data,
+            padding.PSS(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                salt_length=algorithm.get("saltLength", 0),
+            ),
+            hashes.SHA256(),
+        )
     elif isinstance(key_pub, ec.EllipticCurvePublicKey):
         if algorithm["hash"] != "SHA-256":
             raise ValueError("Unsupported hash algorithm")
@@ -263,7 +306,7 @@ def verify_signature(algorithm: dict, signature: bytes, data: bytes, key_pub_pem
     elif isinstance(key_pub, ed25519.Ed25519PublicKey):
         return key_pub.verify(signature, data)
     else:
-        raise ValueError("Unsupported key type")
+        raise TypeError("Unsupported key type")
 
 
 def convert_ecdsa_signature_from_p1363_der(signature_p1363: bytes) -> bytes:
@@ -280,10 +323,8 @@ def pub_key_pem_to_der(pem: str) -> bytes:
     return cert.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)
 
 
-def create_jwt(body_claims: dict, key_priv_pem: str, key_id: str) -> str:
-    return jwt.encode(
-        body_claims, key_priv_pem, algorithm="RS256", headers={"kid": key_id}
-    )
+def create_jwt(body_claims: dict, key_priv_pem: str, key_id: str, alg="RS256") -> str:
+    return jwt.encode(body_claims, key_priv_pem, algorithm=alg, headers={"kid": key_id})
 
 
 def cert_pem_to_der(pem: str) -> bytes:
@@ -294,6 +335,13 @@ def cert_pem_to_der(pem: str) -> bytes:
 def cert_der_to_pem(der: bytes) -> str:
     cert = load_der_x509_certificate(der, default_backend())
     return cert.public_bytes(Encoding.PEM).decode("ascii")
+
+
+def pub_key_der_to_pem(der: bytes) -> str:
+    pub_key = load_der_public_key(der, default_backend())
+    return pub_key.public_bytes(Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode(
+        "ascii"
+    )
 
 
 def are_certs_equal(pem1: str, pem2: str) -> bool:
@@ -308,6 +356,11 @@ def compute_public_key_der_hash_hex_from_pem(pem: str):
         Encoding.DER, PublicFormat.SubjectPublicKeyInfo
     )
     return hashlib.sha256(pub_key).hexdigest()
+
+
+def compute_public_key_der_hash_hex(der: bytes) -> str:
+    """Compute SHA-256 hex digest of DER-encoded public key bytes (matches CCF's kid)."""
+    return hashlib.sha256(der).hexdigest()
 
 
 def compute_cert_der_hash_hex_from_pem(pem: str):
@@ -332,8 +385,176 @@ def check_key_pair_pem(private: str, public: str, password=None) -> bool:
 
 def get_validity_period_from_pem_cert(pem: str):
     cert = load_pem_x509_certificate(pem.encode(), default_backend())
-    return cert.not_valid_before, cert.not_valid_after
+    return cert.not_valid_before_utc, cert.not_valid_after_utc
 
 
 def datetime_to_X509time(datetime: datetime):
     return UTCTime.fromDateTime(datetime)
+
+
+def create_signed_statement(
+    payload: bytes,
+    sub: str,
+    svn: int,
+    eku: str,
+    ca_identity=None,
+    iat: int | None = None,
+) -> tuple:
+    """
+    Create a COSE_Sign1 signed statement with x5chain and CWT claims.
+    Returns (encoded_bytes, issuer_string).
+
+    If ca_identity is provided as (ca_key, ca_name, ca_cert), the same CA
+    will be reused so that the issuer DID is stable across calls.
+    """
+
+    now = datetime.datetime.now(datetime.UTC)
+    validity = datetime.timedelta(days=10)
+
+    # Generate or reuse CA key and self-signed cert
+
+    if ca_identity is not None:
+        ca_key, ca_name, ca_cert = ca_identity
+    else:
+        ca_key = ec.generate_private_key(ec.SECP256R1())
+        ca_name = x509.Name(
+            [x509.NameAttribute(NameOID.COMMON_NAME, str(uuid.uuid4()))]
+        )
+        ca_cert = (
+            x509.CertificateBuilder()
+            .subject_name(ca_name)
+            .issuer_name(ca_name)
+            .public_key(ca_key.public_key())
+            .serial_number(int(uuid.uuid4()))
+            .not_valid_before(now)
+            .not_valid_after(now + validity)
+            .add_extension(
+                x509.BasicConstraints(ca=True, path_length=None), critical=True
+            )
+            .add_extension(
+                x509.KeyUsage(
+                    key_cert_sign=True,
+                    digital_signature=False,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+            .add_extension(
+                x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+                critical=False,
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+
+    # Generate leaf key and cert with EKU, signed by CA
+
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, str(uuid.uuid4()))])
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(leaf_name)
+        .issuer_name(ca_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(int(uuid.uuid4()))
+        .not_valid_before(now)
+        .not_valid_after(now + validity)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                key_cert_sign=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.ObjectIdentifier(eku)]),
+            critical=False,
+        )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(leaf_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+
+    # Build did:x509 issuer
+
+    ca_fingerprint = (
+        base64.urlsafe_b64encode(ca_cert.fingerprint(hashes.SHA256()))
+        .decode("ascii")
+        .rstrip("=")
+    )
+    issuer = f"did:x509:0:sha256:{ca_fingerprint}::eku:{eku}"
+
+    # x5chain: [leaf_der, ca_der]
+
+    leaf_der = leaf_cert.public_bytes(Encoding.DER)
+    ca_der = ca_cert.public_bytes(Encoding.DER)
+
+    # Build COSE_Sign1 protected headers
+
+    cwt_claims = {1: issuer, 2: sub, "svn": svn}
+    if iat is not None:
+        cwt_claims[6] = iat
+
+    phdr = {
+        1: -7,  # alg: ES256
+        3: "application/octet-stream",  # content_type
+        33: [leaf_der, ca_der],  # x5chain
+        int(cwt.COSEHeaders.CWT_CLAIMS): cwt_claims,
+    }
+
+    leaf_key_pem = leaf_key.private_bytes(
+        Encoding.PEM,
+        PrivateFormat.PKCS8,
+        NoEncryption(),
+    )
+    cose_ctx = cwt.COSE.new(alg_auto_inclusion=False, deterministic_header=True)
+    cose_key = cwt.COSEKey.from_pem(leaf_key_pem.decode("ascii"))
+    encoded = cose_ctx.encode_and_sign(
+        payload, cose_key, protected=cwt.utils.ResolvedHeader(phdr)
+    )
+    return encoded, issuer
+
+
+def pub_key_der_from_jwk(jwk: dict) -> bytes:
+    """Convert a JWK (EC public key) to DER-encoded SubjectPublicKeyInfo bytes."""
+    crv_map = {
+        "P-256": ec.SECP256R1(),
+        "P-384": ec.SECP384R1(),
+        "P-521": ec.SECP521R1(),
+    }
+
+    def _decode_b64url(s):
+        pad_len = (-len(s)) % 4
+        return base64.urlsafe_b64decode(s + ("=" * pad_len))
+
+    assert jwk.get("kty") == "EC", f"Expected EC key, got: {jwk.get('kty')}"
+    curve = crv_map[jwk["crv"]]
+    pub_key = ec.EllipticCurvePublicNumbers(
+        x=int.from_bytes(_decode_b64url(jwk["x"]), "big"),
+        y=int.from_bytes(_decode_b64url(jwk["y"]), "big"),
+        curve=curve,
+    ).public_key(default_backend())
+    return pub_key.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo)

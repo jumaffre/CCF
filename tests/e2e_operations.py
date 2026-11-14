@@ -1,27 +1,58 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import tempfile
-import os
-import shutil
-
-import infra.logging_app as app
-import infra.e2e_args
-import infra.network
-import ccf.ledger
-import suite.test_requirements as reqs
-import infra.crypto
-import ipaddress
-import infra.interfaces
-import infra.path
-import infra.proc
-import random
-import json
-import subprocess
-import time
+import base64
+import concurrent.futures
+import copy
+import hashlib
 import http
-import infra.snp as snp
+import io
+import ipaddress
+import json
+import os
+import pathlib
+import random
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import tempfile
+import time
+import urllib.parse
+from contextlib import contextmanager, redirect_stdout
+from datetime import UTC, datetime
 
+import cbor2
+import ccf.ledger
+import ccf.ledger_viz
+import ccf.read_ledger
+import ccf.receipt
+import ccf.signatures
+import ccf.split_ledger
+import infra.commit
+import infra.concurrency
+import infra.crypto
+import infra.e2e_args
+import infra.interfaces
+import infra.logging_app as app
+import infra.network
+import infra.path
+import infra.platform_detection
+import infra.proc
+import infra.recovery_trace
+import infra.utils
+import suite.test_requirements as reqs
+from ccf.tx_id import TxID
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from infra import snp
 from loguru import logger as LOG
+
+# Snapshots written by releases before 7.0 carry JSON receipts, which
+# ccf.ledger.Snapshot rejects. These remain in testdata for the recovery and
+# LTS compatibility tests, which replay the ledger of those services.
+LEGACY_RECEIPT_SNAPSHOT_SERVICES = {"eol_service", "expired_service", "sgx_service"}
 
 
 @reqs.description("Move committed ledger files to read-only directory")
@@ -47,14 +78,62 @@ def test_save_committed_ledger_files(network, args):
 
 
 def test_parse_snapshot_file(network, args):
-    primary, _ = network.find_primary()
-    network.txs.issue(network, number_txs=args.snapshot_tx_interval * 2)
-    committed_snapshots_dir = network.get_committed_snapshots(primary)
-    for snapshot in os.listdir(committed_snapshots_dir):
-        with ccf.ledger.Snapshot(os.path.join(committed_snapshots_dir, snapshot)) as s:
-            assert len(
-                s.get_public_domain().get_tables()
-            ), "No public table in snapshot"
+    class ReaderThread(infra.concurrency.StoppableThread):
+        def __init__(self, network):
+            super().__init__(name="reader")
+            primary, _ = network.find_primary()
+            self.snapshots_dir = os.path.join(
+                primary.remote.remote.root,
+                primary.remote.snapshots_dir_name,
+            )
+
+        def _run(self):
+            seen = set()
+            while not self.is_stopped():
+                for snapshot in os.listdir(self.snapshots_dir):
+                    if (
+                        ccf.ledger.is_snapshot_file_committed(snapshot)
+                        and snapshot not in seen
+                    ):
+                        seen.add(snapshot)
+                        with ccf.ledger.Snapshot(
+                            os.path.join(self.snapshots_dir, snapshot)
+                        ) as s:
+                            assert len(
+                                s.get_public_domain().get_tables()
+                            ), "No public table in snapshot"
+                            LOG.success(f"Successfully parsed snapshot: {snapshot}")
+            LOG.info(f"Tested {len(seen)} snapshots")
+            assert len(seen) > 0, "No snapshots seen, so this tested nothing"
+
+    class WriterThread(infra.concurrency.StoppableThread):
+        def __init__(self, network, reader):
+            super().__init__(name="writer")
+            self.primary, _ = network.find_primary()
+            self.member = network.consortium.get_any_active_member()
+            self.reader = reader
+
+        def _run(self):
+            while not self.is_stopped() and self.reader.is_alive():
+                self.member.update_ack_state_digest(self.primary)
+
+    reader_thread = ReaderThread(network)
+    reader_thread.start()
+
+    writer_thread = WriterThread(network, reader_thread)
+    writer_thread.start()
+
+    # When this test was added, the original failure was occurring 100% of the time within 0.5s.
+    # This fix has been manually verified across multi-minute runs.
+    # 5s is a plausible run-time in the CI, that should still provide convincing coverage.
+    time.sleep(5)
+
+    writer_thread.stop()
+    writer_thread.join()
+
+    reader_thread.stop()
+    reader_thread.join()
+
     return network
 
 
@@ -68,10 +147,10 @@ def find_ledger_chunk_for_seqno(ledger, seqno):
             if (
                 pd.get_seqno() >= seqno
                 and next_signature is None
-                and ccf.ledger.SIGNATURE_TX_TABLE_NAME in tables
+                and ccf.signatures.is_signature_transaction(tables)
             ):
                 next_signature = pd.get_seqno()
-        if first <= seqno and seqno <= last:
+        if first <= seqno <= last:
             return chunk, first, last, next_signature
     return None, None, None, None
 
@@ -90,21 +169,38 @@ def test_forced_ledger_chunk(network, args):
     # Issue some more transactions
     network.txs.issue(network, number_txs=5)
 
-    ledger_dirs = primary.remote.ledger_paths()
-
     # Check that there is indeed a ledger chunk that ends at the
     # first signature after proposal.completed_seqno
-    ledger = ccf.ledger.Ledger(ledger_dirs)
-    chunk, _, last, next_signature = find_ledger_chunk_for_seqno(
-        ledger, proposal.completed_seqno
-    )
-    LOG.info(
-        f"Found ledger chunk {chunk.filename()} with chunking proposal @{proposal.completed_seqno} and signature @{next_signature}"
-    )
-    assert chunk.is_complete and chunk.is_committed()
-    assert last == next_signature
-    assert next_signature - proposal.completed_seqno < args.sig_tx_interval
+    with primary.get_ledger_chunk_from_api(proposal.completed_seqno) as ledger:
+        chunk, _, last, next_signature = find_ledger_chunk_for_seqno(
+            ledger, proposal.completed_seqno
+        )
+        LOG.info(
+            f"Found ledger chunk {chunk.filename()} with chunking proposal @{proposal.completed_seqno} and signature @{next_signature}"
+        )
+        assert chunk.is_complete and chunk.is_committed()
+        assert last == next_signature
+        assert next_signature - proposal.completed_seqno < args.sig_tx_interval
     return network
+
+
+def find_latest_committed_snapshot_name(network, count=1):
+    assert count > 0, f"Expected positive snapshot count, got {count}"
+    primary, _ = network.find_primary()
+    snapshots_dir = network.get_committed_snapshots(primary)
+    snapshot_names = [
+        f for f in os.listdir(snapshots_dir) if ccf.ledger.is_snapshot_file_committed(f)
+    ]
+    assert snapshot_names, f"Expected committed snapshots in {snapshots_dir}"
+    snapshot_names.sort(key=ccf.ledger.snapshot_index_from_filename)
+    assert len(snapshot_names) >= count, (
+        f"Expected at least {count} committed snapshots in {snapshots_dir}, "
+        f"found {snapshot_names}"
+    )
+    latest_snapshot_names = snapshot_names[-count:]
+    if count == 1:
+        return latest_snapshot_names[-1]
+    return latest_snapshot_names
 
 
 @reqs.description("Forced snapshot")
@@ -115,92 +211,835 @@ def test_forced_snapshot(network, args):
     # Submit some dummy transactions
     network.txs.issue(network, number_txs=3)
 
-    # Submit a proposal to force a snapshot at the following signature
-    proposal_body, careful_vote = network.consortium.make_proposal(
-        "trigger_snapshot", node_id=primary.node_id
-    )
-    proposal = network.consortium.get_any_active_member().propose(
-        primary, proposal_body
-    )
+    with primary.client() as c:
+        r = c.get("/node/commit").body.json()
+        hwm_pre_proposal = TxID.from_str(r["transaction_id"]).seqno
 
-    proposal = network.consortium.vote_using_majority(
-        primary,
-        proposal,
-        careful_vote,
-    )
+    # Ensure there is at least one signature greater than the hwm
+    network.txs.issue(network, number_txs=1, wait_for_sync=True)
+
+    # Force a snapshot
+    primary.trigger_snapshot()
 
     # Issue some more transactions
     network.txs.issue(network, number_txs=5)
 
-    ledger_dirs = primary.remote.ledger_paths()
+    snapshot_path = primary.wait_for_snapshot(hwm_pre_proposal + 1)
+    with ccf.ledger.Snapshot(snapshot_path) as snapshot:
+        assert snapshot.get_public_domain().get_seqno() > hwm_pre_proposal
 
-    # Find first signature after proposal.completed_seqno
-    ledger = ccf.ledger.Ledger(ledger_dirs)
-    chunk, _, _, next_signature = find_ledger_chunk_for_seqno(
-        ledger, proposal.completed_seqno
-    )
+    # Do not issue another transaction after this call. The snapshot request
+    # must make all preceding transactions available in a committed chunk even
+    # when the network is otherwise idle.
+    target_seqno = network.create_and_wait_for_ledger_chunk(primary)
+    with primary.get_ledger_chunk_from_api(target_seqno) as ledger:
+        chunk, first, last, _ = find_ledger_chunk_for_seqno(ledger, target_seqno)
+        assert chunk is not None
+        assert chunk.is_complete and chunk.is_committed()
+        assert first <= target_seqno <= last
 
-    assert chunk.is_complete and chunk.is_committed()
-    LOG.info(f"Expecting snapshot at {next_signature}")
-
-    snapshots_dir = network.get_committed_snapshots(primary)
-    for s in os.listdir(snapshots_dir):
-        with ccf.ledger.Snapshot(os.path.join(snapshots_dir, s)) as snapshot:
-            snapshot_seqno = snapshot.get_public_domain().get_seqno()
-            if snapshot_seqno == next_signature:
-                LOG.info(f"Found expected forced snapshot at {next_signature}")
-                return network
-
-    raise RuntimeError("Could not find matching snapshot file")
+    return network
 
 
-# https://github.com/microsoft/CCF/issues/1858
-@reqs.description("Generate snapshot larger than ring buffer max message size")
-def test_large_snapshot(network, args):
+# https://github.com/microsoft/CCF/issues/6469
+@reqs.description("Forced snapshot while service is opening")
+def test_forced_snapshot_while_opening(network, args):
     primary, _ = network.find_primary()
+    network.consortium.activate(primary)
+    network.consortium.check_for_service(primary, infra.network.ServiceStatus.OPENING)
+    member = network.consortium.get_any_active_member()
 
-    # Submit some dummy transactions
-    entry_size = 10000  # Lower bound on serialised write set size
-    iterations = int(args.max_msg_size_bytes) // entry_size
-    LOG.debug(f"Recording {iterations} large entries")
-    with primary.client(identity="user0") as c:
-        for idx in range(iterations):
-            c.post(
-                "/app/log/public?scope=test_large_snapshot",
-                body={"id": idx, "msg": "X" * entry_size},
-                log_capture=[],
-            )
+    def issue_governance_txs(count):
+        assert count > 0
+        for _ in range(count):
+            response = member.update_ack_state_digest(primary)
+        with primary.client() as c:
+            c.wait_for_commit(response)
 
-    # Submit a proposal to force a snapshot at the following signature
-    proposal_body, careful_vote = network.consortium.make_proposal(
-        "trigger_snapshot", node_id=primary.node_id
-    )
-    proposal = network.consortium.get_any_active_member().propose(
-        primary, proposal_body
-    )
-    proposal = network.consortium.vote_using_majority(
+    issue_governance_txs(3)
+
+    with primary.client() as c:
+        r = c.get("/node/commit").body.json()
+        hwm_pre_proposal = TxID.from_str(r["transaction_id"]).seqno
+
+    # Ensure there is at least one signature greater than the hwm.
+    issue_governance_txs(1)
+
+    proposal_body, careful_vote = network.consortium.make_proposal("trigger_snapshot")
+    proposal = member.propose(primary, proposal_body)
+    network.consortium.vote_using_majority(
         primary,
         proposal,
         careful_vote,
     )
 
-    # Check that there is at least a snapshot larger than args.max_msg_size_bytes
-    snapshots_dir = network.get_committed_snapshots(primary)
-    extra_data_size_bytes = 10000  # Upper bound on additional snapshot data (e.g. receipt) that is passed separately from the snapshot
-    for s in os.listdir(snapshots_dir):
-        snapshot_size = os.stat(os.path.join(snapshots_dir, s)).st_size
-        if snapshot_size > int(args.max_msg_size_bytes) + extra_data_size_bytes:
-            # Make sure that large snapshot can be parsed
-            snapshot = ccf.ledger.Snapshot(os.path.join(snapshots_dir, s))
-            assert snapshot.get_len() == snapshot_size
-            LOG.info(
-                f"Found snapshot [{snapshot_size}] larger than ring buffer max msg size {args.max_msg_size_bytes}"
-            )
-            return network
+    issue_governance_txs(5)
 
-    raise RuntimeError(
-        f"Could not find any snapshot file larger than {args.max_msg_size_bytes}"
+    snapshot_path = primary.wait_for_snapshot(hwm_pre_proposal + 1)
+    with ccf.ledger.Snapshot(snapshot_path) as snapshot:
+        snapshot_seqno = snapshot.get_public_domain().get_seqno()
+        assert snapshot_seqno > hwm_pre_proposal
+
+    _, committed_ledger_dirs = primary.get_ledger()
+    ledger = ccf.ledger.Ledger(
+        committed_ledger_dirs,
+        committed_only=True,
+        contiguous_suffix=True,
     )
+    chunk, _, last, _ = find_ledger_chunk_for_seqno(ledger, snapshot_seqno)
+    assert chunk is not None, (
+        f"Could not find committed ledger chunk containing snapshot at "
+        f"{snapshot_seqno}"
+    )
+    assert (
+        chunk.is_complete and chunk.is_committed()
+    ), f"Ledger chunk containing snapshot at {snapshot_seqno} is not committed"
+    assert (
+        last == snapshot_seqno
+    ), f"Expected snapshot at ledger chunk boundary {snapshot_seqno}, got {last}"
+
+    network.consortium.check_for_service(primary, infra.network.ServiceStatus.OPENING)
+    return network
+
+
+@reqs.description("Create snapshot from node endpoint")
+@app.scoped_txs()
+def test_snapshot_create_endpoint(network, args):
+    primary, _ = network.find_primary()
+
+    network.txs.issue(network, number_txs=3)
+
+    with primary.client() as c:
+        r = c.get("/node/commit").body.json()
+        hwm_pre_request = TxID.from_str(r["transaction_id"]).seqno
+
+    with primary.client(interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE) as c:
+        r = c.post("/node/snapshot:create")
+        assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+        assert r.body.json()["error"]["code"] == "ResourceNotFound", r
+
+    with primary.client(
+        interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+    ) as c:
+        r = c.post("/node/snapshot:create")
+        assert r.status_code == http.HTTPStatus.NO_CONTENT, r
+
+    snapshot_path = primary.wait_for_snapshot(hwm_pre_request + 1)
+    with ccf.ledger.Snapshot(snapshot_path) as snapshot:
+        assert snapshot.get_public_domain().get_seqno() > hwm_pre_request
+
+    return network
+
+
+def test_snapshot_access(network, args):
+    primary, backups = network.find_nodes()
+
+    network.txs.issue(network, number_txs=1)
+    trigger_txid = primary.trigger_snapshot()
+    snapshot_path = primary.wait_for_snapshot(trigger_txid.seqno)
+    snapshot_name = os.path.basename(snapshot_path)
+    snapshot_index, _ = ccf.ledger.snapshot_index_from_filename(snapshot_name)
+
+    with open(snapshot_path, "rb") as f:
+        snapshot_data = f.read()
+
+    for node in (primary, *backups):
+        with node.client(interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE) as c:
+            r = c.head("/node/snapshot")
+            assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+            r = c.get("/node/snapshot")
+            assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+
+    interface = primary.host.rpc_interfaces[infra.interfaces.FILE_SERVING_RPC_INTERFACE]
+    loc = f"https://{infra.interfaces.make_address(interface.public_host, interface.public_port)}"
+
+    with (
+        primary.client(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        ) as file_client,
+        primary.client(
+            interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE
+        ) as disabled_client,
+    ):
+
+        def do_request(http_verb, *args, **kwargs):
+            r = disabled_client.call(*args, http_verb=http_verb, **kwargs)
+            assert (
+                r.status_code == http.HTTPStatus.NOT_FOUND
+            ), f"Expected inaccessible due to disabled opt-in feature. Found:\n{r}"
+            return file_client.call(*args, http_verb=http_verb, **kwargs)
+
+        r = do_request("HEAD", "/node/snapshot", allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value, r
+        assert "location" in r.headers, r.headers
+        location = r.headers["location"]
+        path = f"/node/snapshot/{snapshot_name}"
+        assert location == f"{loc}{path}"
+        LOG.warning(r.headers)
+
+        # since uses closed/inclusive semantics: since=N returns snapshots
+        # with index >= N. So since=snapshot_index returns the snapshot
+        # (inclusive boundary), while since=snapshot_index+1 does not
+        # (strictly past the available snapshot index).
+        for since, expected in (
+            (0, location),
+            (1, location),
+            (snapshot_index // 2, location),
+            (snapshot_index - 1, location),
+            (snapshot_index, location),  # inclusive: exact index is returned
+            (snapshot_index + 1, None),  # strictly past: nothing returned
+        ):
+            for method in ("GET", "HEAD"):
+                r = do_request(
+                    method,
+                    f"/node/snapshot?since={since}",
+                    allow_redirects=False,
+                )
+                if expected is None:
+                    assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+                else:
+                    assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value, r
+                    assert "location" in r.headers, r.headers
+                    actual = r.headers["location"]
+                    assert actual == expected
+
+        for since in ("", "foo", "1x", "-1", str(2**64)):
+            for method in ("GET", "HEAD"):
+                r = do_request(
+                    method, f"/node/snapshot?since={since}", allow_redirects=False
+                )
+                assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+                if method == "GET":
+                    error = r.body.json()["error"]
+                    assert error["code"] == "InvalidQueryParameterValue", r
+                    assert "Unable to parse value" in error["message"], r
+
+        for method in ("GET", "HEAD"):
+            r = do_request(method, f"{path}.missing", allow_redirects=False)
+            assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+
+        r = do_request("HEAD", path)
+        assert r.status_code == http.HTTPStatus.OK.value, r
+        assert r.headers["accept-ranges"] == "bytes", r.headers
+        total_size = int(r.headers["content-length"])
+
+        # Use HTTP-style inclusive range end value
+        range_max = total_size - 1
+
+        a = total_size // 3
+        b = a * 2
+        for start, end in [
+            (0, None),
+            (0, 0),
+            (0, range_max),
+            (0, a),
+            (a, a),
+            (a, b),
+            (b, b),
+            (b, range_max),
+            (b, None),
+            (range_max, range_max),
+            (range_max, None),
+        ]:
+            range_header_value = f"{start}-{'' if end is None else end}"
+            r = do_request(
+                "GET", path, headers={"range": f"bytes={range_header_value}"}
+            )
+            assert r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value, r
+            headers = r.headers
+            implied_end = range_max if end is None else end
+            assert int(headers["content-length"]) == implied_end - start + 1
+            assert (
+                headers["content-range"] == f"bytes {start}-{implied_end}/{total_size}"
+            )
+
+            expected = snapshot_data[start : (None if end is None else end + 1)]
+            actual = r.body.data()
+            assert (
+                expected == actual
+            ), f"Binary mismatch, {len(expected)} vs {len(actual)}:\n{expected}\nvs\n{actual}"
+
+        for negative_offset in [
+            1,
+            a,
+            b,
+        ]:
+            range_header_value = f"-{negative_offset}"
+            r = do_request(
+                "GET", path, headers={"range": f"bytes={range_header_value}"}
+            )
+            assert r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value, r
+
+            expected = snapshot_data[-negative_offset:]
+            actual = r.body.data()
+            assert (
+                expected == actual
+            ), f"Binary mismatch, {len(expected)} vs {len(actual)}:\n{expected}\nvs\n{actual}"
+
+        # Ranges which reach beyond the end of the file are clamped to the
+        # whole file, rather than underflowing or overflowing
+        for oversized_range in [
+            f"-{total_size + 1}",
+            f"-{2**64 - 1}",
+            f"0-{2**64 - 1}",
+        ]:
+            for want_digest in [None, "sha-256=1"]:
+                headers = {"range": f"bytes={oversized_range}"}
+                if want_digest is not None:
+                    headers["want-repr-digest"] = want_digest
+                r = do_request("GET", path, headers=headers)
+                assert r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value, r
+                assert (
+                    r.headers["content-range"] == f"bytes 0-{range_max}/{total_size}"
+                ), r.headers
+                actual = r.body.data()
+                assert (
+                    snapshot_data == actual
+                ), f"Binary mismatch for range {oversized_range}, {total_size} vs {len(actual)}"
+
+        # Check error handling for invalid ranges
+        for invalid_range, err_msg in [
+            (f"{a}-foo", "Unable to parse end of range value foo"),
+            ("foo-foo", "Unable to parse start of range value foo"),
+            (f"foo-{b}", "Unable to parse start of range value foo"),
+            (f"{b}-{a}", "out of order"),
+            ("-1-5", "Invalid format"),
+            ("-", "Invalid range"),
+            ("-0", "out of order"),
+            (f"{total_size}-", "out of order"),
+            (f"{total_size}-{total_size}", "out of order"),
+            (f"{a}-{a - 1}", "out of order"),
+            ("-foo", "Unable to parse end of range offset value foo"),
+            ("", "Invalid format"),
+        ]:
+            r = do_request("GET", path, headers={"range": f"bytes={invalid_range}"})
+            assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r
+            assert err_msg in r.body.json()["error"]["message"], r
+
+        for invalid_header, err_msg in [
+            ("items=0-1", "Only 'bytes' is supported"),
+            ("bytes=0-1,2-3", "Multiple ranges are not supported"),
+            (f"bytes={total_size + 1}-", "larger than total file size"),
+            (f"bytes={2**64}-", "Unable to parse start of range"),
+            (f"bytes=0-{2**64}", "Unable to parse end of range"),
+            (f"bytes=-{2**64}", "Unable to parse end of range offset"),
+        ]:
+            r = do_request("GET", path, headers={"range": invalid_header})
+            assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+            error = r.body.json()["error"]
+            assert error["code"] == "InvalidHeaderValue", r
+            assert err_msg in error["message"], r
+
+
+def test_snapshot_repr_digest(network, args):
+    """
+    Verify that the Want-Repr-Digest / Repr-Digest headers work correctly
+    on the snapshot endpoints for GET and HEAD, including sha-256,
+    sha-384 and sha-512 algorithms.
+    """
+    primary, _ = network.find_nodes()
+
+    network.txs.issue(network, number_txs=1)
+    trigger_txid = primary.trigger_snapshot()
+    snapshot_path = primary.wait_for_snapshot(trigger_txid.seqno)
+    snapshot_name = os.path.basename(snapshot_path)
+    with open(snapshot_path, "rb") as f:
+        snapshot_data = f.read()
+
+    path = f"/node/snapshot/{snapshot_name}"
+
+    with primary.client(
+        interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+    ) as c:
+        algos = {
+            "sha-256": hashlib.sha256,
+            "sha-384": hashlib.sha384,
+            "sha-512": hashlib.sha512,
+        }
+
+        for algo_name, hash_fn in algos.items():
+            expected_b64 = base64.b64encode(hash_fn(snapshot_data).digest()).decode()
+            expected_header = f"{algo_name}=:{expected_b64}:"
+
+            for verb in ("GET", "HEAD"):
+                r = c.call(
+                    path,
+                    http_verb=verb,
+                    headers={"want-repr-digest": f"{algo_name}=10"},
+                    allow_redirects=False,
+                )
+                assert (
+                    r.status_code == http.HTTPStatus.OK.value
+                ), f"Expected 200 OK for {verb} without Range, got {r.status_code}"
+                repr_digest = r.headers.get("repr-digest") or r.headers.get(
+                    "Repr-Digest"
+                )
+                assert (
+                    repr_digest is not None
+                ), f"Missing Repr-Digest header on {verb} with {algo_name}"
+                assert repr_digest == expected_header, (
+                    f"Repr-Digest mismatch on {verb} with {algo_name}: "
+                    f"expected {expected_header}, got {repr_digest}"
+                )
+
+        # Verify that requests without Want-Repr-Digest do not include
+        # the Repr-Digest header
+        r = c.get(path, allow_redirects=False)
+        repr_digest = r.headers.get("repr-digest") or r.headers.get("Repr-Digest")
+        assert repr_digest is None, (
+            f"Unexpected Repr-Digest header when Want-Repr-Digest was not sent: "
+            f"{repr_digest}"
+        )
+
+        # Verify Repr-Digest still reflects the full file when a Range
+        # header is sent (body is partial, digest is full)
+        total_size = len(snapshot_data)
+        range_end = total_size // 2
+        expected_b64 = base64.b64encode(hashlib.sha256(snapshot_data).digest()).decode()
+        expected_header = f"sha-256=:{expected_b64}:"
+        r = c.call(
+            path,
+            http_verb="GET",
+            headers={
+                "want-repr-digest": "sha-256=10",
+                "range": f"bytes=0-{range_end}",
+            },
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value
+        ), f"Expected 206 Partial Content for GET with Range, got {r.status_code}"
+        repr_digest = r.headers.get("repr-digest") or r.headers.get("Repr-Digest")
+        assert repr_digest is not None, "Missing Repr-Digest header on GET with Range"
+        assert repr_digest == expected_header, (
+            f"Repr-Digest should reflect full file even with Range: "
+            f"expected {expected_header}, got {repr_digest}"
+        )
+        # Verify response body is partial
+        assert (
+            len(r.body.data()) == range_end + 1
+        ), f"Expected partial body of {range_end + 1} bytes, got {len(r.body.data())}"
+
+
+def run_manual_snapshot_tests(const_args):
+    # Use a separate network with explicit args to ensure unforced snapshots do not happen
+
+    args = copy.deepcopy(const_args)
+    args.common_read_only_ledger_dir = (
+        None  # Side-effect setting which would break the starting node
+    )
+    args.label = f"{args.label}_manual_snapshots"
+    args.snapshot_tx_interval = (
+        10000  # Large interval to avoid interference from regular snapshots
+    )
+    args.snapshot_time_interval = "0s"
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(args)
+
+        # These bounded, read-only checks must keep the explicitly requested
+        # snapshot latest. Run before tests which issue further snapshot requests.
+        test_snapshot_access(network, args)
+        test_snapshot_repr_digest(network, args)
+        test_snapshot_selection(network, args)
+        test_forced_snapshot(network, args)
+        test_snapshot_create_endpoint(network, args)
+
+
+def run_forced_snapshot_while_opening(const_args):
+    args = copy.deepcopy(const_args)
+    args.common_read_only_ledger_dir = None
+    args.label = f"{args.label}_opening_snapshot"
+    args.snapshot_tx_interval = 10000
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        # Note: start() rather than start_and_open() intentionally leaves
+        # the service in the Opening state for test_forced_snapshot_while_opening
+        network.start(args)
+        test_forced_snapshot_while_opening(network, args)
+
+
+def test_snapshot_selection(network, args):
+    # Add nodes so we have at least 3
+    while len(network.get_joined_nodes()) < 3:
+        new_node = network.create_node()
+        network.join_node(
+            new_node,
+            args.package,
+            args,
+            from_snapshot=False,
+        )
+        network.trust_node(new_node, args)
+
+    LOG.info("Creating snapshots")
+    primary, backups = network.find_nodes()
+    for _ in range(max(3, len(backups))):
+        target = network.txs.issue(network, number_txs=1)
+        primary.trigger_snapshot()
+        primary.wait_for_snapshot(target.seqno)
+
+    src_snapshots = []
+    for snapshot_path in primary.get_snapshots():
+        index = ccf.ledger.snapshot_index_from_filename(snapshot_path)
+        src_snapshots.append((index, os.path.basename(snapshot_path), snapshot_path))
+
+    src_snapshots.sort()
+    best_snapshot = src_snapshots[-1][1]
+
+    node_to_snapshot = {}
+    node_to_snapshot[primary] = best_snapshot
+
+    LOG.info("Copying new snapshots to backup directories")
+    for i, backup in enumerate(backups):
+        # Re-create empty directory
+        snapshot_dir = os.path.join(
+            backup.remote.remote.root, backup.remote.snapshots_dir_name
+        )
+        shutil.rmtree(snapshot_dir)
+        pathlib.Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
+
+        # Copy single snapshot into dir
+        candidate = src_snapshots[-1 - i]
+        _, snapshot_name, src_path = candidate
+        shutil.copy(src_path, snapshot_dir)
+        node_to_snapshot[backup] = snapshot_name
+
+    LOG.success(node_to_snapshot)
+
+    def find_snapshot(node):
+        with node.client(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        ) as c:
+            r = c.head("/node/snapshot", allow_redirects=True)
+            assert r.status_code == 200, r
+            snapshot_name = r.headers["x-ms-ccf-snapshot-name"]
+            assert ccf.ledger.is_snapshot_file_committed(snapshot_name)
+            return snapshot_name
+
+    # Each node redirects to the best snapshot, while the primary holding it is still live and primary
+    for node in node_to_snapshot:
+        actual_snapshot_name = find_snapshot(node)
+        assert actual_snapshot_name == best_snapshot
+
+    # Once an election happens, the new primary's snapshot is returned, which may no longer be the best
+    suspended = set()
+    while True:
+        primary.suspend()
+        suspended.add(primary)
+
+        try:
+            new_primary, _ = network.wait_for_new_primary(
+                old_primary=primary, timeout_multiplier=3
+            )
+            new_primarys_snapshot = find_snapshot(new_primary)
+        except infra.network.PrimaryNotFound:
+            # We've suspended so many nodes that elections fail. Now each node
+            # falls back to returning only its _own_ best snapshot
+            new_primary = None
+            new_primarys_snapshot = None
+
+        for node, nodes_best_snapshot in node_to_snapshot.items():
+            if node in suspended:
+                continue
+
+            snapshot_name = find_snapshot(node)
+            if new_primarys_snapshot is None:
+                assert snapshot_name == nodes_best_snapshot
+            else:
+                assert snapshot_name == new_primarys_snapshot
+
+        if new_primary is None:
+            break
+        else:
+            primary = new_primary
+
+    for node in suspended:
+        node.resume()
+
+    # Heal after all the suspensions, before running further tests
+    network.wait_for_primary_unanimity()
+    network.wait_for_node_commit_sync()
+
+
+def test_empty_snapshot(network, args):
+
+    LOG.info("Check that empty snapshot is ignored")
+
+    with tempfile.TemporaryDirectory() as snapshots_dir:
+        LOG.debug(f"Using {snapshots_dir} as snapshots directory")
+
+        snapshot_name = find_latest_committed_snapshot_name(network)
+
+        with open(
+            os.path.join(snapshots_dir, snapshot_name), "wb+"
+        ) as temp_empty_snapshot:
+
+            LOG.debug(f"Created empty snapshot {temp_empty_snapshot.name}")
+
+            # Check the file is indeed empty
+            assert (
+                os.stat(temp_empty_snapshot.name).st_size == 0
+            ), temp_empty_snapshot.name
+
+            # Create new node and join network
+            new_node = network.create_node()
+            network.join_node(
+                new_node,
+                args.package,
+                args,
+                snapshots_dir=snapshots_dir,
+                # Don't try to fetch a snapshot, look at the local files
+                fetch_recent_snapshot=False,
+                from_snapshot=True,
+            )
+            new_node.stop()
+
+            # Check that the empty snapshot is correctly skipped, then remove
+            # the staged copy so shutdown snapshot invariants do not interpret
+            # this deliberately empty test file as a real committed snapshot.
+            if not new_node.check_log_for_error_message(
+                f"Ignoring empty snapshot file {snapshot_name}"
+            ):
+                raise AssertionError(
+                    f"Expected empty snapshot file {snapshot_name} to be skipped in node logs"
+                )
+
+            node_snapshots_dir = os.path.join(
+                new_node.remote.remote.root,
+                new_node.remote.snapshots_dir_name,
+            )
+            staged_snapshot_path = os.path.join(node_snapshots_dir, snapshot_name)
+            assert os.path.exists(staged_snapshot_path), staged_snapshot_path
+            os.remove(staged_snapshot_path)
+
+
+def test_nulled_snapshot(network, args):
+
+    with tempfile.TemporaryDirectory() as snapshots_dir:
+        LOG.debug(f"Using {snapshots_dir} as snapshots directory")
+
+        snapshot_name = find_latest_committed_snapshot_name(network)
+
+        with open(
+            os.path.join(snapshots_dir, snapshot_name), "wb+"
+        ) as temp_empty_snapshot:
+
+            LOG.debug(f"Created empty snapshot {temp_empty_snapshot.name}")
+            temp_empty_snapshot.write(b"\x00" * 64)
+
+        LOG.info("Join a node, ignoring the corrupted snapshot copy")
+        new_node = network.create_node()
+        network.join_node(
+            new_node,
+            args.package,
+            args,
+            snapshots_dir=snapshots_dir,
+            # Don't try to fetch a snapshot, look at the local files
+            fetch_recent_snapshot=False,
+            from_snapshot=True,
+        )
+        new_node.stop()
+
+        if not new_node.check_log_for_error_message("Ignoring corrupt snapshot"):
+            raise AssertionError("Expected corrupt snapshot to be skipped in node logs")
+
+
+def test_corrupt_snapshot_handling(network, args):
+    """
+    Test that corrupt snapshots in writable and read-only directories are
+    handled correctly:
+    - In the writable directory, corrupt files are renamed to .ignored.
+    - In a read-only (config) directory, log messages about unrenamable files
+      are emitted.
+    - When the writable directory's permissions prevent renaming, a log message
+      about failure to mark the snapshot as ignored is emitted.
+    """
+
+    # Craft corrupt snapshot data that passes separate_segments() (valid header
+    # with non-zero body size and non-empty receipt area) but fails
+    # verify_snapshot() because the receipt is not a COSE_Sign1 message.
+    # SerialisedEntryHeader is 8 bytes: version(1) + flags(1) + size(48-bit LE)
+    body_size = 16
+    header = bytes([1, 0]) + body_size.to_bytes(6, "little")
+    assert len(header) == 8
+    body = b"\x00" * body_size
+    receipt = b"this is not a valid receipt!!"
+    corrupt_data = header + body + receipt
+
+    # Use the newest snapshot for the writable dir so it is tried first
+    # (snapshots are iterated in descending seqno order).
+    read_only_snapshot_name, writable_snapshot_name = (
+        find_latest_committed_snapshot_name(network, count=2)
+    )
+    unrenamable_snapshot_name = writable_snapshot_name
+
+    # ---- Part 1: writable dir (rename succeeds) + read-only config dir ----
+    LOG.info("Part 1: corrupt snapshots in both writable and read-only directories")
+
+    with (
+        tempfile.TemporaryDirectory() as writable_dir,
+        tempfile.TemporaryDirectory() as read_only_dir,
+    ):
+        # Place corrupt snapshots
+        with open(os.path.join(writable_dir, writable_snapshot_name), "wb") as f:
+            f.write(corrupt_data)
+        with open(os.path.join(read_only_dir, read_only_snapshot_name), "wb") as f:
+            f.write(corrupt_data)
+
+        new_node = network.create_node()
+
+        # Set up the join with the writable snapshot directory only; we will
+        # inject the read-only directory into the config afterwards.
+        network.setup_join_node(
+            new_node,
+            args.package,
+            args,
+            snapshots_dir=writable_dir,
+            from_snapshot=True,
+            fetch_recent_snapshot=False,
+        )
+
+        # The node's workspace root and config file
+        node_root = new_node.remote.remote.root
+        config_file_name = f"{new_node.remote.local_node_id}.config.json"
+        config_path = os.path.join(node_root, config_file_name)
+
+        # Copy the read-only snapshot directory into the node's workspace
+        ro_dir_basename = os.path.basename(read_only_dir)
+        shutil.copytree(read_only_dir, os.path.join(node_root, ro_dir_basename))
+
+        # Patch the config to include the read-only snapshot directory.
+        # If the config file is a symlink, replace it with a copy so we
+        # don't mutate the shared original.
+        if os.path.islink(config_path):
+            target = os.path.realpath(config_path)
+            os.unlink(config_path)
+            shutil.copy2(target, config_path)
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        config["snapshots"]["read_only_directory"] = ro_dir_basename
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
+
+        # Start the node - it should fall back to ledger replay after
+        # discarding both corrupt snapshots.  If the node fails to join
+        # (e.g. timeout), that is acceptable - the snapshot selection
+        # behaviour we care about happens during startup before the join
+        # protocol completes.
+        try:
+            network.run_join_node(new_node)
+            new_node.stop()
+        except Exception as e:
+            LOG.warning(f"Node failed to join (expected if ledger replay is slow): {e}")
+            # run_join_node already stopped and removed the node on failure,
+            # but we still need to ensure the process is down.
+            try:
+                new_node.stop()
+            except Exception as stop_error:
+                LOG.debug(f"Ignoring error while stopping failed node: {stop_error}")
+
+        # -- Verify writable directory: file must be renamed to .ignored --
+        writable_in_ws = os.path.join(node_root, os.path.basename(writable_dir))
+        ws_files = os.listdir(writable_in_ws)
+        assert writable_snapshot_name not in ws_files, (
+            f"Corrupt snapshot {writable_snapshot_name} should have been "
+            f"renamed in writable dir, but found: {ws_files}"
+        )
+        assert f"{writable_snapshot_name}.ignored" in ws_files, (
+            f"Expected {writable_snapshot_name}.ignored in writable dir, "
+            f"but found: {ws_files}"
+        )
+
+        # -- Verify read-only directory: file must still be present --
+        ro_in_ws = os.path.join(node_root, ro_dir_basename)
+        ro_files = os.listdir(ro_in_ws)
+        assert read_only_snapshot_name in ro_files, (
+            f"Corrupt snapshot {read_only_snapshot_name} in read-only dir "
+            f"should not have been renamed, but found: {ro_files}"
+        )
+
+        # -- Verify node logs --
+        assert new_node.check_log_for_error_message(
+            "Error while verifying"
+        ), "Expected 'Error while verifying' in node logs"
+
+        assert new_node.check_log_for_error_message(
+            "Ignoring corrupt snapshot"
+        ), "Expected 'Ignoring corrupt snapshot' in node logs"
+
+        assert new_node.check_log_for_error_message(
+            "is in a read-only directory"
+        ), "Expected read-only directory message in node logs"
+
+    # ---- Part 2: writable dir with restricted permissions (rename fails) ----
+    LOG.info("Part 2: corrupt snapshot in writable dir that cannot be renamed")
+
+    with tempfile.TemporaryDirectory() as restricted_dir:
+        snapshot_path = os.path.join(restricted_dir, unrenamable_snapshot_name)
+        with open(snapshot_path, "wb") as f:
+            f.write(corrupt_data)
+
+        new_node2 = network.create_node()
+        network.setup_join_node(
+            new_node2,
+            args.package,
+            args,
+            snapshots_dir=restricted_dir,
+            from_snapshot=True,
+            fetch_recent_snapshot=False,
+        )
+
+        # To make the rename to .ignored fail, create a *directory* with the
+        # target name (<snapshot>.ignored).  On Linux, rename() returns EISDIR
+        # when the source is a file and the destination is a directory,
+        # regardless of user privileges (chmod is ineffective under root).
+        node_root2 = new_node2.remote.remote.root
+        restricted_in_ws = os.path.join(node_root2, os.path.basename(restricted_dir))
+        blocker_dir = os.path.join(
+            restricted_in_ws, f"{unrenamable_snapshot_name}.ignored"
+        )
+        os.makedirs(blocker_dir)
+        # Place a file inside so the directory is non-empty (extra safety)
+        with open(os.path.join(blocker_dir, "placeholder"), "w") as f:
+            f.write("")
+
+        try:
+            network.run_join_node(new_node2)
+        except Exception as join_error:
+            # The node may fail to join if it cannot write to the snapshots
+            # directory at all; that is acceptable for this sub-test.
+            LOG.debug(f"Ignoring expected join failure: {join_error}")
+
+        try:
+            new_node2.stop()
+        except Exception as stop_error:
+            LOG.debug(f"Ignoring error while stopping failed node: {stop_error}")
+
+        # The corrupt file should still be present (rename failed)
+        ws_files2 = os.listdir(restricted_in_ws)
+        assert unrenamable_snapshot_name in ws_files2, (
+            f"Corrupt snapshot {unrenamable_snapshot_name} should still exist "
+            f"after failed rename, but found: {ws_files2}"
+        )
+
+        # Check that the failure-to-rename message appears in the logs
+        assert new_node2.check_log_for_error_message(
+            "Unable to mark snapshot as ignored"
+        ), "Expected 'Unable to mark snapshot as ignored' in node logs"
+
+    return network
 
 
 def split_all_ledger_files_in_dir(input_dir, output_dir):
@@ -216,10 +1055,13 @@ def split_all_ledger_files_in_dir(input_dir, output_dir):
             continue
 
         ledger_file_path = os.path.join(input_dir, ledger_file)
-        ledger_chunk = ccf.ledger.LedgerChunk(ledger_file_path, ledger_validator=None)
+        ledger_chunk = ccf.ledger.LedgerChunk(
+            ledger_file_path,
+        )
         for transaction in ledger_chunk:
             public_domain = transaction.get_public_domain()
-            if ccf.ledger.SIGNATURE_TX_TABLE_NAME in public_domain.get_tables().keys():
+            tables = public_domain.get_tables().keys()
+            if ccf.signatures.is_signature_transaction(tables):
                 sig_seqnos.append(public_domain.get_seqno())
 
         if len(sig_seqnos) <= 1:
@@ -254,8 +1096,853 @@ def test_split_ledger_on_stopped_network(primary, args):
 
     # Check that the split ledger can be read successfully
     ccf.ledger.Ledger(
-        [current_ledger_dir] + committed_ledger_dirs, committed_only=False
+        [current_ledger_dir] + committed_ledger_dirs,
+        committed_only=False,
+        contiguous_suffix=True,
     )
+
+
+def test_ledger_chunk_access(network, args):
+    """
+    Access ledger chunks linearly, checking redirection, content-length and
+    content correctness. All nodes have all chunks locally.
+    """
+    primary, backups = network.find_nodes()
+
+    for node in (primary, *backups):
+        with node.client(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        ) as c:
+            for since in (None, "", "foo", "1x", "-1", str(2**64)):
+                query = "" if since is None else f"?since={since}"
+                for method in ("GET", "HEAD"):
+                    r = c.call(
+                        f"/node/ledger_chunk{query}",
+                        http_verb=method,
+                        allow_redirects=False,
+                    )
+                    assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+                    if method == "GET":
+                        error = r.body.json()["error"]
+                        assert error["code"] == "InvalidQueryParameterValue", r
+                        expected_message = (
+                            "Missing required query parameter"
+                            if since is None
+                            else "Unable to parse value"
+                        )
+                        assert expected_message in error["message"], r
+
+            for method in ("GET", "HEAD"):
+                r = c.call(
+                    f"/node/ledger_chunk?since={2**64 - 1}",
+                    http_verb=method,
+                    allow_redirects=True,
+                )
+                assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+                if method == "GET":
+                    assert r.body.json()["error"]["code"] == "ResourceNotFound", r
+
+            r = c.get("/node/ledger_chunk/does-not-exist", allow_redirects=False)
+            assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+            assert r.body.json()["error"]["code"] == "ResourceNotFound", r
+
+            main_ledger_dir = node.get_main_ledger_dir()
+            chunks = [
+                f for f in os.listdir(main_ledger_dir) if f.endswith(".committed")
+            ]
+            chunks = sorted(
+                (*ccf.ledger.range_from_filename(chunk), chunk) for chunk in chunks
+            )
+            assert len(chunks) > 10, f"Unexpectedly small number of chunks {chunks}"
+
+            for start_index, end_index, chunk in chunks:
+                chunk_url = None
+                # Asking about any index in the chunk should redirect to the chunk
+                for index in (start_index, end_index, (start_index + end_index) // 2):
+                    r = c.head(
+                        f"/node/ledger_chunk?since={index}", allow_redirects=False
+                    )
+                    assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value, r
+                    assert r.headers["Location"].endswith(
+                        f"/node/ledger_chunk/{chunk}"
+                    ), r
+                    r = c.get(
+                        f"/node/ledger_chunk?since={index}", allow_redirects=False
+                    )
+                    assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value, r
+                    assert r.headers["Location"].endswith(
+                        f"/node/ledger_chunk/{chunk}"
+                    ), r
+
+                    chunk_url = urllib.parse.urlparse(r.headers["Location"])
+
+                assert chunk_url is not None
+
+                r = c.head(chunk_url.path, allow_redirects=False)
+                chunk_size = int(r.headers["Content-Length"])
+
+                main_ledger_dir = node.get_main_ledger_dir()
+                ledger_chunk_path = os.path.join(main_ledger_dir, chunk)
+                actual_chunk_size = os.stat(ledger_chunk_path).st_size
+                assert (
+                    chunk_size == actual_chunk_size
+                ), f"Expected chunk size {actual_chunk_size}, got {chunk_size}"
+
+                r = c.get(chunk_url.path, allow_redirects=False)
+                assert r.status_code == http.HTTPStatus.OK.value, r
+                dled_chunk_digest = hashlib.sha256(r.body.data()).hexdigest()
+                with open(ledger_chunk_path, "rb") as f:
+                    actual_chunk_digest = hashlib.sha256(f.read()).hexdigest()
+                assert (
+                    dled_chunk_digest == actual_chunk_digest
+                ), "Ledger chunk content does not match"
+
+            LOG.info("Accessing an empty chunk always returns an error")
+            with tempfile.NamedTemporaryFile(dir=main_ledger_dir) as temp_chunk:
+                chunk_url = f"/node/ledger_chunk/{os.path.basename(temp_chunk.name)}"
+                r = c.get(
+                    chunk_url,
+                    allow_redirects=True,
+                )
+                assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
+
+                chunk_url = f"/node/ledger_chunk/{os.path.basename(temp_chunk.name)}"
+                for range_value in ("bytes=0-10", "bytes=0-", "bytes=0-0"):
+                    r = c.get(
+                        chunk_url,
+                        allow_redirects=True,
+                        headers={"Range": range_value},
+                    )
+                    assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR, r
+
+    # ETag / If-None-Match tests on a single chunk
+    with primary.client(
+        interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+    ) as c:
+        main_ledger_dir = primary.get_main_ledger_dir()
+        chunks = [f for f in os.listdir(main_ledger_dir) if f.endswith(".committed")]
+        chunks = sorted(
+            (*ccf.ledger.range_from_filename(chunk), chunk) for chunk in chunks
+        )
+        assert len(chunks) > 0, "No committed chunks found"
+        _, _, chunk = chunks[0]
+        chunk_url = f"/node/ledger_chunk/{chunk}"
+        ledger_chunk_path = os.path.join(main_ledger_dir, chunk)
+        with open(ledger_chunk_path, "rb") as f:
+            chunk_data = f.read()
+
+        # 1. Normal GET returns a correctly formed ETag
+        r = c.get(chunk_url, allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.OK.value, r
+        etag = r.headers.get("etag")
+        assert etag is not None, "Missing ETag header on GET"
+        # ETag must be in RFC 9530 format: "sha-256=:<base64>:"
+        assert etag.startswith('"sha-256=:') and etag.endswith(
+            ':"'
+        ), f"ETag has unexpected format: {etag}"
+        expected_b64 = base64.b64encode(hashlib.sha256(chunk_data).digest()).decode()
+        assert (
+            etag == f'"sha-256=:{expected_b64}:"'
+        ), f"ETag digest mismatch: expected sha-256=:{expected_b64}:, got {etag}"
+
+        for match in ("*", f'"not-this-chunk", {etag}'):
+            for method in ("GET", "HEAD"):
+                r = c.call(
+                    chunk_url,
+                    http_verb=method,
+                    headers={"if-none-match": match},
+                    allow_redirects=False,
+                )
+                assert r.status_code == http.HTTPStatus.NOT_MODIFIED, r
+                assert r.body.data() == b"", r
+                assert r.headers["etag"] == etag, r.headers
+
+        for match in ("not-quoted", '"unterminated', f"W/{etag}"):
+            r = c.get(
+                chunk_url,
+                headers={"if-none-match": match},
+                allow_redirects=False,
+            )
+            assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+            assert r.body.json()["error"]["code"] == "InvalidHeaderValue", r
+
+        # 2. GET with If-None-Match that does NOT match returns a fresh download
+        r = c.get(
+            chunk_url,
+            headers={"if-none-match": '"sha-256=:AAAA:"'},
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.OK.value
+        ), f"Expected 200 for non-matching If-None-Match, got {r.status_code}"
+        assert (
+            r.body.data() == chunk_data
+        ), "Body content should match for non-matching If-None-Match"
+
+        # 3.a. GET with If-None-Match matching the ETag returns 304 Not Modified
+        r = c.get(
+            chunk_url,
+            headers={"if-none-match": etag},
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.NOT_MODIFIED.value
+        ), f"Expected 304 for matching If-None-Match, got {r.status_code}"
+
+        # 3.b. Compute a sha-384 version of the same ETag, and confirm that it works too
+        # RFC 9530 allows multiple algorithms in the ETag, and If-None-Match should match if any of them match
+        # GET with If-None-Match matching the ETag returns 304 Not Modified
+        sha384_b64 = base64.b64encode(hashlib.sha384(chunk_data).digest()).decode()
+        sha384_etag = f'"sha-384=:{sha384_b64}:"'
+        r = c.get(
+            chunk_url,
+            headers={"if-none-match": sha384_etag},
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.NOT_MODIFIED.value
+        ), f"Expected 304 for matching sha-384 If-None-Match, got {r.status_code}"
+
+        # 3.b2. sha-512 variant
+        sha512_b64 = base64.b64encode(hashlib.sha512(chunk_data).digest()).decode()
+        sha512_etag = f'"sha-512=:{sha512_b64}:"'
+        r = c.get(
+            chunk_url,
+            headers={"if-none-match": sha512_etag},
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.NOT_MODIFIED.value
+        ), f"Expected 304 for matching sha-512 If-None-Match, got {r.status_code}"
+
+        # 3.c. HEAD returns the same ETag as GET
+        r = c.head(chunk_url, allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.OK.value, r
+        head_etag = r.headers.get("etag")
+        assert (
+            head_etag == etag
+        ), f"HEAD ETag mismatch: expected {etag}, got {head_etag}"
+
+        # 3.d. HEAD with matching If-None-Match returns 304
+        r = c.call(
+            chunk_url,
+            http_verb="HEAD",
+            headers={"if-none-match": etag},
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.NOT_MODIFIED.value
+        ), f"Expected 304 for matching If-None-Match with HEAD, got {r.status_code}"
+
+        # 4. Same checks on a sub-Range of the file
+        total_size = len(chunk_data)
+        range_end = total_size // 2
+        partial_data = chunk_data[: range_end + 1]
+        r = c.call(
+            chunk_url,
+            http_verb="GET",
+            headers={"range": f"bytes=0-{range_end}"},
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value
+        ), f"Expected 206 for Range GET, got {r.status_code}"
+        range_etag = r.headers.get("etag")
+        assert range_etag is not None, "Missing ETag header on Range GET"
+        range_expected_b64 = base64.b64encode(
+            hashlib.sha256(partial_data).digest()
+        ).decode()
+        assert (
+            range_etag == f'"sha-256=:{range_expected_b64}:"'
+        ), f"Range ETag mismatch: expected sha-256=:{range_expected_b64}:, got {range_etag}"
+
+        # A suffix longer than the representation selects the full content.
+        r = c.get(
+            chunk_url,
+            headers={"range": f"bytes=-{total_size + 1}"},
+            allow_redirects=False,
+        )
+        assert r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value, r
+        assert r.body.data() == chunk_data
+
+        r = c.get(
+            chunk_url,
+            headers={"range": "bytes=-0"},
+            allow_redirects=False,
+        )
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r
+
+        # Non-matching If-None-Match on range -> fresh partial download
+        r = c.call(
+            chunk_url,
+            http_verb="GET",
+            headers={
+                "range": f"bytes=0-{range_end}",
+                "if-none-match": '"sha-256=:AAAA:"',
+            },
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value
+        ), f"Expected 206 for non-matching If-None-Match with Range, got {r.status_code}"
+        assert (
+            r.body.data() == partial_data
+        ), "Body content should match partial data for non-matching If-None-Match with Range"
+
+        # Matching If-None-Match on range -> 304 Not Modified
+        r = c.call(
+            chunk_url,
+            http_verb="GET",
+            headers={
+                "range": f"bytes=0-{range_end}",
+                "if-none-match": range_etag,
+            },
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.NOT_MODIFIED.value
+        ), f"Expected 304 for matching If-None-Match with Range, got {r.status_code}"
+
+        # HEAD with Range should return the same ETag as the corresponding GET range
+        r = c.call(
+            chunk_url,
+            http_verb="HEAD",
+            headers={
+                "range": f"bytes=0-{range_end}",
+            },
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value
+        ), f"Expected 206 for HEAD with Range, got {r.status_code}"
+        head_range_etag = r.headers.get("etag")
+        assert (
+            head_range_etag == range_etag
+        ), f"HEAD Range ETag mismatch: expected {range_etag}, got {head_range_etag}"
+
+        # Matching If-None-Match on HEAD + Range -> 304 Not Modified
+        r = c.call(
+            chunk_url,
+            http_verb="HEAD",
+            headers={
+                "range": f"bytes=0-{range_end}",
+                "if-none-match": range_etag,
+            },
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.NOT_MODIFIED.value
+        ), f"Expected 304 for matching If-None-Match with HEAD Range, got {r.status_code}"
+
+
+def test_ledger_chunk_repr_digest(network, args):
+    """
+    Verify that the Want-Repr-Digest / Repr-Digest headers work correctly
+    on the ledger_chunk endpoints for GET and HEAD, including sha-256,
+    sha-384 and sha-512 algorithms.
+    """
+    primary, _ = network.find_nodes()
+
+    with primary.client(
+        interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+    ) as c:
+        main_ledger_dir = primary.get_main_ledger_dir()
+        chunks = [f for f in os.listdir(main_ledger_dir) if f.endswith(".committed")]
+        chunks = sorted(
+            (*ccf.ledger.range_from_filename(chunk), chunk) for chunk in chunks
+        )
+        assert len(chunks) > 0, "No committed chunks found"
+
+        _, _, chunk = chunks[0]
+        chunk_url = f"/node/ledger_chunk/{chunk}"
+        ledger_chunk_path = os.path.join(main_ledger_dir, chunk)
+        with open(ledger_chunk_path, "rb") as f:
+            chunk_data = f.read()
+
+        algos = {
+            "sha-256": hashlib.sha256,
+            "sha-384": hashlib.sha384,
+            "sha-512": hashlib.sha512,
+        }
+
+        for algo_name, hash_fn in algos.items():
+            expected_b64 = base64.b64encode(hash_fn(chunk_data).digest()).decode()
+            expected_header = f"{algo_name}=:{expected_b64}:"
+
+            for verb in ("GET", "HEAD"):
+                r = c.call(
+                    chunk_url,
+                    http_verb=verb,
+                    headers={"want-repr-digest": f"{algo_name}=10"},
+                    allow_redirects=False,
+                )
+                assert (
+                    r.status_code == http.HTTPStatus.OK.value
+                ), f"Expected 200 OK for {verb} without Range, got {r.status_code}"
+                repr_digest = r.headers.get("repr-digest") or r.headers.get(
+                    "Repr-Digest"
+                )
+                assert (
+                    repr_digest is not None
+                ), f"Missing Repr-Digest header on {verb} with {algo_name}"
+                assert repr_digest == expected_header, (
+                    f"Repr-Digest mismatch on {verb} with {algo_name}: "
+                    f"expected {expected_header}, got {repr_digest}"
+                )
+
+        # Verify that requests without Want-Repr-Digest do not include
+        # the Repr-Digest header
+        r = c.get(chunk_url, allow_redirects=False)
+        repr_digest = r.headers.get("repr-digest") or r.headers.get("Repr-Digest")
+        assert repr_digest is None, (
+            f"Unexpected Repr-Digest header when Want-Repr-Digest was not sent: "
+            f"{repr_digest}"
+        )
+
+        # Verify that unsupported algorithms fall back to sha-256
+        # (RFC 9530 Appendix C.2)
+        r = c.get(
+            chunk_url,
+            headers={"want-repr-digest": "md5=10"},
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.OK.value
+        ), f"Unexpected status {r.status_code} for unsupported algorithm request"
+        repr_digest = r.headers.get("repr-digest") or r.headers.get("Repr-Digest")
+        expected_b64 = base64.b64encode(hashlib.sha256(chunk_data).digest()).decode()
+        expected_header = f"sha-256=:{expected_b64}:"
+        assert repr_digest == expected_header, (
+            "Unsupported algorithms should fall back to sha-256: "
+            f"expected {expected_header}, got {repr_digest}"
+        )
+
+        # Verify that the highest-priority algorithm is chosen
+        r = c.get(
+            chunk_url,
+            headers={"want-repr-digest": "sha-256=3, sha-512=10"},
+            allow_redirects=False,
+        )
+        repr_digest = r.headers.get("repr-digest") or r.headers.get("Repr-Digest")
+        expected_b64 = base64.b64encode(hashlib.sha512(chunk_data).digest()).decode()
+        expected_header = f"sha-512=:{expected_b64}:"
+        assert (
+            repr_digest == expected_header
+        ), f"Expected sha-512 (highest priority) but got {repr_digest}"
+
+        # Verify Repr-Digest still reflects the full file when a Range
+        # header is sent (body is partial, digest is full)
+        total_size = len(chunk_data)
+        range_end = total_size // 2
+        expected_b64 = base64.b64encode(hashlib.sha256(chunk_data).digest()).decode()
+        expected_header = f"sha-256=:{expected_b64}:"
+        r = c.call(
+            chunk_url,
+            http_verb="GET",
+            headers={
+                "want-repr-digest": "sha-256=10",
+                "range": f"bytes=0-{range_end}",
+            },
+            allow_redirects=False,
+        )
+        assert (
+            r.status_code == http.HTTPStatus.PARTIAL_CONTENT.value
+        ), f"Expected 206 Partial Content for GET with Range, got {r.status_code}"
+        repr_digest = r.headers.get("repr-digest") or r.headers.get("Repr-Digest")
+        assert repr_digest is not None, "Missing Repr-Digest header on GET with Range"
+        assert repr_digest == expected_header, (
+            f"Repr-Digest should reflect full file even with Range: "
+            f"expected {expected_header}, got {repr_digest}"
+        )
+        # Verify response body is partial
+        assert (
+            len(r.body.data()) == range_end + 1
+        ), f"Expected partial body of {range_end + 1} bytes, got {len(r.body.data())}"
+
+
+def test_committed_ledger_prefix_access(network, args):
+    primary, _ = network.find_primary()
+    prefix_suffix = infra.node.COMMITTED_PREFIX_FILE_SUFFIX
+    first_txid = network.txs.issue(
+        network, number_txs=1, send_private=False, send_public=True
+    )
+
+    with primary.client(
+        interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+    ) as c:
+        locator = f"/node/ledger_chunk?since={first_txid.seqno}"
+
+        r = c.get(locator, allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+
+        r = c.get(f"{locator}&include_committed_prefix=false", allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+
+        r = c.get(f"{locator}&include_committed_prefix=invalid", allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+
+        r = c.head(f"{locator}&include_committed_prefix=true", allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.TEMPORARY_REDIRECT, r
+
+        r = c.get(f"{locator}&include_committed_prefix=true", allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.TEMPORARY_REDIRECT, r
+        prefix_url = urllib.parse.urlparse(r.headers["Location"]).path
+        first_prefix_name = os.path.basename(prefix_url)
+        assert first_prefix_name.endswith(prefix_suffix), first_prefix_name
+        first_start, first_end = ccf.ledger.range_from_filename(
+            first_prefix_name
+            # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+            .removesuffix(prefix_suffix)
+            # END SDK 7.0.18 compatibility.
+        )
+        assert first_start == first_txid.seqno
+        assert first_end is not None and first_end >= first_start
+
+        r = c.head(prefix_url, allow_redirects=False)
+        assert r.status_code == http.HTTPStatus.OK, r
+        assert r.headers["x-ms-ccf-ledger-chunk-kind"] == "committed-prefix", r
+        assert r.headers["x-ms-ccf-ledger-chunk-name"] == first_prefix_name, r
+        prefix_size = int(r.headers["content-length"])
+        first_etag = r.headers["etag"]
+
+        r = c.get(
+            prefix_url,
+            allow_redirects=False,
+            headers={"want-repr-digest": "sha-256=1"},
+        )
+        assert r.status_code == http.HTTPStatus.OK, r
+        first_prefix = r.body.data()
+        assert len(first_prefix) == prefix_size
+        expected_digest = base64.b64encode(
+            hashlib.sha256(first_prefix).digest()
+        ).decode()
+        assert r.headers["repr-digest"] == f"sha-256=:{expected_digest}:"
+
+        for local_only in (False, True):
+            with primary.download_ledger(
+                first_end,
+                start_seqno=first_start,
+                local_only=local_only,
+                include_committed_prefix=True,
+            ) as ledger_paths:
+                assert len(ledger_paths) == 1, ledger_paths
+                assert ledger_paths[0].endswith(prefix_suffix), ledger_paths
+                chunk_path = ledger_paths[0]
+                # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+                # Older SDKs can read the bytes but not the prefix filename.
+                chunk_path = chunk_path.removesuffix(prefix_suffix)
+                os.rename(ledger_paths[0], chunk_path)
+                # END SDK 7.0.18 compatibility.
+                downloaded_chunk = ccf.ledger.LedgerChunk(chunk_path)
+                downloaded_start, downloaded_end = downloaded_chunk.get_seqnos()
+                assert downloaded_start == first_start
+                assert downloaded_end >= first_end
+                assert any(
+                    tx.get_txid() == first_txid for tx in downloaded_chunk
+                ), first_txid
+
+        range_end = min(31, prefix_size - 1)
+        r = c.get(
+            prefix_url,
+            allow_redirects=False,
+            headers={"range": f"bytes=0-{range_end}"},
+        )
+        assert r.status_code == http.HTTPStatus.PARTIAL_CONTENT, r
+        assert r.body.data() == first_prefix[: range_end + 1]
+
+        # Ranges spanning the header, the entries, and the positions table
+        positions_start = int.from_bytes(
+            first_prefix[: ccf.ledger.LEDGER_HEADER_SIZE], byteorder="little"
+        )
+        for range_value, expected in (
+            (f"bytes=4-{positions_start}", first_prefix[4 : positions_start + 1]),
+            (f"bytes={positions_start - 2}-", first_prefix[positions_start - 2 :]),
+            ("bytes=-6", first_prefix[-6:]),
+        ):
+            r = c.get(prefix_url, allow_redirects=False, headers={"range": range_value})
+            assert r.status_code == http.HTTPStatus.PARTIAL_CONTENT, r
+            assert r.body.data() == expected, range_value
+
+        r = c.get(
+            prefix_url,
+            allow_redirects=False,
+            headers={"range": "bytes=4-11", "want-repr-digest": "sha-256=1"},
+        )
+        assert r.status_code == http.HTTPStatus.PARTIAL_CONTENT, r
+        assert r.body.data() == first_prefix[4:12]
+        assert r.headers["repr-digest"] == f"sha-256=:{expected_digest}:"
+
+        for invalid_range in (f"bytes={prefix_size}-", "bytes=10-5"):
+            r = c.get(
+                prefix_url, allow_redirects=False, headers={"range": invalid_range}
+            )
+            assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+
+        with tempfile.TemporaryDirectory() as ledger_dir:
+            first_path = os.path.join(
+                ledger_dir,
+                first_prefix_name
+                # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+                .removesuffix(prefix_suffix),
+                # END SDK 7.0.18 compatibility.
+            )
+            with open(first_path, "wb") as prefix_file:
+                prefix_file.write(first_prefix)
+
+            chunk = ccf.ledger.LedgerChunk(first_path)
+            assert chunk.get_seqnos() == (first_start, first_end)
+            assert len(chunk) == first_end - first_start + 1
+            assert not chunk.is_committed()
+
+            second_txid = network.txs.issue(
+                network, number_txs=1, send_private=False, send_public=True
+            )
+            assert second_txid.seqno > first_end
+
+            r = c.get(prefix_url, allow_redirects=False)
+            assert r.status_code == http.HTTPStatus.OK, r
+            assert r.body.data() == first_prefix
+            assert r.headers["etag"] == first_etag
+
+            next_seqno = first_end + 1
+            r = c.get(
+                "/node/ledger_chunk"
+                f"?since={next_seqno}&include_committed_prefix=true",
+                allow_redirects=False,
+            )
+            assert r.status_code == http.HTTPStatus.TEMPORARY_REDIRECT, r
+            second_url = urllib.parse.urlparse(r.headers["Location"]).path
+            second_prefix_name = os.path.basename(second_url)
+            second_start, second_end = ccf.ledger.range_from_filename(
+                second_prefix_name
+                # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+                .removesuffix(prefix_suffix)
+                # END SDK 7.0.18 compatibility.
+            )
+            assert second_start == next_seqno
+            assert second_end is not None and second_end >= second_txid.seqno
+
+            r = c.get(second_url, allow_redirects=False)
+            assert r.status_code == http.HTTPStatus.OK, r
+            second_path = os.path.join(
+                ledger_dir,
+                second_prefix_name
+                # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+                .removesuffix(prefix_suffix),
+                # END SDK 7.0.18 compatibility.
+            )
+            with open(second_path, "wb") as prefix_file:
+                prefix_file.write(r.body.data())
+
+            # Each prefix is a self-contained chunk, and consecutive prefixes
+            # are contiguous.
+            second_chunk = ccf.ledger.LedgerChunk(second_path)
+            assert second_chunk.get_seqnos() == (second_start, second_end)
+            assert len(second_chunk) == second_end - second_start + 1
+            assert second_start == first_end + 1
+
+        r = c.get(
+            "/node/ledger_chunk"
+            f"?since={second_end + 1_000_000}&include_committed_prefix=true",
+            allow_redirects=False,
+        )
+        assert r.status_code == http.HTTPStatus.NOT_FOUND, r
+
+        r = c.get(
+            "/node/ledger_chunk/committed_prefix/not-a-prefix",
+            allow_redirects=False,
+        )
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+
+        network.create_and_wait_for_ledger_chunk(primary)
+        canonical_response = c.get(locator, allow_redirects=True)
+        assert canonical_response.status_code == http.HTTPStatus.OK, canonical_response
+        canonical_name = canonical_response.headers["x-ms-ccf-ledger-chunk-name"]
+        assert canonical_name.endswith(ccf.ledger.COMMITTED_FILE_SUFFIX), canonical_name
+
+        with primary.download_ledger(
+            second_txid.seqno,
+            start_seqno=first_start,
+            include_committed_prefix=True,
+        ) as ledger_paths:
+            assert [os.path.basename(p) for p in ledger_paths] == [canonical_name]
+            txids = [tx.get_txid() for tx in ccf.ledger.LedgerChunk(ledger_paths[0])]
+            assert txids.count(first_txid) == 1, txids
+            assert txids.count(second_txid) == 1, txids
+
+
+def test_ledger_chunk_redirect_recent(network, args):
+    """
+    Access ledger chunk that is missing locally on a backup, after the initial index,
+    checking redirection to the primary and content correctness.
+    """
+    primary, backups = network.find_nodes()
+
+    late_backup = backups[-1]
+    main_ledger_dir = late_backup.get_main_ledger_dir()
+    LOG.info(f"Late backup main ledger directory: {main_ledger_dir}")
+    chunks = [f for f in os.listdir(main_ledger_dir) if f.endswith(".committed")]
+    chunks = sorted(chunks, key=lambda chunk: ccf.ledger.range_from_filename(chunk)[0])
+    start_of_last_chunk = ccf.ledger.range_from_filename(chunks[-1])[0]
+    # Drop last chunk from the backup to force redirect
+    LOG.info(
+        f"Dropping last ledger chunk {chunks[-1]} from late backup main ledger directory {main_ledger_dir}"
+    )
+    os.remove(os.path.join(main_ledger_dir, chunks[-1]))
+    network.skip_verify_chunking = True
+    with late_backup.client(
+        interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+    ) as c:
+        expected_host = primary.get_public_rpc_host(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        )
+        expected_port = primary.get_public_rpc_port(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        )
+        expected_location = f"https://{infra.interfaces.make_address(expected_host, expected_port)}/node/ledger_chunk?since={start_of_last_chunk}"
+
+        r = c.head(
+            f"/node/ledger_chunk?since={start_of_last_chunk}"
+            "&include_committed_prefix=true",
+            allow_redirects=False,
+        )
+        assert r.status_code == http.HTTPStatus.TEMPORARY_REDIRECT.value, r
+        assert (
+            r.headers["Location"]
+            == f"{expected_location}&include_committed_prefix=true"
+        ), r
+
+        r = c.head(
+            f"/node/ledger_chunk?since={start_of_last_chunk}", allow_redirects=False
+        )
+        assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value, r
+        assert r.headers["Location"] == expected_location, r
+        r = c.get(
+            f"/node/ledger_chunk?since={start_of_last_chunk}", allow_redirects=True
+        )
+        primary_main_ledger_dir = primary.get_main_ledger_dir()
+        ledger_chunk_path = os.path.join(primary_main_ledger_dir, chunks[-1])
+        dled_chunk_digest = hashlib.sha256(r.body.data()).hexdigest()
+        with open(ledger_chunk_path, "rb") as f:
+            actual_chunk_digest = hashlib.sha256(f.read()).hexdigest()
+        assert (
+            dled_chunk_digest == actual_chunk_digest
+        ), f"Ledger chunk content for {chunks[-1]} does not match"
+
+
+def test_ledger_chunk_redirect_gap(network, args):
+    """
+    Add a new node to the network from a recent snapshot, then access a ledger chunk that
+    predates the snapshot on the new node, checking redirection to another node and content correctness.
+    """
+    primary, _backups = network.find_nodes()
+
+    # Get commit index from primary
+    with primary.client(interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE) as c:
+        r = c.get("/node/commit").body.json()
+        commit_seqno = TxID.from_str(r["transaction_id"]).seqno
+
+    new_node = network.create_node()
+    # Commit a transaction beyond the old boundary before requesting a snapshot.
+    target = network.txs.issue(network, number_txs=1)
+    primary.trigger_snapshot()
+    primary.wait_for_snapshot(target.seqno)
+    network.join_node(
+        new_node,
+        args.package,
+        args,
+        from_snapshot=False,
+        # Fetch recent snapshot to speed up joining
+        fetch_recent_snapshot=True,
+    )
+    network.trust_node(new_node, args)
+
+    with new_node.client(interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE) as c:
+        r = c.get("/node/state")
+        startup_seqno = r.body.json()["startup_seqno"]
+        # The new node should have started from a snapshot taken after the commit at the start of the test
+        assert (
+            startup_seqno > commit_seqno
+        ), f"New node joined at {startup_seqno}, should be later than commit at start of test {commit_seqno}"
+
+    main_ledger_dir = new_node.get_main_ledger_dir()
+    chunks = [f for f in os.listdir(main_ledger_dir) if f.endswith(".committed")]
+    chunks = sorted(chunks, key=lambda chunk: ccf.ledger.range_from_filename(chunk)[0])
+    init_index = ccf.ledger.range_from_filename(chunks[0])[0]
+    # And it does not have any ledger chunks predating the snapshot
+    assert (
+        init_index >= startup_seqno
+    ), f"New node has ledger chunks starting at {init_index}, should be later than startup seqno {startup_seqno}"
+
+    download_index = 1
+    LOG.info(
+        f"New node ledger chunks start at index {init_index}, downloading missing chunks"
+    )
+    # But we can download all missing chunks from other nodes
+    while download_index < init_index:
+        with new_node.client(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        ) as c:
+            r = c.head(
+                f"/node/ledger_chunk?since={download_index}"
+                "&include_committed_prefix=true",
+                allow_redirects=False,
+            )
+            assert r.status_code == http.HTTPStatus.TEMPORARY_REDIRECT.value, r
+            redirect_query = urllib.parse.parse_qs(
+                urllib.parse.urlparse(r.headers["Location"]).query
+            )
+            assert redirect_query == {
+                "since": [str(download_index)],
+                "include_committed_prefix": ["true"],
+            }, r
+
+            r = c.head(
+                f"/node/ledger_chunk?since={download_index}", allow_redirects=False
+            )
+            assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value, r
+            # Should redirect to any existing node
+            redirect_location = urllib.parse.urlparse(r.headers["Location"])
+            redirect_host = redirect_location.hostname
+            redirect_port = redirect_location.port
+
+            redirected_node = None
+            for node in network.get_joined_nodes():
+                node_host = node.get_public_rpc_host(
+                    interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+                )
+                node_port = node.get_public_rpc_port(
+                    interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+                )
+                if node_host == redirect_host and node_port == redirect_port:
+                    redirected_node = node
+                    break
+
+            assert (
+                redirected_node is not None
+            ), f"Ledger chunk redirect location {r.headers['Location']} does not match any known node"
+
+            assert (
+                redirected_node != new_node
+            ), "Ledger chunk redirect should not point to self"
+
+            r = c.get(
+                f"/node/ledger_chunk?since={download_index}", allow_redirects=True
+            )
+            chunk_name = os.path.basename(r.headers["x-ms-ccf-ledger-chunk-name"])
+            ledger_chunk_path = os.path.join(
+                # There may have been more than one redirect
+                primary.get_main_ledger_dir(),
+                chunk_name,
+            )
+            dled_chunk_digest = hashlib.sha256(r.body.data()).hexdigest()
+            with open(ledger_chunk_path, "rb") as f:
+                actual_chunk_digest = hashlib.sha256(f.read()).hexdigest()
+            assert (
+                dled_chunk_digest == actual_chunk_digest
+            ), f"Ledger chunk content for {chunk_name} does not match"
+            download_index = ccf.ledger.range_from_filename(chunk_name)[1] + 1
+            assert download_index is not None, chunk_name
 
 
 def run_file_operations(args):
@@ -264,15 +1951,12 @@ def run_file_operations(args):
         json.dump(service_data, ntf)
         ntf.flush()
 
-        args.max_msg_size_bytes = f"{100 * 1024}"  # 100KB
-
         with tempfile.TemporaryDirectory() as tmp_dir:
             txs = app.LoggingTxs("user0")
             with infra.network.network(
                 args.nodes,
                 args.binary_dir,
                 args.debug_nodes,
-                args.perf_nodes,
                 pdb=args.pdb,
                 txs=txs,
             ) as network:
@@ -288,9 +1972,11 @@ def run_file_operations(args):
                 test_save_committed_ledger_files(network, args)
                 test_parse_snapshot_file(network, args)
                 test_forced_ledger_chunk(network, args)
-                test_forced_snapshot(network, args)
-                test_large_snapshot(network, args)
+                test_empty_snapshot(network, args)
+                test_nulled_snapshot(network, args)
+                test_corrupt_snapshot_handling(network, args)
 
+                # Ensure that the network is still live
                 primary, _ = network.find_primary()
                 # Scoped transactions are not handled by historical range queries
                 network.stop_all_nodes(skip_verification=True)
@@ -299,12 +1985,43 @@ def run_file_operations(args):
                 args.common_read_only_ledger_dir = None  # Reset for future tests
 
 
-def run_tls_san_checks(args):
+def run_ledger_chunk_download(args):
     with infra.network.network(
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+        check_file_invariants=False,
+    ) as network:
+        network.start_and_open(args)
+        # Issue enough transactions to create multiple ledger chunks
+        network.txs.issue(network, number_txs=10)
+        test_ledger_chunk_access(network, args)
+        test_ledger_chunk_repr_digest(network, args)
+        test_ledger_chunk_redirect_recent(network, args)
+        test_ledger_chunk_redirect_gap(network, args)
+
+
+def run_committed_ledger_prefix_download(args):
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(args)
+        test_committed_ledger_prefix_access(network, args)
+
+
+def run_tls_san_checks(const_args):
+    args = copy.deepcopy(const_args)
+    args.label += "_tls_san"
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
         pdb=args.pdb,
     ) as network:
         network.start_and_open(args)
@@ -314,56 +2031,117 @@ def run_tls_san_checks(args):
 
         LOG.info("Check SAN value in TLS certificate")
         dummy_san = "*.dummy.com"
-        new_node = network.create_node(
-            infra.interfaces.HostSpec(
-                rpc_interfaces={
-                    infra.interfaces.PRIMARY_RPC_INTERFACE: infra.interfaces.RPCInterface(
-                        endorsement=infra.interfaces.Endorsement(
-                            authority=infra.interfaces.EndorsementAuthority.Node
-                        )
-                    )
-                }
-            )
+        host_spec = infra.interfaces.HostSpec()
+        host_spec.get_primary_interface().endorsement.authority = (
+            infra.interfaces.EndorsementAuthority.Node
         )
+        new_node = network.create_node(host_spec)
         args.subject_alt_names = [f"dNSName:{dummy_san}"]
-        network.join_node(new_node, args.package, args)
+        network.join_node(new_node, args.package, args, from_snapshot=False)
         sans = infra.crypto.get_san_from_pem_cert(new_node.get_tls_certificate_pem())
         assert len(sans) == 1, "Expected exactly one SAN"
         assert sans[0].value == dummy_san
 
-        LOG.info("A node started with no specified SAN defaults to public RPC host")
-        dummy_public_rpc_host = "123.123.123.123"
+        LOG.info("A node started with no specified SAN defaults to public RPC host(s)")
+        dummy_public_rpc_hosts = set()
         args.subject_alt_names = []
 
-        new_node = network.create_node(
-            infra.interfaces.HostSpec(
-                rpc_interfaces={
-                    infra.interfaces.PRIMARY_RPC_INTERFACE: infra.interfaces.RPCInterface(
-                        public_host=dummy_public_rpc_host,
-                        endorsement=infra.interfaces.Endorsement(
-                            authority=infra.interfaces.EndorsementAuthority.Node
-                        ),
-                    )
-                }
-            )
-        )
-        network.join_node(new_node, args.package, args)
+        for i, interface in enumerate(host_spec.rpc_interfaces.values()):
+            dummy_public_rpc_host = f"123.123.123.{i}"
+            interface.public_host = dummy_public_rpc_host
+            dummy_public_rpc_hosts.add(ipaddress.ip_address(dummy_public_rpc_host))
+
+        new_node = network.create_node(host_spec)
+        network.join_node(new_node, args.package, args, from_snapshot=False)
         # Cannot trust the node here as client cannot authenticate dummy public IP in cert
         with open(
             os.path.join(network.common_dir, f"{new_node.local_node_id}.pem"),
             encoding="utf-8",
         ) as self_signed_cert:
             sans = infra.crypto.get_san_from_pem_cert(self_signed_cert.read())
-        assert len(sans) == 1, "Expected exactly one SAN"
-        assert sans[0].value == ipaddress.ip_address(dummy_public_rpc_host)
+        assert len(sans) == len(
+            dummy_public_rpc_hosts
+        ), f"Expected {len(dummy_public_rpc_hosts)} SANs ({dummy_public_rpc_hosts}), found {len(sans)} ({sans})"
+        ip_sans = set(sans.get_values_for_type(x509.IPAddress))
+        assert (
+            ip_sans == dummy_public_rpc_hosts
+        ), f"Expected SANs do not match: {ip_sans} vs {dummy_public_rpc_hosts}"
 
 
-def run_config_timeout_check(args):
+def run_tls_san_join_mismatch(const_args):
+    # Since the join client was migrated to libcurl, a joining node verifies
+    # (CURLOPT_SSL_VERIFYHOST=2) that the target node's certificate covers the
+    # address it dialled. Check that a join is rejected when the dialled address
+    # is absent from the target node's certificate SANs, even though the service
+    # certificate itself is trusted. This exercises the hostname/SAN check
+    # specifically, as opposed to the untrusted-service-certificate path already
+    # covered by reconfiguration.test_add_node_invalid_service_cert.
+    args = copy.deepcopy(const_args)
+    args.label += "_tls_san_join_mismatch"
+
+    # Bind the target node's primary and file-serving interfaces to distinct
+    # loopback addresses, and restrict the node certificate SANs to the primary
+    # address only. The test harness reaches the node through the primary
+    # interface (in the SAN, so trusted), while a joining node dials the
+    # file-serving interface (not in the SAN, so rejected).
+    primary_host = "127.0.0.1"
+    file_serving_host = "127.0.0.2"
+
+    args.nodes = infra.e2e_args.nodes(args, 1)
+    target_spec = args.nodes[0]
+    target_spec.get_primary_interface().host = primary_host
+    target_spec.get_file_serving_interface().host = file_serving_host
+    args.subject_alt_names = [f"iPAddress:{primary_host}"]
+
     with infra.network.network(
-        ["local://localhost"],
+        args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
+        pdb=args.pdb,
+    ) as network:
+        network.start_and_open(args)
+
+        LOG.info(
+            "A join is rejected when the target address is not covered by the "
+            "target node's certificate SANs"
+        )
+        new_node = network.create_node()
+        try:
+            network.join_node(
+                new_node,
+                args.package,
+                args,
+                timeout=3,
+                stop_on_error=True,
+                from_snapshot=False,
+                # Skip the proactive snapshot fetch so the node goes straight to
+                # the join request. The snapshot fetch treats a certificate
+                # verification failure as a retryable (non-fatal) error, whereas
+                # the join request itself treats it as fatal, which is the
+                # behaviour under test.
+                fetch_recent_snapshot=False,
+            )
+        except infra.network.ServiceCertificateInvalid:
+            LOG.info(
+                f"Node {new_node.local_node_id} correctly rejected the target, "
+                "whose certificate SANs do not cover the dialled file-serving "
+                "address (VERIFYHOST)"
+            )
+        else:
+            assert False, (
+                f"Node {new_node.local_node_id} unexpectedly joined despite a "
+                "target certificate SAN mismatch"
+            )
+
+
+def run_config_timeout_check(const_args):
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.nodes(args, 1)
+    args.label += "_config_timeout"
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
         pdb=args.pdb,
     ) as network:
         network.start_and_open(args)
@@ -387,70 +2165,230 @@ def run_config_timeout_check(args):
     LOG.info(f"Attempt to start node without a config under {start_node_path}")
     config_timeout = 10
     env = {}
-    if args.enclave_platform == "snp":
-        env = snp.get_aci_env()
-    env["ASAN_OPTIONS"] = "alloc_dealloc_mismatch=0"
 
-    proc = subprocess.Popen(
-        [
-            "./cchost",
-            "--config",
-            "0.config.json",
-            "--config-timeout",
-            f"{config_timeout}s",
-            "--enclave-file",
-            node.remote.enclave_file,
-        ],
-        cwd=start_node_path,
-        env=env,
-        stdout=open(os.path.join(start_node_path, "out"), "wb"),
-        stderr=open(os.path.join(start_node_path, "err"), "wb"),
-    )
-    time.sleep(2)
-    LOG.info("Copy a partial config")
-    # Replace it with a prefix
-    with open(os.path.join(start_node_path, "0.config.json"), "w") as f:
-        f.write("{")
-    time.sleep(2)
-    LOG.info("Move a full config back")
-    shutil.copy(
-        os.path.join(start_node_path, "0.config.json.bak"),
-        os.path.join(start_node_path, "0.config.json"),
-    )
-    LOG.info(f"Wait out the rest of the {config_timeout}s timeout")
-    time.sleep(config_timeout)
-    LOG.info("Check node")
-    assert proc.poll() is None, "Node process should still be running"
-    assert os.path.exists(os.path.join(start_node_path, "service_cert.pem"))
-    proc.terminate()
-    proc.wait()
+    if infra.platform_detection.is_snp():
+        env.update(snp.get_aci_env())
+
+    with (
+        open(os.path.join(start_node_path, "out"), "wb") as stdout,
+        open(os.path.join(start_node_path, "err"), "wb") as stderr,
+    ):
+        proc = subprocess.Popen(
+            [
+                os.path.join(".", os.path.basename(node.remote.BIN)),
+                "--config",
+                "0.config.json",
+                "--config-timeout",
+                f"{config_timeout}s",
+            ],
+            cwd=start_node_path,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+        )
+        time.sleep(2)
+        LOG.info("Copy a partial config")
+        # Replace it with a prefix
+        with open(os.path.join(start_node_path, "0.config.json"), "w") as f:
+            f.write("{")
+        time.sleep(2)
+        LOG.info("Move a full config back")
+        shutil.copy(
+            os.path.join(start_node_path, "0.config.json.bak"),
+            os.path.join(start_node_path, "0.config.json"),
+        )
+        LOG.info(f"Wait out the rest of the {config_timeout}s timeout")
+        time.sleep(config_timeout)
+        LOG.info("Check node")
+        assert proc.poll() is None, "Node process should still be running"
+        assert os.path.exists(os.path.join(start_node_path, "service_cert.pem"))
+        proc.terminate()
+        proc.wait()
 
 
-def run_sighup_check(args):
+def run_sighup_check(const_args):
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.nodes(args, 1)
+    args.label += "_sighup_check"
     with infra.network.network(
-        ["local://localhost"],
+        args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
     ) as network:
         network.start_and_open(args)
         network.nodes[0].remote.remote.hangup()
-        time.sleep(1)
+        time.sleep(5)
         assert network.nodes[0].remote.check_done(), "Node should have exited"
         out, _ = network.nodes[0].remote.get_logs()
         with open(out, "r") as outf:
             lines = outf.readlines()
-        assert any("Hangup: " in line for line in lines), "Hangup should be logged"
+        assert any("SIGHUP: " in line for line in lines), "Hangup should be logged"
+
+
+def run_runtime_lifecycle_checks(args):
+    def assert_log_order(output, *messages):
+        offset = 0
+        for message in messages:
+            index = output.find(message, offset)
+            assert (
+                index >= 0
+            ), f"Expected {message!r} after offset {offset} in:\n{output}"
+            offset = index + len(message)
+
+    shutdown_sequence = (
+        "Created new node",
+        "Output self-signed node certificate",
+        "Entering event loop",
+        "SIGTERM: Shutting down enclave gracefully...",
+        "Stopping RPC transports",
+        "Enclave stopped successfully. Stopping host...",
+        "Exited event loop",
+        "Shutting down enclave",
+        "cleanup iteration(s)",
+    )
+
+    with infra.network.network(
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
+    ) as network:
+        network.start_and_open(args)
+        node = network.nodes[0]
+        node.stop()
+        out, _ = node.remote.get_logs()
+        with open(out, encoding="utf-8") as f:
+            output = f.read()
+        assert_log_order(output, *shutdown_sequence)
+        assert "Failed to close uv loop" not in output, output
+
+        root = pathlib.Path(node.remote.remote.root).resolve()
+        with open(root / "0.config.json", encoding="utf-8") as f:
+            original_config = json.load(f)
+        env = os.environ.copy()
+        if infra.platform_detection.is_snp():
+            env.update(snp.get_aci_env())
+
+        for failure in ("bind", "output", "pending_join", "startup_signal"):
+            with tempfile.TemporaryDirectory(dir=root) as temp:
+                temp = pathlib.Path(temp).resolve()
+                config = copy.deepcopy(original_config)
+                config["ledger"]["directory"] = str(temp / "ledger")
+                config["snapshots"]["directory"] = str(temp / "snapshots")
+                config["output_files"]["pid_file"] = str(temp / "node.pid")
+                with socket.socket() as blocker:
+                    if failure == "bind":
+                        blocker.bind(("127.0.0.1", 0))
+                        blocker.listen()
+                        interface = next(
+                            iter(config["network"]["rpc_interfaces"].values())
+                        )
+                        interface["bind_address"] = (
+                            f"127.0.0.1:{blocker.getsockname()[1]}"
+                        )
+                    elif failure == "output":
+                        config["output_files"]["node_certificate_file"] = str(temp)
+                    elif failure == "startup_signal":
+                        os.mkfifo(temp / "certificate")
+                        config["output_files"]["node_certificate_file"] = str(
+                            temp / "certificate"
+                        )
+                    else:
+                        blocker.bind(("127.0.0.1", 0))
+                        blocker.listen()
+                        blocker.settimeout(10)
+                        config["command"]["type"] = "Join"
+                        config["command"]["join"][
+                            "target_rpc_address"
+                        ] = f"127.0.0.1:{blocker.getsockname()[1]}"
+                        config["command"]["join"]["fetch_recent_snapshot"] = False
+                    config_path = temp / "config.json"
+                    config_path.write_text(json.dumps(config), encoding="utf-8")
+                    command = [
+                        str(root / os.path.basename(node.remote.BIN)),
+                        "--config",
+                        str(config_path),
+                        "--log-level",
+                        "Trace",
+                    ]
+                    if failure in ("pending_join", "startup_signal"):
+                        with (
+                            open(temp / "out", "w+", encoding="utf-8") as out,
+                            subprocess.Popen(
+                                command,
+                                cwd=root,
+                                env=env,
+                                stdout=out,
+                                stderr=subprocess.STDOUT,
+                            ) as proc,
+                        ):
+                            try:
+                                if failure == "pending_join":
+                                    # Leave TLS incomplete to exercise curl
+                                    # cancellation while NodeState is alive.
+                                    connection, _ = blocker.accept()
+                                    with connection:
+                                        proc.send_signal(signal.SIGTERM)
+                                        assert proc.wait(timeout=30) == 0
+                                else:
+                                    # FIFO output holds startup before uv_run.
+                                    # Release it only after sending the signal.
+                                    deadline = time.monotonic() + 30
+                                    while "Created new node" not in (
+                                        temp / "out"
+                                    ).read_text(encoding="utf-8"):
+                                        assert proc.poll() is None
+                                        assert time.monotonic() < deadline
+                                        time.sleep(0.01)
+                                    proc.send_signal(signal.SIGTERM)
+                                    with os.fdopen(
+                                        os.open(
+                                            temp / "certificate",
+                                            os.O_RDONLY | os.O_NONBLOCK,
+                                        ),
+                                        "rb",
+                                    ):
+                                        assert proc.wait(timeout=30) == 0
+                            finally:
+                                if proc.poll() is None:
+                                    proc.kill()
+                                    proc.wait()
+                            out.seek(0)
+                            output = out.read()
+                        assert_log_order(output, *shutdown_sequence)
+                        assert "Failed to close uv loop" not in output, output
+                        continue
+                    result = subprocess.run(
+                        command,
+                        cwd=root,
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                assert result.returncode == 1, result
+                if failure == "output":
+                    startup_sequence = (
+                        "Created new node",
+                        "Error starting node: Failed to open file",
+                    )
+                else:
+                    startup_sequence = ("Error starting node:",)
+                    assert "Created new node" not in result.stdout, result
+                assert_log_order(
+                    result.stdout,
+                    *startup_sequence,
+                    "Shutting down enclave",
+                    "cleanup iteration(s)",
+                )
+                assert "Entering event loop" not in result.stdout, result
+                assert "Failed to close uv loop" not in result.stdout, result
 
 
 def run_configuration_file_checks(args):
     LOG.info(
         f"Verifying JSON configuration samples in {args.config_samples_dir} directory"
     )
-    CCHOST_BINARY_NAME = "cchost"
-
-    bin_path = infra.path.build_bin_path(CCHOST_BINARY_NAME, binary_dir=args.binary_dir)
+    bin_path = args.package
 
     config_files_to_check = [
         os.path.join(args.config_samples_dir, c)
@@ -460,10 +2398,141 @@ def run_configuration_file_checks(args):
     for config in config_files_to_check:
         cmd = [bin_path, f"--config={config}", "--check"]
         rc = infra.proc.ccall(
-            *cmd, env={"ASAN_OPTIONS": "alloc_dealloc_mismatch=0"}
+            *cmd,
         ).returncode
         assert rc == 0, f"Failed to check configuration: {rc}"
         LOG.success(f"Successfully check sample configuration file {config}")
+
+        with open(config, encoding="utf-8") as config_file:
+            config_json = json.load(config_file)
+
+        for worker_threads, valid in (
+            (0, True),
+            (1, True),
+            (65533, True),
+            (0.0, True),
+            (1.0, True),
+            (65533.0, True),
+            (-1, False),
+            (-1.0, False),
+            (1.5, False),
+            (65534, False),
+            (65534.0, False),
+            (1e20, False),
+            ("1", False),
+            (True, False),
+            (None, False),
+        ):
+            worker_config = copy.deepcopy(config_json)
+            worker_config["worker_threads"] = worker_threads
+            with tempfile.NamedTemporaryFile(mode="w+") as temp_config:
+                json.dump(worker_config, temp_config)
+                temp_config.flush()
+                for flags in (["--check"],) if valid else (["--check"], []):
+                    result = infra.proc.ccall(
+                        bin_path, f"--config={temp_config.name}", *flags
+                    )
+                    if valid:
+                        assert result.returncode == 0, result
+                    else:
+                        assert result.returncode != 0, result
+                        output = result.stdout + result.stderr
+                        assert (
+                            b"Error validating JSON schema for configuration file"
+                            in output
+                        ), result
+                        assert b'context: <root>["worker_threads"]' in output, result
+
+        for timeout in ("0s", "0us", "1us", "500us", "999us", "1000us", "1ms"):
+            valid = timeout in ("0s", "0us", "1000us", "1ms")
+            config_json["pending_node_timeout"] = timeout
+            with tempfile.NamedTemporaryFile(mode="w+") as temp_config:
+                json.dump(config_json, temp_config)
+                temp_config.flush()
+                for flags in (["--check"],) if valid else (["--check"], []):
+                    result = infra.proc.ccall(
+                        bin_path, f"--config={temp_config.name}", *flags
+                    )
+                    if valid:
+                        assert result.returncode == 0, result
+                    else:
+                        assert result.returncode != 0, result
+                        assert (
+                            b"pending_node_timeout must be 0s or at least 1ms"
+                            in result.stdout + result.stderr
+                        ), result
+
+
+def run_limit_config_checks(args):
+    with open(
+        os.path.join(args.config_samples_dir, "minimal_config.json"), encoding="utf-8"
+    ) as config_file:
+        base = json.load(config_file)
+
+    legacy = {
+        "memory": {
+            "circuit_size": "3MB",
+            "max_msg_size": "64MB",
+            "max_fragment_size": "256KB",
+        }
+    }
+    cases = [
+        ({}, True),
+        ({**legacy, "ledger": {"max_transaction_size": "64MB"}}, True),
+        ({"ledger": {"max_read_size": "64MB", "max_transaction_size": "64MB"}}, True),
+        (
+            {"ledger": {"max_read_size": "64MB", "max_transaction_size": "67108865B"}},
+            False,
+        ),
+        (
+            {
+                **legacy,
+                "ledger": {
+                    "max_read_size": "32MB",
+                    "max_transaction_size": "32MB",
+                    "max_pending_append_bytes": "0",
+                },
+                "node_to_node": {"max_message_size": "16MB"},
+            },
+            True,
+        ),
+    ]
+    for settings, valid in cases:
+        config = copy.deepcopy(base)
+        config.update(settings)
+        with tempfile.NamedTemporaryFile(mode="w+") as temp_config:
+            json.dump(config, temp_config)
+            temp_config.flush()
+            for flags in (["--check"],) if valid else (["--check"], []):
+                result = infra.proc.ccall(
+                    args.package, f"--config={temp_config.name}", *flags
+                )
+                output = result.stdout + result.stderr
+                if not valid:
+                    assert result.returncode != 0, result
+                    assert b"ledger.max_read_size" in output, result
+                    continue
+                assert result.returncode == 0, result
+                memory = settings.get("memory", {})
+                for field in ("circuit_size", "max_msg_size", "max_fragment_size"):
+                    notice = f"memory.{field} is deprecated".encode()
+                    assert (notice in output) == (field in memory), result
+                if "max_msg_size" in memory:
+                    read_state = (
+                        "ignored"
+                        if "max_read_size" in settings.get("ledger", {})
+                        else "used"
+                    )
+                    frame_state = (
+                        "ignored"
+                        if "max_message_size" in settings.get("node_to_node", {})
+                        else "used"
+                    )
+                    assert f"{read_state} for ledger.max_read_size".encode() in output
+                    assert (
+                        f"{frame_state} for node_to_node.max_message_size".encode()
+                        in output
+                    )
 
 
 def run_preopen_readiness_check(args):
@@ -471,7 +2540,6 @@ def run_preopen_readiness_check(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
     ) as network:
         network.start(args)
@@ -494,7 +2562,6 @@ def run_pid_file_check(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
     ) as network:
         network.start_and_open(args)
@@ -510,7 +2577,7 @@ def run_pid_file_check(args):
         start = time.time()
         LOG.info("Wait for node to shut down")
         while time.time() - start < timeout:
-            if node.remote.check_done():
+            if node.remote.check_done(timeout=0):
                 break
             time.sleep(0.1)
         out, _ = node.remote.get_logs()
@@ -523,12 +2590,14 @@ def run_pid_file_check(args):
         network.ignoring_shutdown_errors = True
 
 
-def run_max_uncommitted_tx_count(args):
+def run_max_uncommitted_tx_count(const_args):
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.nodes(args, 2)
+    args.label += "_max_uncommitted_tx"
     with infra.network.network(
-        ["local://localhost", "local://localhost"],
+        args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
     ) as network:
         uncommitted_cap = 20
@@ -564,12 +2633,3111 @@ def run_max_uncommitted_tx_count(args):
             assert r.status_code == http.HTTPStatus.OK.value, r
 
 
-def run(args):
-    run_max_uncommitted_tx_count(args)
+def run_service_subject_name_check(args):
+    expected_subject = x509.Name(
+        [
+            x509.NameAttribute(x509.NameOID.COMMON_NAME, "https://this.test.service"),
+            x509.NameAttribute(x509.NameOID.ORGANIZATION_NAME, "CCF User"),
+        ]
+    )
+
+    def service_subject(network):
+        with open(network.cert_path, "rb") as cert_file:
+            cert = x509.load_pem_x509_certificate(cert_file.read(), default_backend())
+        primary, _ = network.find_primary()
+        with primary.client() as c:
+            r = c.get("/node/network")
+            assert r.status_code == http.HTTPStatus.OK.value, r
+            cert_pem = r.body.json()["service_certificate"]
+            node_cert = x509.load_pem_x509_certificate(
+                cert_pem.encode(), default_backend()
+            )
+        assert node_cert.subject == cert.subject, (node_cert.subject, cert.subject)
+        return cert.subject
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        network.start_and_open(
+            args,
+            service_subject_name="CN=https://this.test.service,O=CCF User",
+            pq_service_cert_file="custom_pq_service_cert.pem",
+        )
+        assert os.path.basename(network.pq_cert_path) == "custom_pq_service_cert.pem"
+        assert "pq_service_cert.pem" not in network.nodes[0].remote.remote.list_files()
+        subject = service_subject(network)
+        assert subject == expected_subject, subject
+
+        LOG.info("Renewing service certificate preserves its subject name")
+        primary, _ = network.find_primary()
+        renewed_validity_days = args.maximum_service_certificate_validity_days
+        assert renewed_validity_days != args.initial_service_cert_validity_days
+        network.consortium.set_service_certificate_validity(
+            primary,
+            valid_from=str(datetime.now(UTC)),
+            validity_period_days=renewed_validity_days,
+        )
+        network.verify_service_certificate_validity_period(renewed_validity_days)
+        network.refresh_service_identity_file(args)
+        renewed_subject = service_subject(network)
+        assert renewed_subject.public_bytes() == subject.public_bytes(), renewed_subject
+
+
+def run_cose_only_mode_upgrade(args):
+
+    def get_service_key(network):
+        service_cert_path = os.path.join(network.common_dir, "service_cert.pem")
+        with open(service_cert_path, "rb") as service_cert_file:
+            service_cert = x509.load_pem_x509_certificate(
+                service_cert_file.read(), default_backend()
+            )
+        return service_cert.public_key()
+
+    def verify_receipt_available(node, view, seqno, service_key, expect_regular=True):
+        with node.client("user0") as c:
+            infra.commit.wait_for_commit(c, seqno, view, timeout=3)
+
+            start_time = time.time()
+            while time.time() < start_time + 3:
+                rc = c.get(f"/node/receipt?transaction_id={view}.{seqno}")
+                if rc.status_code != http.HTTPStatus.ACCEPTED:
+                    break
+                time.sleep(0.1)
+
+            if expect_regular:
+                assert (
+                    rc.status_code == http.HTTPStatus.OK
+                ), f"Regular receipt should be available, got {rc.status_code}"
+            else:
+                assert (
+                    rc.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR
+                ), f"Regular receipt should fail on COSE-only network, got {rc.status_code}"
+
+            start_time = time.time()
+            while time.time() < start_time + 3:
+                cose_rc = c.get(f"/node/receipt/cose?transaction_id={view}.{seqno}")
+                if cose_rc.status_code != http.HTTPStatus.ACCEPTED:
+                    break
+                time.sleep(0.1)
+
+            assert (
+                cose_rc.status_code == http.HTTPStatus.OK
+            ), f"COSE receipt should be available, got {cose_rc.status_code}"
+            ccf.receipt.verify_cose(cose_rc.body.data(), service_key, b"\0" * 32)
+
+        LOG.info(
+            f"Receipt check OK for {view}.{seqno} "
+            f"(regular={'available' if expect_regular else 'unavailable'})"
+        )
+
+    def assert_ledger_cose_only_after(node, start_seqno):
+        current_ledger_dir, committed_ledger_dirs = node.get_ledger()
+        ledger = ccf.ledger.Ledger(
+            committed_ledger_dirs + [current_ledger_dir],
+            committed_only=False,
+            contiguous_suffix=True,
+        )
+
+        cose_sig_count = 0
+        for chunk in ledger:
+            for tx in chunk:
+                pd = tx.get_public_domain()
+                tables = pd.get_tables()
+                seqno = pd.get_seqno()
+
+                if seqno <= start_seqno:
+                    continue
+
+                assert ccf.signatures.SIGNATURE_TX_TABLE_NAME not in tables, (
+                    f"Found traditional (non-COSE) signature at seqno {seqno}, "
+                    f"expected COSE-only after seqno {start_seqno}"
+                )
+
+                if ccf.signatures.COSE_SIGNATURE_TX_TABLE_NAME in tables:
+                    cose_sig_count += 1
+
+        assert (
+            cose_sig_count > 0
+        ), "No COSE signatures found in ledger after old nodes were removed"
+        return cose_sig_count
+
+    def trust_package_host_data(network, primary, package):
+        host_data, _ = infra.utils.get_host_data_and_security_policy(
+            infra.platform_detection.get_platform(),
+            package,
+            binary_dir=nargs.binary_dir,
+        )
+        network.consortium.add_host_data(
+            primary,
+            infra.platform_detection.get_platform(),
+            host_data,
+        )
+
+    def replace_nodes(network, old_nodes, new_package):
+        new_nodes = []
+        for _ in range(len(old_nodes)):
+            new_node = network.create_node()
+            network.join_node(new_node, new_package, nargs, from_snapshot=False)
+            network.trust_node(new_node, nargs)
+            new_nodes.append(new_node)
+
+        network.txs.issue(network, number_txs=5)
+
+        new_primary = new_nodes[0]
+        for old_node in old_nodes:
+            network.retire_node(new_primary, old_node)
+            old_node.stop()
+
+        return new_nodes
+
+    nargs = copy.deepcopy(args)
+    nargs.nodes = infra.e2e_args.max_nodes(nargs, f=0)
+
+    with infra.network.network(
+        nargs.nodes,
+        nargs.binary_dir,
+        nargs.debug_nodes,
+        pdb=nargs.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(nargs)
+
+        primary, _ = network.find_nodes()
+        dual_nodes = network.get_joined_nodes()
+        service_key = get_service_key(network)
+
+        # Verify both regular and COSE receipts work on the dual-signing network
+        LOG.info("Verifying both receipt types work on dual-signing network")
+        pre_idx = network.txs.idx + 1
+        network.txs.issue(network, number_txs=1)
+        pre_msg = network.txs.priv[pre_idx][0]
+        verify_receipt_available(
+            primary, pre_msg["view"], pre_msg["seqno"], service_key, expect_regular=True
+        )
+
+        # ---- Phase 1: Dual -> COSE-only (allow dual joiners) ----
+        cose_only_allow_dual_package = nargs.package + "_cose_only_allow_join_dual"
+        LOG.info("Phase 1: Replacing dual nodes with COSE-only (allow dual joiners)")
+        trust_package_host_data(network, primary, cose_only_allow_dual_package)
+        cose_nodes = replace_nodes(network, dual_nodes, cose_only_allow_dual_package)
+
+        # Record the seqno after all dual nodes are removed
+        cose_primary = cose_nodes[0]
+        with cose_primary.client() as c:
+            r = c.get("/node/state")
+            cose_only_start_seqno = r.body.json()["last_signed_seqno"]
+        LOG.info(
+            f"Dual nodes removed. COSE-only starts after seqno {cose_only_start_seqno}"
+        )
+
+        network.txs.issue(network, number_txs=3)
+
+        # Verify a Dual joiner can still join (allow_dual_signing_joiner=true)
+        LOG.info("Verifying Dual joiner can still join COSE-only (allow dual) network")
+        dual_joiner = network.create_node()
+        network.join_node(dual_joiner, nargs.package, nargs, from_snapshot=False)
+        network.trust_node(dual_joiner, nargs)
+        LOG.success("Dual joiner successfully joined COSE-only network")
+
+        # Remove the Dual joiner
+        cose_primary, _ = network.find_primary()
+        network.retire_node(cose_primary, dual_joiner)
+        dual_joiner.stop()
+
+        # Verify receipts
+        LOG.info("Verifying receipts after phase 1")
+        cose_primary, _ = network.find_primary()
+        post_msg = network.txs.priv[network.txs.idx][0]
+        verify_receipt_available(
+            cose_primary,
+            pre_msg["view"],
+            pre_msg["seqno"],
+            service_key,
+            expect_regular=True,
+        )
+        verify_receipt_available(
+            cose_primary,
+            post_msg["view"],
+            post_msg["seqno"],
+            service_key,
+            expect_regular=False,
+        )
+
+        # ---- Phase 2: COSE-only (allow dual) -> COSE-only (disallow dual) ----
+        cose_only_package = nargs.package + "_cose_only"
+        LOG.info("Phase 2: Replacing with COSE-only (disallow dual joiners)")
+        trust_package_host_data(network, cose_primary, cose_only_package)
+        replace_nodes(network, cose_nodes, cose_only_package)
+
+        network.txs.issue(network, number_txs=3)
+
+        # Verify a Dual joiner is now rejected
+        LOG.info("Verifying Dual joiner is rejected by COSE-only-no-dual network")
+        rejected_joiner = network.create_node()
+        try:
+            network.join_node(
+                rejected_joiner, nargs.package, nargs, timeout=10, from_snapshot=False
+            )
+            network.trust_node(rejected_joiner, nargs)
+            assert False, "Dual joiner should have been rejected"
+        except Exception as e:
+            LOG.success(f"Dual joiner correctly rejected: {e}")
+
+        # Verify COSE receipts still work
+        LOG.info("Verifying COSE receipts after phase 2")
+        no_dual_primary, _ = network.find_primary()
+        final_msg = network.txs.priv[network.txs.idx][0]
+        verify_receipt_available(
+            no_dual_primary,
+            final_msg["view"],
+            final_msg["seqno"],
+            service_key,
+            expect_regular=False,
+        )
+
+        # Verify ledger is COSE-only signed
+        LOG.info("Verifying ledger is COSE-only signed")
+        network.wait_for_all_nodes_to_commit(primary=no_dual_primary)
+        cose_sig_count = assert_ledger_cose_only_after(
+            no_dual_primary, cose_only_start_seqno
+        )
+
+        LOG.success(
+            f"COSE-only mode upgrade test passed. "
+            f"Found {cose_sig_count} COSE-only signatures after seqno {cose_only_start_seqno}"
+        )
+
+
+def run_cose_signatures_config_check(args):
+    nargs = copy.deepcopy(args)
+    nargs.nodes = infra.e2e_args.max_nodes(nargs, f=0)
+
+    with infra.network.network(
+        nargs.nodes,
+        nargs.binary_dir,
+        nargs.debug_nodes,
+        pdb=nargs.pdb,
+    ) as network:
+        network.start_and_open(
+            nargs,
+            cose_signatures_issuer="test.issuer.example.com",
+            cose_signatures_subject="test.subject",
+        )
+
+        for node in network.get_joined_nodes():
+            with node.client("user0") as client:
+                r = client.get("/commit")
+                assert r.status_code == http.HTTPStatus.OK
+                txid = TxID.from_str(r.body.json()["transaction_id"])
+                max_retries = 10
+                for _ in range(max_retries):
+                    response = client.get(
+                        "/log/public/cose_signature",
+                        headers={
+                            infra.clients.CCF_TX_ID_HEADER: f"{txid.view}.{txid.seqno}"
+                        },
+                    )
+
+                    if response.status_code == http.HTTPStatus.OK:
+                        signature = response.body.json()["cose_signature"]
+                        signature = base64.b64decode(signature)
+                        signature_filename = os.path.join(
+                            network.common_dir, f"cose_signature_{txid}.cose"
+                        )
+                        with open(signature_filename, "wb") as f:
+                            f.write(signature)
+                        sig = cbor2.loads(signature)
+                        assert sig.tag == 18
+                        phdr = cbor2.loads(sig.value[0])
+                        assert 15 in phdr, "CWT_Claims"
+                        assert phdr[15][1] == "test.issuer.example.com"
+                        assert phdr[15][2] == "test.subject"
+                        assert sig.value[2] is None, "Detached payload"
+                        LOG.debug(
+                            "Well-formed COSE signature schema for issuer and subject"
+                        )
+                        break
+                    elif response.status_code == http.HTTPStatus.ACCEPTED:
+                        LOG.debug(f"Transaction {txid} accepted, retrying")
+                        time.sleep(0.1)
+                    else:
+                        LOG.error(f"Failed to get COSE signature for txid {txid}")
+                        break
+                else:
+                    assert (
+                        False
+                    ), f"Failed to get receipt for txid {txid} after {max_retries} retries"
+
+
+def run_late_mounted_ledger_check(args):
+    nargs = copy.deepcopy(args)
+    nargs.nodes = infra.e2e_args.min_nodes(nargs, f=0)
+
+    with infra.network.network(
+        nargs.nodes,
+        nargs.binary_dir,
+        nargs.debug_nodes,
+        pdb=nargs.pdb,
+    ) as network:
+        network.start_and_open(
+            nargs,
+        )
+
+        primary, _ = network.find_primary()
+
+        msg_id = 42
+        msg = str(random.random())
+
+        # Write a new entry
+        with primary.client("user0") as c:
+            r = c.post(
+                "/app/log/private",
+                body={"id": msg_id, "msg": msg},
+            )
+            assert r.status_code == http.HTTPStatus.OK.value, r
+            c.wait_for_commit(r)
+
+            msg_seqno = r.seqno
+            msg_tx_id = f"{r.view}.{r.seqno}"
+
+        def try_historical_fetch(node, timeout=1):
+            with node.client("user0") as c:
+                start_time = time.time()
+                while time.time() < (start_time + timeout):
+                    r = c.get(
+                        f"/app/log/private/historical?id={msg_id}",
+                        headers={infra.clients.CCF_TX_ID_HEADER: msg_tx_id},
+                    )
+                    if r.status_code == http.HTTPStatus.OK:
+                        assert r.body.json()["msg"] == msg
+                        return True
+                    assert r.status_code == http.HTTPStatus.ACCEPTED
+                    time.sleep(0.2)
+            return False
+
+        # Confirm this can be retrieved with a historical query
+        assert try_historical_fetch(primary)
+
+        expected_errors = []
+
+        # Create a temporary directory to manually construct a ledger in
+        with tempfile.TemporaryDirectory() as temp_dir:
+            new_node = network.create_node()
+
+            snapshots_dir = network.get_committed_snapshots()
+            network.join_node(
+                new_node,
+                nargs.package,
+                nargs,
+                from_snapshot=True,
+                snapshots_dir=snapshots_dir,
+                copy_ledger=False,
+                common_read_only_ledger_dir=temp_dir,  # New node will try to read from temp directory
+            )
+            network.trust_node(new_node, args)
+
+            # Due to copy_ledger=False, this new node cannot access this historical entry
+            assert not try_historical_fetch(new_node)
+            expected_errors.append(f"Cannot find ledger file for seqno {msg_seqno}")
+
+            # Gather the source files that the operator should backfill
+            src_ledger_dir = primary.remote.ledger_paths()[0]
+            dst_files = {
+                os.path.join(temp_dir, filename): os.path.join(src_ledger_dir, filename)
+                for filename in os.listdir(src_ledger_dir)
+            }
+
+            # Create empy files in the new node's directory, with the correct names
+            for dst_path in dst_files:
+                with open(dst_path, "wb") as f:
+                    pass
+
+            # Historical query still fails, but node survives
+            assert not try_historical_fetch(new_node)
+            expected_errors.append("Failed to read positions offset from ledger file")
+
+            # Create files of the correct size, but filled with zeros
+            for dst_path, src_path in dst_files.items():
+                with open(dst_path, "wb") as f:
+                    f.write(bytes(os.path.getsize(src_path)))
+
+            # Historical query still fails, but node survives
+            assert not try_historical_fetch(new_node)
+            expected_errors.append("cannot be read: invalid table offset (0)")
+
+            # Write an invalid table offset at the start of each file
+            for dst_path, src_path in dst_files.items():
+                with open(dst_path, "r+b") as f:
+                    f.seek(0)
+                    size = os.path.getsize(src_path)
+                    f.write(struct.pack("<Q", size + 1))
+
+            # Historical query still fails, but node survives
+            assert not try_historical_fetch(new_node)
+            expected_errors.append("greater than total file size")
+
+            # Copy correct files
+            for dst_path, src_path in dst_files.items():
+                with open(src_path, "rb") as src, open(dst_path, "wb") as dst:
+                    dst.write(src.read())
+
+            # Historical query now passes
+            assert try_historical_fetch(new_node)
+
+            # Remove node
+            network.retire_node(primary, new_node)
+            new_node.stop()
+
+            # Check node output for expected errors
+            out_path, _ = new_node.get_logs()
+            with open(out_path, "r", encoding="utf-8") as output:
+                for line in output:
+                    expected_errors = [
+                        error for error in expected_errors if error not in line
+                    ]
+                    if len(expected_errors) == 0:
+                        break
+                else:
+                    LOG.error(
+                        "Expected to find following error messages in node output:"
+                    )
+                    for error in expected_errors:
+                        LOG.error(f"  {error}")
+                    raise AssertionError(expected_errors)
+
+
+def run_empty_ledger_dir_check(args):
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        check_file_invariants=False,
+    ) as network:
+        LOG.info("Check that empty ledger directory is handled correctly")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            LOG.debug(f"Using {tmp_dir} as ledger directory")
+
+            dir_name = os.path.basename(tmp_dir)
+
+            # Check tmp_dir is indeed empty
+            assert len(os.listdir(tmp_dir)) == 0, tmp_dir
+
+            # Start network, this should not fail
+            network.start_and_open(args, ledger_dir=tmp_dir)
+            primary, _ = network.find_primary()
+            network.stop_all_nodes()
+
+            # Now write a file in the directory
+            with open(os.path.join(tmp_dir, "ledger_10_15.committed"), "wb") as f:
+                f.write(b"bar")
+            network.skip_verify_chunking = True
+
+            # Start new network, this should fail
+            try:
+                network.start(args, ledger_dir=tmp_dir)
+            except Exception as start_error:
+                LOG.debug(f"Ignoring expected network start failure: {start_error}")
+                network.ignore_error_pattern_on_shutdown(
+                    "On start, ledger directory should not exist or be empty"
+                )
+
+            # Check that the node has failed with the expected error message
+            if not primary.check_log_for_error_message(
+                f"On start, ledger directory should not exist or be empty ({dir_name})"
+            ):
+                raise AssertionError(
+                    f"Expected node error message with non-empty ledger directory {dir_name}"
+                )
+
+
+def run_initial_uvm_descriptor_checks(const_args):
+    args = copy.deepcopy(const_args)
+    args.label += "_uvm_descriptor"
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        LOG.info("Start a network and stop it")
+        network.start_and_open(args)
+        primary, _ = network.find_primary()
+
+        LOG.info("Fetch current join policy to get UVM endorsement values")
+        with primary.api_versioned_client(api_version=args.gov_api_version) as uc:
+            r = uc.get("/gov/service/join-policy")
+            assert r.status_code == http.HTTPStatus.OK, r
+            snp_policy = r.body.json()["snp"]
+            uvm_endorsements = snp_policy["uvmEndorsements"]
+            assert len(uvm_endorsements) == 1, uvm_endorsements
+            did = next(iter(uvm_endorsements.keys()))
+            feeds = uvm_endorsements[did]
+            assert len(feeds) == 1, feeds
+            feed = next(iter(feeds.keys()))
+            svn = int(feeds[feed]["svn"])
+            LOG.info(f"Current UVM endorsement: did={did} feed={feed} svn={svn}")
+
+        bumped_svn = str(svn + 10)
+        LOG.info(
+            f"Proposing UVM endorsement with bumped SVN: did={did} feed={feed} svn={bumped_svn}"
+        )
+        network.consortium.add_snp_uvm_endorsement(primary, did, feed, bumped_svn)
+
+        network_service_identity_file, _ = network.save_service_identity_to_file()
+        snapshots_dir = network.get_committed_snapshots(primary)
+        network.stop_all_nodes()
+        LOG.info("Check that the a UVM descriptor is present")
+
+        ledger_dirs = primary.remote.ledger_paths()
+        ledger = ccf.ledger.Ledger(ledger_dirs, contiguous_suffix=True)
+        first_chunk = next(iter(ledger))
+        first_tx = next(iter(first_chunk))
+        tables = first_tx.get_public_domain().get_tables()
+        endorsements = tables["public:ccf.gov.nodes.snp.uvm_endorsements"]
+        assert len(endorsements) == 1, endorsements
+        (key,) = endorsements.keys()
+        assert key.startswith(b"did:x509:"), key
+        LOG.info(f"Initial UVM endorsement found in ledger: {endorsements[key]}")
+
+        LOG.info("Start a recovery network and stop it")
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+        recovered_network_args = copy.deepcopy(args)
+        recovered_network_args.label += "_recovery"
+
+        with infra.network.network(
+            recovered_network_args.nodes,
+            recovered_network_args.binary_dir,
+            recovered_network_args.debug_nodes,
+            existing_network=network,
+        ) as recovered_network:
+
+            recovered_network_args.previous_service_identity_file = (
+                network_service_identity_file
+            )
+            recovered_network.start_in_recovery(
+                recovered_network_args,
+                ledger_dir=current_ledger_dir,
+                committed_ledger_dirs=committed_ledger_dirs,
+                snapshots_dir=snapshots_dir,
+            )
+            recovered_primary, _ = recovered_network.find_primary()
+            LOG.info("Check that the UVM descriptor is present in the recovery tx")
+            recovery_seqno = None
+            with recovered_primary.client() as c:
+                r = c.get("/node/network").body.json()
+                recovery_seqno = int(r["current_service_create_txid"].split(".")[1])
+            recovered_network.stop_all_nodes()
+            ledger = ccf.ledger.Ledger(
+                recovered_primary.remote.ledger_paths(),
+                committed_only=False,
+                read_recovery_files=True,
+                contiguous_suffix=True,
+            )
+            for chunk in ledger:
+                _, chunk_end_seqno = chunk.get_seqnos()
+                # Open chunks have no end seqno, so they may contain the
+                # recovery transaction. Only skip chunks known to end earlier.
+                if chunk_end_seqno is not None and chunk_end_seqno < recovery_seqno:
+                    continue
+                for tx in chunk:
+                    tables = tx.get_public_domain().get_tables()
+                    seqno = tx.get_public_domain().get_seqno()
+                    if seqno < recovery_seqno:
+                        continue
+                    else:
+                        tables = tx.get_public_domain().get_tables()
+                        endorsements = tables[
+                            "public:ccf.gov.nodes.snp.uvm_endorsements"
+                        ]
+                        assert len(endorsements) == 1, endorsements
+                        (key,) = endorsements.keys()
+                        assert key.startswith(b"did:x509:"), key
+                        LOG.info(
+                            f"Recovery UVM endorsement found in ledger: {endorsements[key]}"
+                        )
+                        return
+            assert False, "No UVM endorsement found in recovery ledger"
+
+
+def run_initial_tcb_version_checks(const_args):
+    args = copy.deepcopy(const_args)
+    args.label += "_tcb_version"
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        LOG.info("Start a network and stop it")
+        network.start_and_open(args)
+        primary, _ = network.find_primary()
+
+        def get_min_tcb_versions(node):
+            with node.api_versioned_client(api_version=args.gov_api_version) as uc:
+                r = uc.get("/gov/service/join-policy")
+                assert r.status_code == http.HTTPStatus.OK, r
+                return r.body.json()["snp"]["tcbVersions"]
+
+        LOG.info("Fetch current join policy to get the minimum TCB version")
+        tcb_versions = get_min_tcb_versions(primary)
+        assert len(tcb_versions) == 1, tcb_versions
+        cpuid, node_tcb = next(iter(tcb_versions.items()))
+        LOG.info(f"Current minimum TCB version for {cpuid}: {node_tcb}")
+
+        # Lowering microcode, the first byte of the hex string on every product,
+        # gives a minimum that admits the node's TCB version, so recovery must
+        # keep it as is rather than replace it with the node's TCB version
+        node_tcb_hex = node_tcb["hexstring"]
+        microcode = int(node_tcb_hex[:2], 16)
+        assert microcode > 0, node_tcb
+        tcb_hex_before_recovery = f"{microcode - 1:02x}{node_tcb_hex[2:]}"
+        LOG.info(
+            f"Proposing minimum TCB version for {cpuid}: {tcb_hex_before_recovery}"
+        )
+        network.consortium.set_snp_minimum_tcb_version_hex(
+            primary, cpuid, tcb_hex_before_recovery
+        )
+        tcb_versions_before_recovery = get_min_tcb_versions(primary)
+        assert (
+            tcb_versions_before_recovery[cpuid]["hexstring"] == tcb_hex_before_recovery
+        ), tcb_versions_before_recovery
+
+        network_service_identity_file, _ = network.save_service_identity_to_file()
+        snapshots_dir = network.get_committed_snapshots(primary)
+        network.stop_all_nodes()
+
+        LOG.info("Check that the a SNP tcb_version is present")
+        ledger_dirs = primary.remote.ledger_paths()
+        ledger = ccf.ledger.Ledger(ledger_dirs, contiguous_suffix=True)
+        first_chunk = next(iter(ledger))
+        first_tx = next(iter(first_chunk))
+        tables = first_tx.get_public_domain().get_tables()
+        tcb_versions = tables["public:ccf.gov.nodes.snp.tcb_versions"]
+        assert len(tcb_versions) == 1, tcb_versions
+        LOG.info(f"Initial TCB_version found in ledger: {tcb_versions}")
+
+        LOG.info("Start a recovery network and stop it")
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+
+        recovered_network_args = copy.deepcopy(args)
+        recovered_network_args.previous_service_identity_file = (
+            network_service_identity_file
+        )
+        recovered_network_args.label += "_recovery"
+        with infra.network.network(
+            recovered_network_args.nodes,
+            recovered_network_args.binary_dir,
+            recovered_network_args.debug_nodes,
+            existing_network=network,
+        ) as recovered_network:
+            recovered_network.start_in_recovery(
+                recovered_network_args,
+                ledger_dir=current_ledger_dir,
+                committed_ledger_dirs=committed_ledger_dirs,
+                snapshots_dir=snapshots_dir,
+            )
+            recovered_primary, _ = recovered_network.find_primary()
+            LOG.info("Check that recovery kept the minimum TCB version")
+            tcb_versions = get_min_tcb_versions(recovered_primary)
+            assert (
+                tcb_versions == tcb_versions_before_recovery
+            ), f"Expected minimum TCB versions {tcb_versions_before_recovery} after recovery, got {tcb_versions}"
+
+            LOG.info("Check that the TCB_version is not written by the recovery tx")
+            recovery_seqno = None
+            with recovered_primary.client() as c:
+                r = c.get("/node/network").body.json()
+                recovery_seqno = int(r["current_service_create_txid"].split(".")[1])
+            recovered_network.stop_all_nodes()
+            ledger = ccf.ledger.Ledger(
+                recovered_primary.remote.ledger_paths(),
+                committed_only=False,
+                read_recovery_files=True,
+                contiguous_suffix=True,
+            )
+            for chunk in ledger:
+                _, chunk_end_seqno = chunk.get_seqnos()
+                # Open chunks have no end seqno, so they may contain the
+                # recovery transaction. Only skip chunks known to end earlier.
+                if chunk_end_seqno is not None and chunk_end_seqno < recovery_seqno:
+                    continue
+                for tx in chunk:
+                    tables = tx.get_public_domain().get_tables()
+                    seqno = tx.get_public_domain().get_seqno()
+                    if seqno < recovery_seqno:
+                        continue
+                    else:
+                        assert seqno == recovery_seqno, (seqno, recovery_seqno)
+                        tables = tx.get_public_domain().get_tables()
+                        assert "public:ccf.gov.service.info" in tables, tables.keys()
+                        assert (
+                            "public:ccf.gov.nodes.snp.tcb_versions" not in tables
+                        ), tables["public:ccf.gov.nodes.snp.tcb_versions"]
+                        return
+            assert False, "No recovery tx found in recovery ledger"
+
+
+def run_recovery_local_unsealing(
+    const_args, suffix, recovery_f=0, rekey=False, recovery_shares_refresh=False
+):
+    LOG.info("Running recovery local unsealing")
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.label += suffix
+
+    with infra.network.network(args.nodes, args.binary_dir) as network:
+        network.set_sealing_recovery_locations()
+        network.start_and_open(args)
+
+        network.save_service_identity(args)
+        network.wait_for_node_commit_sync()
+
+        primary, _ = network.find_primary()
+        if rekey:
+            network.consortium.trigger_ledger_rekey(primary)
+        if recovery_shares_refresh:
+            network.consortium.trigger_recovery_shares_refresh(primary)
+
+        # Wait for commit sync to ensure that the rekey reaches all nodes
+        network.wait_for_node_commit_sync()
+        network.stop_all_nodes()
+
+        prev_network = network
+        for node in network.nodes:
+            recovery_network_args = copy.deepcopy(args)
+            recovery_network_args.nodes = infra.e2e_args.min_nodes(args, f=recovery_f)
+            recovery_network_args.label += f"_recovery_from_node_{node.local_node_id}"
+
+            with infra.network.network(
+                recovery_network_args.nodes,
+                recovery_network_args.binary_dir,
+                next_node_id=prev_network.next_node_id,
+            ) as recovery_network:
+                recovery_network.set_sealing_recovery_locations(
+                    prev_nodes=network.nodes
+                )
+
+                # Reset consortium and users to prevent issues with hosts from existing_network
+                recovery_network.consortium = prev_network.consortium
+                recovery_network.users = prev_network.users
+                recovery_network.txs = prev_network.txs
+                recovery_network.jwt_issuer = prev_network.jwt_issuer
+
+                current_ledger_dir, committed_ledger_dirs = node.get_ledger()
+                recovery_network.start_in_recovery(
+                    recovery_network_args,
+                    common_dir=network.common_dir,
+                    ledger_dir=current_ledger_dir,
+                    committed_ledger_dirs=committed_ledger_dirs,
+                )
+
+                recovery_network.recover(recovery_network_args, via_local_sealing=True)
+
+                recovery_network.stop_all_nodes()
+                prev_network = recovery_network
+
+
+def run_recovery_unsealing_validate_audit(const_args):
+    LOG.info("Running recovery local unsealing")
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.label += "_unsealing_audit"
+
+    with infra.network.network(args.nodes, args.binary_dir) as network:
+        network.set_sealing_recovery_locations()
+        network.start_and_open(args)
+
+        network.save_service_identity(args)
+        network.wait_for_node_commit_sync()
+
+        latest_public_tables, _ = network.get_latest_ledger_public_state()
+        sealed_recovery_keys = latest_public_tables[
+            "public:ccf.gov.nodes.sealed_recovery_keys"
+        ]
+        for node in network.nodes:
+            node_id_bytes = node.node_id.encode("utf-8")
+            assert (
+                node_id_bytes in sealed_recovery_keys
+            ), f"Node {node.node_id} does not have sealed recovery key"
+        assert (
+            "public:ccf.internal.last_recovery_type" not in latest_public_tables
+        ), "last_recovery_type was set when no recovery was performed."
+
+        network.stop_all_nodes()
+
+        prev_network = network
+        for via_local_unsealing in [True, False]:
+            recovery_network_args = copy.deepcopy(args)
+            recovery_network_args.nodes = infra.e2e_args.min_nodes(args, f=0)
+            if via_local_unsealing:
+                recovery_network_args.label += "_via_local_unsealing"
+            else:
+                recovery_network_args.label += "_via_recovery_shares"
+
+            with infra.network.network(
+                recovery_network_args.nodes,
+                recovery_network_args.binary_dir,
+                next_node_id=prev_network.next_node_id,
+            ) as recovery_network:
+                if via_local_unsealing:
+                    recovery_network.set_sealing_recovery_locations(
+                        prev_nodes=network.nodes
+                    )
+
+                # Reset consortium and users to prevent issues with hosts from existing_network
+                recovery_network.consortium = prev_network.consortium
+                recovery_network.users = prev_network.users
+                recovery_network.txs = prev_network.txs
+                recovery_network.jwt_issuer = prev_network.jwt_issuer
+
+                current_ledger_dir, committed_ledger_dirs = network.nodes[
+                    0
+                ].get_ledger()
+                recovery_network.start_in_recovery(
+                    recovery_network_args,
+                    common_dir=network.common_dir,
+                    ledger_dir=current_ledger_dir,
+                    committed_ledger_dirs=committed_ledger_dirs,
+                )
+
+                recovery_network.recover(
+                    recovery_network_args, via_local_sealing=via_local_unsealing
+                )
+
+                latest_public_tables, _ = (
+                    recovery_network.get_latest_ledger_public_state()
+                )
+                recovery_type = latest_public_tables[
+                    "public:ccf.internal.last_recovery_type"
+                ][b"\x00\x00\x00\x00\x00\x00\x00\x00"].decode("utf-8")
+                expected_recovery_type = (
+                    '"LOCAL_UNSEALING"' if via_local_unsealing else '"RECOVERY_SHARES"'
+                )
+                assert (
+                    recovery_type == expected_recovery_type
+                ), f"Network recovery type was {recovery_type} instead of {expected_recovery_type}"
+
+                recovery_network.stop_all_nodes()
+
+                prev_network = recovery_network
+
+
+def run_recovery_decision_protocol(const_args):
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.label += "_recovery_decision_protocol"
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+    ) as network:
+        LOG.info("Start a network and stop it")
+        network.set_sealing_recovery_locations()
+        network.start_and_open(args)
+        network.save_service_identity(args)
+        network.stop_all_nodes()
+
+        recovery_args = copy.deepcopy(args)
+
+        LOG.info("Start recovery network")
+        with infra.network.network(
+            recovery_args.nodes,
+            recovery_args.binary_dir,
+            recovery_args.debug_nodes,
+            existing_network=network,
+        ) as recovered_network:
+            recovered_network.start_in_recovery_decision_protocol(
+                recovery_args,
+                existing_network=network,
+            )
+            recovered_network.wait_for_recovery_decision_protocol_finish()
+
+            # Refresh the declared state of nodes which have shut themselves down to join.
+            for node in recovered_network.nodes:
+                node.refresh_network_state(verify_ca=False)
+
+            recovered_network.refresh_service_identity_file(recovery_args)
+
+            joined_nodes = recovered_network.get_joined_nodes()
+
+            assert len(joined_nodes) == 1, joined_nodes
+
+            LOG.info("Completed self-healing open successfully")
+
+            latest_public_tables, _ = recovered_network.get_latest_ledger_public_state()
+            recovery_type = latest_public_tables[
+                "public:ccf.gov.recovery_decision_protocol.open_kind"
+            ][b"\x00\x00\x00\x00\x00\x00\x00\x00"].decode("utf-8")
+            assert (
+                recovery_type == '"Quorum"'
+            ), f"Network self-healing open type was {recovery_type} instead of Quorum"
+            infra.recovery_trace.validate_recovery_trace_if_enabled(
+                recovered_network, args.label
+            )
+
+
+def run_recovery_decision_protocol_timeout_path(const_args):
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.label += "_recovery_decision_protocol_timeout"
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+    ) as network:
+        LOG.info("Start a network and stop it")
+        network.set_sealing_recovery_locations()
+        network.start_and_open(args)
+        network.save_service_identity(args)
+        network.stop_all_nodes()
+
+        recovery_args = copy.deepcopy(args)
+
+        LOG.info("Start a recovery network and stop it")
+        with infra.network.network(
+            recovery_args.nodes,
+            recovery_args.binary_dir,
+            recovery_args.debug_nodes,
+            existing_network=network,
+        ) as recovered_network:
+            recovered_network.start_in_recovery_decision_protocol(
+                recovery_args,
+                existing_network=network,
+                starting_nodes=0,  # Force timeout path by starting only one node
+            )
+            recovered_network.wait_for_recovery_decision_protocol_finish()
+
+            # Refresh the declared state of nodes which have shut themselves down to join.
+            for node in recovered_network.nodes:
+                node.refresh_network_state(verify_ca=False)
+
+            recovered_network.refresh_service_identity_file(recovery_args)
+
+            joined_nodes = recovered_network.get_joined_nodes()
+            assert len(joined_nodes) == 1, joined_nodes
+
+            LOG.info("Completed self-healing open successfully")
+
+            latest_public_tables, _ = recovered_network.get_latest_ledger_public_state()
+            recovery_type = latest_public_tables[
+                "public:ccf.gov.recovery_decision_protocol.open_kind"
+            ][b"\x00\x00\x00\x00\x00\x00\x00\x00"].decode("utf-8")
+            assert (
+                recovery_type == '"Failover"'
+            ), f"Network self-healing open type was {recovery_type} instead of Failover"
+            infra.recovery_trace.validate_recovery_trace_if_enabled(
+                recovered_network, args.label
+            )
+
+
+def run_recovery_decision_protocol_multiple_timeout(const_args):
+    args = copy.deepcopy(const_args)
+    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.label += "_recovery_decision_protocol_multiple_timeout"
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+    ) as network:
+        LOG.info("Start a network and stop it")
+        network.set_sealing_recovery_locations()
+        network.start_and_open(args)
+        network.save_service_identity(args)
+        network.stop_all_nodes()
+
+        recovery_args = copy.deepcopy(args)
+
+        LOG.info("Start a recovery network")
+        with infra.network.network(
+            recovery_args.nodes,
+            recovery_args.binary_dir,
+            recovery_args.debug_nodes,
+            existing_network=network,
+            check_file_invariants=False,
+        ) as recovered_network:
+            recovered_network.start_in_recovery_decision_protocol(
+                recovery_args,
+                existing_network=network,
+                suspend_after_start=True,  # suspend each node after starting to ensure they don't progress
+            )
+            # for each node: start it and wait until it finishes the recovery-decision-protocol on the timeout path
+            for node in recovered_network.nodes:
+                node.resume()
+                recovered_network.wait_for_statuses(
+                    node,
+                    ["Open"],
+                    timeout=10,
+                    verify_ca=False,
+                )
+                node.suspend()
+
+            for node in recovered_network.nodes:
+                node.resume()
+
+            # Refresh the declared state of nodes which have shut themselves down to join.
+            for node in recovered_network.nodes:
+                node.refresh_network_state(verify_ca=False)
+
+            assert len(recovered_network.get_joined_nodes()) == len(args.nodes)
+            infra.recovery_trace.validate_recovery_trace_if_enabled(
+                recovered_network, args.label
+            )
+
+
+def run_read_ledger_on_testdata(args):
+    for testdata_dir in os.scandir(args.historical_testdata):
+        assert testdata_dir.is_dir()
+        testdata_path = os.path.join(
+            args.historical_testdata, testdata_dir.name, "ledger"
+        )
+        LOG.info(f"Reading and validating ledger in {testdata_path}")
+        tx_count = 0
+        ledger = ccf.ledger.Ledger(
+            [testdata_path],
+            committed_only=False,
+            read_recovery_files=False,
+            contiguous_suffix=True,
+        )
+        for chunk in ledger:
+            for tx in chunk:
+                tables = tx.get_public_domain().get_tables()
+                tx_count += 1
+        LOG.info(f"Read {tx_count} transactions from {testdata_path}")
+
+        snapshot_path = os.path.join(
+            args.historical_testdata, testdata_dir.name, "snapshots"
+        )
+        for snapshot_file in os.scandir(snapshot_path):
+            if snapshot_file.is_file() and snapshot_file.name.endswith(".committed"):
+                LOG.info(f"Reading and validating snapshot {snapshot_file.path}")
+                # Release tests use the published SDK, which may accept JSON
+                # receipts. Local SDK tests enforce COSE-only snapshot receipts.
+                try:
+                    snapshot = ccf.ledger.Snapshot(snapshot_file.path)
+                except ccf.ledger.InvalidSnapshotException as e:
+                    if testdata_dir.name not in LEGACY_RECEIPT_SNAPSHOT_SERVICES:
+                        raise
+                    assert "Snapshot receipt is not a COSE_Sign1 receipt" in str(e), e
+                    LOG.info(f"Legacy snapshot rejected: {e}")
+                    continue
+
+                with snapshot:
+                    tables = snapshot.get_public_domain().get_tables()
+                    LOG.info(
+                        f"Valid snapshot at {snapshot_file.path} with {len(tables)} tables"
+                    )
+
+
+def run_ledger_viz_test(args):
+    """Offline test: visualise a checked-in Dual->COSE upgraded ledger and
+    require an exact byte-for-byte match against a golden output file.
+    """
+    testdata_dir = os.path.join(args.historical_testdata, "cose_upgraded_service")
+    ledger_dir = os.path.join(testdata_dir, "ledger")
+    expected_file = os.path.join(testdata_dir, "expected_viz.txt")
+
+    LOG.info(f"Testing ledger_viz on {ledger_dir} against {expected_file}")
+
+    ledger = ccf.ledger.Ledger(
+        [ledger_dir], committed_only=True, contiguous_suffix=True
+    )
+    liner = ccf.ledger_viz.DefaultLiner(
+        write_views=False, split_views=False, split_services=False
+    )
+    # Override on the instance to avoid mutating the class attribute and so
+    # affecting unrelated callers in the same process.
+    liner.MAX_LENGTH = 80
+    validator = ccf.ledger.LedgerValidator()
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        liner.help()
+        ccf.ledger_viz.visualise(ledger, liner, validator=validator)
+    actual = buf.getvalue()
+
+    with open(expected_file, "r") as f:
+        expected = f.read()
+
+    assert actual == expected, (
+        f"ledger_viz output for {ledger_dir} does not match {expected_file}.\n"
+        f"--- expected ({len(expected)} bytes) ---\n{expected!r}\n"
+        f"--- actual ({len(actual)} bytes) ---\n{actual!r}"
+    )
+    LOG.success(f"ledger_viz output matches golden file {expected_file}")
+
+
+def run_split_ledger_test(args):
+    """Offline test: run split_ledger on a checked-in Dual->COSE upgraded
+    ledger and verify the result still reads cleanly.
+
+    Picks two hardcoded signature seqnos from the testdata: one dual
+    signature (SIGNATURE_TX_TABLE_NAME + COSE_SIGNATURE_TX_TABLE_NAME) and
+    one COSE-only signature (COSE_SIGNATURE_TX_TABLE_NAME only) so both
+    split_ledger code paths are exercised. Files are copied to a temp
+    directory first since split_ledger mutates input chunks.
+    """
+    testdata_dir = os.path.join(args.historical_testdata, "cose_upgraded_service")
+    src_ledger_dir = os.path.join(testdata_dir, "ledger")
+
+    LOG.info(f"Testing split_ledger on {src_ledger_dir}")
+
+    # Pinned to the checked-in cose_upgraded_service ledger.
+    # - 9 is a dual signature inside ledger_3-12.committed
+    # - 88 is a COSE-only signature inside ledger_80-91.committed
+    # Each split turns one chunk into two, so 19 input chunks become 21.
+    split_targets = [
+        ("ledger_3-12.committed", 9),
+        ("ledger_80-91.committed", 88),
+    ]
+    expected_before = 19
+    expected_after = expected_before + len(split_targets)
+
+    with tempfile.TemporaryDirectory() as tmp_ledger_dir:
+        for entry in os.scandir(src_ledger_dir):
+            if entry.is_file():
+                shutil.copy2(entry.path, tmp_ledger_dir)
+
+        files_before = len(os.listdir(tmp_ledger_dir))
+        assert files_before == expected_before, (
+            f"Unexpected file count before split in {tmp_ledger_dir}: "
+            f"got {files_before}, expected {expected_before}"
+        )
+
+        for chunk_name, split_seqno in split_targets:
+            chunk_path = os.path.join(tmp_ledger_dir, chunk_name)
+            assert os.path.exists(chunk_path), f"Missing testdata chunk {chunk_path}"
+            assert ccf.split_ledger.run(
+                [chunk_path, str(split_seqno), f"--output-dir={tmp_ledger_dir}"]
+            ), f"Failed to split {chunk_path} at {split_seqno}"
+            os.remove(chunk_path)
+
+        files_after = len(os.listdir(tmp_ledger_dir))
+        assert files_after == expected_after, (
+            f"Unexpected file count after split in {tmp_ledger_dir}: "
+            f"got {files_after}, expected {expected_after}"
+        )
+
+        # Confirm the post-split directory still parses as a valid ledger.
+        # Iterate to actually parse each chunk; Ledger.__init__ only checks
+        # filename ranges, real parsing happens during iteration.
+        ledger = ccf.ledger.Ledger(
+            [tmp_ledger_dir], committed_only=False, contiguous_suffix=True
+        )
+        tx_count = 0
+        for chunk in ledger:
+            for _ in chunk:
+                tx_count += 1
+        assert tx_count > 0, f"Post-split ledger {tmp_ledger_dir} contains no txs"
+
+    LOG.success(f"split_ledger works on COSE-only ledger {src_ledger_dir}")
+
+
+def run_merkle_verification_level(args):
+    """Test MERKLE verification level on isolated chunks and full ledgers"""
+    LOG.info("Testing MERKLE verification level")
+
+    def validate(path, level):
+        validator = ccf.ledger.LedgerValidator(verification_level=level)
+        ledger = ccf.ledger.Ledger([path], committed_only=False, contiguous_suffix=True)
+        for chunk in ledger:
+            for tx in chunk:
+                validator.add_transaction(tx)
+        return validator
+
+    def assert_modes_agree(path):
+        full = validate(path, ccf.ledger.VerificationLevel.FULL)
+        merkle = validate(path, ccf.ledger.VerificationLevel.MERKLE)
+        assert full.last_verified_txid() == merkle.last_verified_txid(), (
+            f"MERKLE last_verified {merkle.last_verified_txid()} "
+            f"!= FULL last_verified {full.last_verified_txid()} for {path}"
+        )
+        assert full.signature_count == merkle.signature_count, (
+            f"MERKLE signature_count {merkle.signature_count} "
+            f"!= FULL signature_count {full.signature_count} for {path}"
+        )
+
+    # Test 1: MERKLE verification on full ledger
+    for testdata_dir in os.scandir(args.historical_testdata):
+        if not testdata_dir.is_dir():
+            continue
+        testdata_path = os.path.join(
+            args.historical_testdata, testdata_dir.name, "ledger"
+        )
+        LOG.info(f"Testing MERKLE verification on full ledger: {testdata_path}")
+
+        # Read with MERKLE verification level
+        assert ccf.read_ledger.run(
+            paths=[testdata_path],
+            print_mode=ccf.read_ledger.PrintMode.Quiet,
+            verification_level=ccf.ledger.VerificationLevel.MERKLE,
+        )
+        # Cross-check that MERKLE reached the same last_verified TxID and
+        # walked over the same signature count as FULL. Catches silent
+        # no-ops in the MERKLE-only path (e.g. on COSE-only sig TXs).
+        assert_modes_agree(testdata_path)
+
+    # Test 2: MERKLE verification on isolated chunks
+    # Find chunks with multiple signatures to test the "trust first signature" logic
+    test_chunks = [
+        os.path.join(
+            args.historical_testdata,
+            "expired_service",
+            "ledger",
+            "ledger_29-46.committed",
+        ),
+        os.path.join(
+            args.historical_testdata,
+            "double_sealed_service",
+            "ledger",
+            "ledger_44-64.committed",
+        ),
+    ]
+
+    for chunk_path in test_chunks:
+        if os.path.exists(chunk_path):
+            LOG.info(f"Testing MERKLE verification on isolated chunk: {chunk_path}")
+            assert ccf.read_ledger.run(
+                paths=[chunk_path],
+                print_mode=ccf.read_ledger.PrintMode.Quiet,
+                verification_level=ccf.ledger.VerificationLevel.MERKLE,
+            )
+
+    LOG.info("MERKLE verification level tests passed")
+
+    # Corrupt a single chunk to confirm that read_ledger throws appropriate errors
+    source_chunk = os.path.join(
+        args.historical_testdata,
+        "double_sealed_service",
+        "ledger",
+        "ledger_44-64.committed",
+    )
+    good_chunk = ccf.ledger.LedgerChunk(source_chunk)
+    start_seqno, end_seqno = good_chunk.get_seqnos()
+    expected_range = end_seqno - start_seqno + 1
+    tx_count_error = (
+        f"Expected to contain {expected_range} transactions due to filename"
+    )
+    chunk_name = os.path.basename(source_chunk)
+    with open(source_chunk, "rb") as src_f:
+        good_data = src_f.read()
+    source_size = len(good_data)
+    header_size = ccf.ledger.LEDGER_HEADER_SIZE
+    source_offset = int.from_bytes(good_data[0:header_size], byteorder="little")
+    assert source_offset > 0
+    assert source_offset < source_size
+
+    # Create an alternate version of the chunk without the offsets table. Should be equivalent to the file immediately before it was marked `.committed`
+    no_offsets_table = (0).to_bytes(header_size, byteorder="little") + good_data[
+        header_size:source_offset
+    ]
+
+    null_block_size = source_size // 8
+
+    for name, corrupted_data, expected_parse_error in [
+        (
+            "truncate_pre_offsets",
+            good_data[: source_offset - 1],
+            f"File header claims offset table is at {source_offset}",
+        ),
+        (
+            "truncate_at_offsets",
+            good_data[:source_offset],
+            tx_count_error,
+        ),
+        (
+            "truncate_tx_no_offsets",
+            no_offsets_table[: source_size // 2],
+            tx_count_error,
+        ),
+        (
+            "nulled_block",
+            good_data[: source_size // 2]
+            + b"\00" * null_block_size
+            + good_data[source_size // 2 + null_block_size :],
+            "is smaller than the minimum entry size",
+        ),
+        (
+            "header_offset_too_large",
+            (source_size + 1).to_bytes(header_size, byteorder="little")
+            + good_data[header_size:],
+            f"File header claims offset table is at {source_size + 1}",
+        ),
+        (
+            "truncate_mid_offsets",
+            good_data[:-4],
+            tx_count_error,
+        ),
+        (
+            "misaligned_offsets_too_small",
+            good_data[:-1],
+            "Expected positions to contain uint32s",
+        ),
+        (
+            "misaligned_offsets_too_large",
+            good_data + b"\x00",
+            "Expected positions to contain uint32s",
+        ),
+        (
+            "unread_data",
+            good_data + b"\x00" * 4,
+            tx_count_error,
+        ),
+        (
+            "unread_data_no_offsets_misaligned",
+            no_offsets_table + b"\x00",
+            "Failed to read precise number of bytes",
+        ),
+        (
+            "unread_data_no_offsets",
+            no_offsets_table + b"\x00" * 8,
+            tx_count_error,
+        ),
+    ]:
+        temp_dir = tempfile.TemporaryDirectory(
+            dir="workspace", prefix=name + "-", delete=False
+        )
+        corrupted_chunk_path = os.path.join(temp_dir.name, chunk_name)
+        LOG.info(f"Testing chunk corruption {name} in {corrupted_chunk_path}")
+        with open(corrupted_chunk_path, "wb") as dst_f:
+            dst_f.write(corrupted_data)
+
+        try:
+            chunk = ccf.ledger.LedgerChunk(corrupted_chunk_path)
+            for tx in chunk:
+                tx.get_public_domain()
+
+        except (
+            AssertionError,
+            # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+            IndexError,
+            # END SDK 7.0.18 compatibility.
+            ValueError,
+        ) as e:
+            # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+            if name == "nulled_block" and isinstance(e, IndexError):
+                expected_parse_error = "index out of range"
+            # END SDK 7.0.18 compatibility.
+            assert expected_parse_error in str(
+                e
+            ), f"Unexpected error message for corruption {name}: {e}"
+        else:
+            raise AssertionError(
+                f"Expected to raise exception while parsing corrupted ledger chunk {name}"
+            )
+
+        # NB: cleanup() is deliberately skipped if an assertion fails, so the corrupted files can be inspected
+        temp_dir.cleanup()
+
+
+def run_error_message_on_failure_to_read_aci_sec_context(args):
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        network.start_and_open(args)
+
+        _primary, _ = network.find_primary()
+
+        args_copy = copy.deepcopy(args)
+
+        new_node = network.create_node()
+        args_copy.snp_endorsements_servers = ["Azure:invalid.azure.com"]
+        args_copy.snp_security_policy_file = "/a/fake/path"
+        args_copy.snp_uvm_endorsements_file = "/a/fake/path"
+        args_copy.snp_endorsements_file = "/a/fake/path"
+        failed = False
+        try:
+            # 4 retries after 3s timeout, 3s backoff between retries = 27 seconds
+            network.join_node(
+                new_node, args.package, args_copy, timeout=60, from_snapshot=False
+            )
+        except infra.network.CollateralFetchTimeout:
+            LOG.info(
+                "Node with invalid quote endorsement servers could not join as expected"
+            )
+            failed = True
+        assert (
+            failed
+        ), "Node with invalid quote endorsement servers should not be able to join"
+
+        expected_log_messages = [
+            "Could not read snp_security_policy from /a/fake/path",
+            "Could not read snp_uvm_endorsements from /a/fake/path",
+            "Could not read snp_endorsements from /a/fake/path",
+        ]
+
+        out_path, _ = new_node.get_logs()
+        with open(out_path, "r", encoding="utf-8") as output:
+            for line in output:
+                for expected in expected_log_messages:
+                    if expected in line:
+                        expected_log_messages.remove(expected)
+                        LOG.info(f"Found expected log message: {expected}")
+                if len(expected_log_messages) == 0:
+                    break
+
+        assert (
+            len(expected_log_messages) == 0
+        ), f"Did not find expected log messages: {expected_log_messages}"
+
+
+def _assert_snapshot_fetch_failure_messages(node, timeout_s=0):
+    """Assert that the expected snapshot fetch failure messages appear in node's logs.
+
+    Polls the node's logs until all expected messages are found or timeout_s elapses.
+    Use the default timeout_s=0 for nodes that have already stopped (single pass).
+    Pass a positive timeout_s for nodes still running (poll until messages appear).
+    """
+    expected_patterns = [
+        re.compile(r"Fetching snapshot from .* \(attempt 1/3\)"),
+        re.compile(r"Fetching snapshot from .* \(attempt 2/3\)"),
+        re.compile(r"Fetching snapshot from .* \(attempt 3/3\)"),
+        re.compile(r"Exceeded maximum snapshot fetch retries \([0-9]+\), giving up"),
+    ]
+    end_time = time.time() + timeout_s
+    remaining = list(expected_patterns)
+    while True:
+        out_path, _ = node.get_logs()
+        with open(out_path, "r", encoding="utf-8") as f:
+            for line in f:
+                matched = [e for e in remaining if re.search(e, line)]
+                for m in matched:
+                    remaining.remove(m)
+                    LOG.info(f"Found expected log message: {line.rstrip()}")
+        if not remaining or time.time() >= end_time:
+            break
+        time.sleep(0.5)
+    assert not remaining, f"Did not find expected log messages: {remaining}"
+
+
+def test_join_time_snapshot_fetch_failure(network, args):
+    # Test that the join-time FetchSnapshot task produces the expected retry
+    # and "giving up" log messages when the snapshot endpoint is unreachable.
+    #
+    # Strategy:
+    #  1. Fully reconfigure the network: for each of the X original nodes
+    #     (which were bootstrapped at network start with startup_seqno = 0),
+    #     add a replacement node joined from a snapshot (startup_seqno > 0),
+    #     then retire and stop the originals. After this, every remaining
+    #     node has startup_seqno > 0, so any fresh joiner with
+    #     startup_seqno = 0 is rejected with StartupSeqnoIsOld -- regardless
+    #     of which node a join request gets redirected to (the join endpoint
+    #     redirects backups to the primary before checking StartupSeqnoIsOld,
+    #     so the primary must also reject).
+    #  2. Add an intermediate node joined from a snapshot to use as the
+    #     failing-join target via primary_rpc_interface.
+    #  3. Join a fresh node (no snapshot, startup_seqno = 0) targeting the
+    #     intermediate node via primary_rpc_interface.  The target replies
+    #     StartupSeqnoIsOld, triggering the FetchSnapshot task.
+    #  4. primary_rpc_interface lacks the SnapshotRead operator feature, so
+    #     GET /node/snapshot returns HTTP 404, exhausting the 3-attempt retry
+    #     loop and logging "Exceeded maximum snapshot fetch retries".
+    primary, _ = network.find_primary()
+
+    # Ensure at least one committed snapshot exists so that joining nodes
+    # can be given one (startup_seqno > 0).
+    target = network.txs.issue(network, number_txs=1)
+    primary.trigger_snapshot()
+    primary.wait_for_snapshot(target.seqno)
+
+    # Full reconfigure so every remaining node has startup_seqno > 0
+    # (otherwise a redirect to the primary would let the joiner succeed).
+    # Add all replacements before retiring any original, to preserve quorum
+    # throughout the reconfiguration.
+    original_nodes = list(network.get_joined_nodes())
+    for _ in original_nodes:
+        new_node = network.create_node()
+        network.join_node(
+            new_node,
+            args.package,
+            args,
+            from_snapshot=False,
+            fetch_recent_snapshot=True,
+        )
+        network.trust_node(new_node, args)
+    for old in original_nodes:
+        current_primary, _ = network.find_primary()
+        network.retire_node(current_primary, old)
+        old.stop()
+    primary, _ = network.find_primary()
+    network.wait_for_all_nodes_to_commit(primary)
+
+    # Add an intermediate node (also snapshot-joined) to act as the
+    # failing-join target.
+    intermediate_node = network.create_node()
+    network.join_node(
+        intermediate_node,
+        args.package,
+        args,
+        target_node=primary,
+        from_snapshot=False,
+        fetch_recent_snapshot=True,
+    )
+    network.trust_node(intermediate_node, args)
+
+    # Now join a fresh node (no snapshot) targeting the intermediate node via
+    # primary_rpc_interface.  The join target replies StartupSeqnoIsOld, which
+    # triggers a snapshot fetch on the joiner.  primary_rpc_interface lacks
+    # the SnapshotRead operator feature, so all fetch attempts return HTTP
+    # 404 and the FetchSnapshot retry loop logs "Exceeded maximum snapshot
+    # fetch retries (3), giving up".  The joiner then retries the whole join,
+    # so it never registers in the KV; we wait long enough for at least one
+    # full fetch cycle to be emitted to the log, then expect a TimeoutError
+    # from wait_for_node_in_store.  log_errors only inspects [fail ]/[fatal]
+    # lines so the StartupSeqnoIsOld info-level message is not promoted to a
+    # specific exception type.
+    failing_node = network.create_node()
+    try:
+        network.join_node(
+            failing_node,
+            args.package,
+            args,
+            target_node=intermediate_node,
+            from_snapshot=False,
+            fetch_recent_snapshot=True,
+            join_target_interface_name=infra.interfaces.PRIMARY_RPC_INTERFACE,
+            timeout=15,
+        )
+    except TimeoutError:
+        pass  # expected: FetchSnapshot exhausts retries and node cannot join
+    else:
+        raise AssertionError(
+            "Expected network.join_node() to raise TimeoutError after snapshot "
+            "fetch retries were exhausted, but it succeeded"
+        )
+
+    _assert_snapshot_fetch_failure_messages(failing_node)
+
+
+def test_error_message_on_failure_to_fetch_snapshot(network, args):
+    # Add a new backup node pointed at the primary_rpc_interface for snapshot
+    # fetching. That interface does NOT expose the SnapshotRead operator
+    # feature, so every fetch request returns HTTP 404, reliably driving the
+    # BackupSnapshotFetch retry loop to exhaustion.
+    primary, _ = network.find_primary()
+    new_node = network.create_node()
+    network.join_node(
+        new_node,
+        args.package,
+        args,
+        target_node=primary,
+        timeout=5,
+        backup_snapshot_fetch_enabled=True,
+        backup_snapshot_fetch_target_rpc_interface=infra.interfaces.PRIMARY_RPC_INTERFACE,
+    )
+    network.trust_node(new_node, args)
+
+    # Explicitly trigger a snapshot after the new node has joined.
+    # The snapshot_evidence hook on new_node then schedules BackupSnapshotFetch,
+    # which exhausts its 3 attempts (all HTTP 404) and logs "giving up".
+    target = network.txs.issue(network, number_txs=1)
+    primary.trigger_snapshot()
+    primary.wait_for_snapshot(target.seqno)
+
+    _assert_snapshot_fetch_failure_messages(new_node, timeout_s=30)
+
+
+def test_backup_snapshot_fetch(network, args):
+    primary, _ = network.find_primary()
+    backups = network.find_backups()
+    assert len(backups) > 0, "Expected at least one backup node"
+
+    chunk_size = 4 * 1024 * 1024
+    entry_size = 100000
+    target = network.txs.issue(
+        network,
+        number_txs=chunk_size // entry_size + 1,
+        msg="X" * entry_size,
+        send_private=False,
+        log_capture=[],
+    )
+    primary.trigger_snapshot()
+
+    # Wait for committed snapshots on the primary, and use those as expected
+    # snapshot files on backups.
+    LOG.info("Waiting for committed snapshot on primary")
+    latest_snapshot_path = primary.wait_for_snapshot(target.seqno)
+    assert os.path.getsize(latest_snapshot_path) > chunk_size, latest_snapshot_path
+    expected_snapshots = {}
+    for path in primary.get_snapshots(include_read_only=True):
+        with open(path, "rb") as snapshot_file:
+            expected_snapshots[os.path.basename(path)] = snapshot_file.read()
+
+    assert (
+        len(expected_snapshots) > 0
+    ), f"No committed snapshots found on primary {primary.local_node_id}"
+
+    interface = primary.host.rpc_interfaces[infra.interfaces.FILE_SERVING_RPC_INTERFACE]
+    primary_address = infra.interfaces.make_address(
+        interface.public_host, interface.public_port
+    )
+    for backup in backups:
+        with backup.client(
+            interface_name=infra.interfaces.FILE_SERVING_RPC_INTERFACE
+        ) as c:
+            r = c.head(f"/node/snapshot?since={target.seqno}", allow_redirects=False)
+            assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT, r
+            assert (
+                r.headers["location"]
+                == f"https://{primary_address}/node/snapshot?since={target.seqno}"
+            ), r.headers
+
+        backup_snapshots_dir = os.path.join(
+            backup.remote.remote.root, backup.remote.snapshots_dir_name
+        )
+        LOG.info(
+            f"Checking backup {backup.local_node_id} snapshots in {backup_snapshots_dir}"
+        )
+
+        for snapshot_name, expected_data in expected_snapshots.items():
+            expected_size = len(expected_data)
+            snapshot_path = os.path.join(backup_snapshots_dir, snapshot_name)
+            timeout_s = 10
+            end_time = time.time() + timeout_s
+            while time.time() < end_time:
+                if os.path.exists(snapshot_path):
+                    actual_size = os.path.getsize(snapshot_path)
+                    if actual_size == expected_size:
+                        with open(snapshot_path, "rb") as snapshot_file:
+                            assert (
+                                snapshot_file.read() == expected_data
+                            ), f"Backup {backup.local_node_id} fetched different bytes for {snapshot_name}"
+                        LOG.info(
+                            f"Backup {backup.local_node_id}: found {snapshot_name} with expected size {expected_size} bytes"
+                        )
+                        break
+
+                    LOG.info(
+                        f"Backup {backup.local_node_id}: snapshot {snapshot_name} present with size {actual_size}, expected {expected_size}; retrying"
+                    )
+
+                time.sleep(0.1)
+            else:
+                actual_size = (
+                    os.path.getsize(snapshot_path)
+                    if os.path.exists(snapshot_path)
+                    else None
+                )
+                raise AssertionError(
+                    f"Backup {backup.local_node_id} missing snapshot {snapshot_name} "
+                    f"with expected size {expected_size} in {backup_snapshots_dir} "
+                    f"after {timeout_s}s (actual size: {actual_size})"
+                )
+
+    LOG.success("All backups successfully fetched snapshots from primary")
+
+
+def test_backup_snapshot_fetch_max_size(network, args):
+    # Add a new node to the network with a very small max backup snapshot fetch size,
+    # and confirm that it although it can join the network successfully,
+    # it cannot fetch snapshots from the primary,
+    # and that it logs appropriate error messages
+    primary, _ = network.find_primary()
+    new_node = network.create_node()
+    network.join_node(
+        new_node,
+        args.package,
+        args,
+        target_node=primary,
+        timeout=5,
+        fetch_recent_snapshot=False,
+        from_snapshot=False,
+        backup_snapshot_fetch_enabled=True,
+        backup_snapshot_fetch_max_attempts=1,
+        backup_snapshot_fetch_max_size="1KB",
+    )
+    network.trust_node(new_node, args)
+    new_node.wait_for_node_to_join(timeout=5)
+    snapshot_dir = os.path.join(
+        new_node.remote.remote.root, new_node.remote.snapshots_dir_name
+    )
+
+    def assert_no_snapshot_is_present(duration_s=10):
+        """
+        On a join node, the snapshot directory is expected to be empty until
+        the node attempts to fetch a snapshot from the primary. Directory creation
+        is not always visible immediately, so we defer enforcing the expectation
+        that the directory exists.
+        """
+        end_time = time.time() + duration_s
+        while time.time() < end_time:
+            if os.path.exists(snapshot_dir):
+                files = os.listdir(snapshot_dir)
+                assert (
+                    files == []
+                ), f"Expected no snapshot in {snapshot_dir}, but found {files}"
+            time.sleep(0.1)
+        assert os.path.exists(
+            snapshot_dir
+        ), f"Expected snapshot directory {snapshot_dir} to exist"
+
+    assert_no_snapshot_is_present()
+    target = network.txs.issue(network, number_txs=1, msg="X" * 2048)
+    primary.trigger_snapshot()
+    snapshot_path = primary.wait_for_snapshot(target.seqno)
+    assert os.path.getsize(snapshot_path) > 1024, snapshot_path
+    assert_no_snapshot_is_present()
+    expected_log_message = "Failed writing received data to disk/application"
+    out_path, _ = new_node.get_logs()
+    with open(out_path, "r", encoding="utf-8") as output:
+        for line in output:
+            if expected_log_message in line:
+                LOG.info(f"Found expected log message: {line}")
+                break
+        else:
+            raise AssertionError(
+                f"Did not find expected log message about snapshot exceeding max size: {expected_log_message}"
+            )
+
+
+def test_join_idempotency_on_backup(network, args):
+    # Pending retries must reach the primary to refresh their expiration
+    # timestamp. With expiration disabled, backups can answer locally.
+    #
+    # The C++ joiner cannot exercise this path: after the first 308 it
+    # permanently retargets the primary (node_state.h:1144), so its retries
+    # never re-hit the backup. We therefore drive /node/join directly from
+    # Python via Network.fake_join, which forges a virtual quote bound to
+    # a synthetic keypair (precedent: test_issue_fake_join in
+    # reconfiguration.py).
+    #
+    # Skipped on snp because we cannot synthesize a valid SNP quote.
+    if infra.platform_detection.get_platform() == "snp":
+        LOG.warning(
+            "Skipping test_join_idempotency_on_backup on snp: "
+            "cannot synthesize a valid SNP quote for raw Python join."
+        )
+        return
+
+    primary, backups = network.find_nodes()
+    assert backups, "Test requires at least one backup"
+    backup = backups[0]
+
+    # Reuse a fresh synthetic identity across all join attempts.
+    # add_node binds the virtual quote to the joiner's public key
+    # (src/node/quote.cpp:122-132 verify_quoted_node_public_key).
+    priv_pem, _ = infra.crypto.generate_ec_keypair()
+    cert_pem = infra.crypto.generate_cert(priv_pem, cn="fake_joiner")
+    kp = (priv_pem, cert_pem)
+
+    # --- Attempt 1: POST to backup, expect 308 redirect to primary ---
+    r1, expected_node_id = network.fake_join(backup, kp)
+    assert r1.status_code == http.HTTPStatus.PERMANENT_REDIRECT, (
+        f"Expected 308 from backup on first attempt, got {r1.status_code}: "
+        f"{r1.body.text()}"
+    )
+    location = next((v for k, v in r1.headers.items() if k.lower() == "location"), None)
+    assert location, "Expected Location header on 308"
+
+    # --- Follow redirect manually: POST same identity to primary ---
+    r_primary, _ = network.fake_join(primary, kp)
+    assert r_primary.status_code == http.HTTPStatus.OK, (
+        f"Primary should accept join, got {r_primary.status_code}: "
+        f"{r_primary.body.text()}"
+    )
+    body = r_primary.body.json()
+    assert body["node_status"] == "Pending", body
+    joined_node_id = body["node_id"]
+    assert joined_node_id == expected_node_id, (
+        f"node_id mismatch: server returned {joined_node_id}, expected "
+        f"sha256(DER pubkey) = {expected_node_id}"
+    )
+    assert (
+        body.get("network_info") is None
+    ), "PENDING response must not include network_info"
+
+    # Wait for the new node entry to be replicated and committed on the backup
+    # so that its check_node_exists lookup succeeds on the second attempt.
+    network.wait_for_all_nodes_to_commit(primary)
+
+    # Retry the same identity after its Pending entry reaches the backup.
+    r2, _ = network.fake_join(backup, kp)
+    expiration_enabled = (
+        infra.e2e_args._convert_time_string(args.pending_node_timeout, "s") > 0
+    )
+    if expiration_enabled:
+        assert r2.status_code == http.HTTPStatus.PERMANENT_REDIRECT, (
+            f"Backup must redirect Pending retries to refresh their timestamp, "
+            f"got {r2.status_code}: {r2.body.text()}"
+        )
+        retry_location = next(
+            (v for k, v in r2.headers.items() if k.lower() == "location"), None
+        )
+        assert retry_location == location, (retry_location, location)
+        r2, _ = network.fake_join(primary, kp)
+
+    assert (
+        r2.status_code == http.HTTPStatus.OK
+    ), f"Pending retry must succeed, got {r2.status_code}: {r2.body.text()}"
+    assert not any(
+        k.lower() == "location" for k in r2.headers
+    ), "Successful Pending response must not include a Location header"
+    body2 = r2.body.json()
+    assert body2["node_status"] == "Pending", body2
+    assert body2["node_id"] == joined_node_id, (
+        f"Idempotency violated: second attempt returned different node_id "
+        f"({body2['node_id']} vs {joined_node_id})"
+    )
+    assert (
+        body2.get("network_info") is None
+    ), "PENDING response must not include network_info"
+
+    # The backup must not add nodes, and retries must not duplicate entries.
+    backup_out, _ = backup.get_logs()
+    primary_out, _ = primary.get_logs()
+    with open(backup_out, encoding="utf-8") as backup_output:
+        backup_lines = backup_output.read()
+    with open(primary_out, encoding="utf-8") as primary_output:
+        primary_lines = primary_output.read()
+
+    assert (
+        "Join request redirected to primary" in backup_lines
+    ), "Expected backup to log redirect on first attempt"
+    # NodeId formats as `n[<hex>]` in logs.
+    assert (
+        f"Node n[{joined_node_id}] added as" not in backup_lines
+    ), "Backup must not have added the node itself"
+    add_count = primary_lines.count(
+        f"Node n[{joined_node_id}] added as PENDING"
+    ) + backup_lines.count(f"Node n[{joined_node_id}] added as PENDING")
+    assert (
+        add_count == 1
+    ), f"Primary should have added the node exactly once, found {add_count}"
+
+    # Cleanup: retire the never-started PENDING node so it doesn't pollute
+    # later tests in this run.
+    network.consortium.retire_node_by_id(primary, joined_node_id)
+
+
+def _run_backup_snapshot_download(
+    const_args, label_suffix, tests, snapshot_tx_interval=30
+):
+    args = copy.deepcopy(const_args)
+    args.label += label_suffix
+    args.snapshot_tx_interval = snapshot_tx_interval
+    args.nodes = infra.e2e_args.max_nodes(args, f=0)
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(args, backup_snapshot_fetch_enabled=True)
+        for test in tests:
+            test(network, args)
+
+
+# Each group below brings up its own network and runs concurrently with the
+# others. Every test starts by finding the primary and issuing its own
+# transactions, so none of them depend on the others.
+def run_backup_snapshot_download(const_args):
+    # Do not race the explicit snapshot with intermediate automatic snapshots.
+    _run_backup_snapshot_download(
+        const_args,
+        "_backup_snapshot_download",
+        [test_backup_snapshot_fetch],
+        snapshot_tx_interval=10000,
+    )
+
+
+def run_backup_snapshot_download_limits(const_args):
+    args = copy.deepcopy(const_args)
+    args.pending_node_timeout = "1h"
+    _run_backup_snapshot_download(
+        args,
+        "_backup_snapshot_limits",
+        [
+            test_backup_snapshot_fetch_max_size,
+            test_join_idempotency_on_backup,
+        ],
+    )
+    args.pending_node_timeout = "0s"
+    _run_backup_snapshot_download(
+        args,
+        "_join_idempotency_cleanup_disabled",
+        [test_join_idempotency_on_backup],
+    )
+
+
+def run_backup_snapshot_download_failures(const_args):
+    _run_backup_snapshot_download(
+        const_args,
+        "_backup_snapshot_failures",
+        [
+            test_join_time_snapshot_fetch_failure,
+            test_error_message_on_failure_to_fetch_snapshot,
+        ],
+    )
+
+
+def run_propose_request_vote(const_args):
+    args = copy.deepcopy(const_args)
+    args.label += "_propose_vote"
+    args.nodes = infra.e2e_args.nodes(args, 3)
+    args.snapshot_tx_interval = 100000  # High to avoid tx-count-triggered snapshots
+    # use a high timeout to hedge against flaky nodes which pause for seconds
+    # In most cases this should not matter as the propose_request_vote will cause the election quickly
+    args.election_timeout_ms = 20000
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        LOG.info("Start a network")
+        network.start_and_open(args, ignore_first_sigterm=True)
+        network.wait_for_node_commit_sync(timeout=16)
+        try:
+            original_primary, original_term = network.find_primary()
+
+            LOG.info("Waiting for initial snapshot")
+            original_primary.wait_for_snapshot(1)
+            network.wait_for_node_commit_sync(timeout=16)
+
+            original_primary.remote.remote.proc.send_signal(signal.SIGTERM)
+            # Find any primary which wasn't the original one
+            # If propose_request_vote worked, the new primary will be elected rapidly
+            # So if this times out, the propose_request_vote likely failed
+            new_primary, new_term = network.wait_for_new_primary(
+                original_primary, timeout_multiplier=0.9
+            )
+            assert (
+                new_primary.node_id != original_primary.node_id
+            ), "A new primary should have been elected"
+            assert (
+                new_term > original_term
+            ), "The new primary should be in a higher term than the original primary"
+
+            LOG.info(f"New primary is node {new_primary.node_id}")
+
+        finally:
+            # send an additional sigterm to balance the ignore_first_sigterm above, and ensure all nodes are cleaned up
+            for node in network.nodes:
+                node.remote.remote.proc.send_signal(signal.SIGTERM)
+
+
+def run_time_based_snapshotting(const_args):
+    args = copy.deepcopy(const_args)
+    args.label += "_tb_snapshot"
+    args.snapshot_tx_interval = (
+        10000  # Large interval to avoid interference from regular snapshots
+    )
+    args.snapshot_time_interval = "1s"
+
+    @contextmanager
+    def net_with_min_tx(label, min_tx_interval):
+        inner_args = copy.deepcopy(args)
+        inner_args.snapshot_min_tx_interval = min_tx_interval
+        inner_args.label += label
+        with infra.network.network(
+            inner_args.nodes,
+            inner_args.binary_dir,
+            inner_args.debug_nodes,
+            pdb=inner_args.pdb,
+            txs=app.LoggingTxs("user0"),
+        ) as net:
+            net.start_and_open(inner_args)
+            yield net
+
+    def snapshot_names(node):
+        return {
+            os.path.basename(path)
+            for path in node.get_snapshots(include_read_only=True)
+        }
+
+    # Pattern for these tests:
+    # 1. wait for any startup triggered txs to commit and net to settle
+    # 2. wait for a snapshot with the latest committed tx, or wait 5s
+    # 3. record baseline
+    # 4. record new snapshots over 10s and compare that to the baseline
+
+    def run_low():
+        with net_with_min_tx("_low", 0) as net:
+            time.sleep(1)
+            primary, _ = net.find_primary()
+            with primary.client() as c:
+                target = TxID.from_str(
+                    c.get("/node/commit").body.json()["transaction_id"]
+                )
+            primary.wait_for_snapshot(target.seqno, timeout=5)
+            baseline = snapshot_names(primary)
+            time.sleep(10)
+            final = snapshot_names(primary)
+            assert (
+                len(final - baseline) >= 8
+            ), f"With min_tx_interval set to 0 we expect snapshots to be generated at around 1 per second, but got {final} snapshots 10s after a baseline of {baseline}, with {final - baseline} new snapshots seen over the test."
+
+    def run_exact():
+        with net_with_min_tx("_exact", 2) as net:
+            time.sleep(1)
+            primary, _ = net.find_primary()
+            with primary.client() as c:
+                target = TxID.from_str(
+                    c.get("/node/commit").body.json()["transaction_id"]
+                )
+            try:
+                primary.wait_for_snapshot(target.seqno, timeout=5)
+            except TimeoutError:
+                pass
+            baseline = snapshot_names(primary)
+            time.sleep(10)
+            final = snapshot_names(primary)
+            assert (
+                final == baseline
+            ), f"With min_tx_interval set to 2 we expect no snapshots to be generated without transactions, but got {final} snapshots 10s after a baseline of {baseline}, with {final - baseline} new snapshots seen over the test."
+
+    def run_high():
+        with net_with_min_tx("_high", 10) as net:
+            time.sleep(1)
+            primary, _ = net.find_primary()
+            with primary.client() as c:
+                target = TxID.from_str(
+                    c.get("/node/commit").body.json()["transaction_id"]
+                )
+            try:
+                primary.wait_for_snapshot(target.seqno, timeout=5)
+            except TimeoutError:
+                pass
+            baseline = snapshot_names(primary)
+            time.sleep(10)
+            final = snapshot_names(primary)
+            assert (
+                final == baseline
+            ), f"With min_tx_interval set to 10 we expect no snapshots to be generated without transactions, but got {final} snapshots 10s after a baseline of {baseline}, with {final - baseline} new snapshots seen over the test."
+
+            tx_id = net.txs.issue(net, number_txs=1)
+            baseline = snapshot_names(primary)
+            time.sleep(10)
+            final = snapshot_names(primary)
+            assert (
+                final == baseline
+            ), f"With min_tx_interval set to 10 and we expect no snapshots to be generated with only one extra tx, but got {final} snapshots 10s after a baseline of {baseline}, and in total saw {final - baseline} new snapshots over the test."
+
+            net.txs.issue(net, number_txs=20)
+            primary.wait_for_snapshot(tx_id.seqno)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [
+            executor.submit(run_test) for run_test in (run_low, run_exact, run_high)
+        ]
+        for future in futures:
+            future.result()
+
+
+def run_snapshot_persistence_across_primary_failure(const_args):
+    """
+    Verify that the snapshot generation rate stays consistent across
+    leadership changes. Suspends the primary to trigger an election,
+    then resumes it. If the time baseline reset on each election,
+    new primaries would snapshot immediately, inflating the count.
+    """
+    snapshot_interval_ms = 5000
+    test_duration_s = 60
+    stable_time_s = 5
+
+    args = copy.deepcopy(const_args)
+    args.label += "_tb_snapshot_persist"
+    args.nodes = infra.e2e_args.nodes(args, 3)
+    args.snapshot_tx_interval = 10000  # High to avoid tx-count-triggered snapshots
+    args.snapshot_time_interval = f"{snapshot_interval_ms}ms"
+    args.snapshot_min_tx_interval = 0
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as net:
+        net.start_and_open(args)
+
+        start_time = time.time()
+        end_time = time.time() + test_duration_s
+
+        while True:
+            primary, _ = net.find_primary()
+            LOG.info(f"Leadership change suspending {primary.local_node_id}")
+            primary.suspend()
+            new_primary, _ = net.wait_for_new_primary(primary)
+            LOG.info(f"New primary is {new_primary.local_node_id}")
+            primary.resume()
+            if time.time() < end_time:
+                time.sleep(stable_time_s)
+            else:
+                break
+
+        elapsed = time.time() - start_time
+        snapshots = set()
+        for node in net.nodes:
+            snapshots.update(
+                os.path.basename(path)
+                for path in node.get_snapshots(include_read_only=True)
+            )
+
+        total_snapshots = len(snapshots)
+
+        snapshot_interval_s = snapshot_interval_ms / 1000
+        election_timeout_s = args.election_timeout_ms / 1000
+        # Lower bound: in the worst case each snapshot is delayed by one extra
+        # election timeout beyond the nominal snapshot interval while leadership
+        # is re-established.
+        min_expected = elapsed / (snapshot_interval_s + election_timeout_s * 1.2)
+        # Upper bound: the theoretical maximum is elapsed / snapshot_interval_s.
+        # We add 1 to account for timing imprecision at the boundary.
+        max_expected = elapsed / (snapshot_interval_s * 0.9) + 1
+        LOG.info(
+            f"Elapsed: {elapsed:.1f}s, snapshots: {total_snapshots}, "
+            f"expected bounds [{min_expected:.1f}, {max_expected:.1f}] "
+            f"(interval={snapshot_interval_ms}ms, election_timeout={args.election_timeout_ms}ms)"
+        )
+
+        assert min_expected <= total_snapshots <= max_expected, (
+            f"Snapshot count {total_snapshots} is outside expected bounds "
+            f"[{min_expected:.1f}, {max_expected:.1f}] based on elapsed time, "
+            f"snapshot interval, and election timeout"
+        )
+
+
+def run_snp_tests(args):
+    run_initial_uvm_descriptor_checks(args)
+    run_initial_tcb_version_checks(args)
+    run_recovery_local_unsealing(args, suffix="_unsealing")
+    run_recovery_local_unsealing(args, rekey=True, suffix="_unsealing_with_rekey")
+    run_recovery_local_unsealing(
+        args,
+        recovery_shares_refresh=True,
+        suffix="_unsealing_with_recovery_shares_refresh",
+    )
+    run_recovery_local_unsealing(args, recovery_f=1, suffix="_unsealing_with_f_equal_1")
+    run_recovery_unsealing_validate_audit(args)
+    run_error_message_on_failure_to_read_aci_sec_context(args)
+    run_recovery_decision_protocol(args)
+    run_recovery_decision_protocol_timeout_path(args)
+    run_recovery_decision_protocol_multiple_timeout(args)
+
+
+def test_max_retained_snapshot_files(network, args):
+    max_retained = args.files_cleanup_max_snapshots
+    primary, _ = network.find_primary()
+
+    snapshots_dir = os.path.join(
+        primary.remote.remote.root,
+        primary.remote.snapshots_dir_name,
+    )
+
+    def wait_for_snapshot_seqnos(count, timeout=10):
+        end_time = time.time() + timeout
+        observed_seqnos = set()
+        while time.time() < end_time:
+            observed_seqnos = set()
+            for f in os.listdir(snapshots_dir):
+                if f.startswith("snapshot_") and ccf.ledger.is_snapshot_file_committed(
+                    f
+                ):
+                    seqno, _ = ccf.ledger.snapshot_index_from_filename(f)
+                    observed_seqnos.add(seqno)
+
+            if len(observed_seqnos) >= count:
+                return sorted(observed_seqnos)
+
+            time.sleep(0.1)
+
+        raise TimeoutError(
+            f"Timed out waiting for at least {count} committed snapshots in "
+            f"{snapshots_dir}. Last observed {len(observed_seqnos)}: {sorted(observed_seqnos)}"
+        )
+
+    def wait_for_cleanup(max_count, timeout=10):
+        """Wait for the periodic cleanup timer to prune snapshots."""
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            committed = [
+                f
+                for f in os.listdir(snapshots_dir)
+                if f.startswith("snapshot_")
+                and ccf.ledger.is_snapshot_file_committed(f)
+            ]
+            if len(committed) <= max_count:
+                return
+            time.sleep(0.5)
+        raise TimeoutError(
+            f"Timed out waiting for snapshot count to drop to {max_count} in "
+            f"{snapshots_dir}. Found {len(committed)}: {sorted(committed)}"
+        )
+
+    # We expect an initial snapshot, created by network open.
+    prev_seqnos = wait_for_snapshot_seqnos(count=1)
+    LOG.info(f"Initial snapshots on disk: {prev_seqnos}")
+
+    # Generate more snapshots than the retention limit, checking invariants at each step
+    num_snapshots_to_create = max_retained + 3
+    for i in range(num_snapshots_to_create):
+        LOG.info(f"Triggering snapshot {i + 1}/{num_snapshots_to_create}")
+        network.txs.issue(network, number_txs=3)
+
+        with primary.client() as c:
+            r = c.get("/node/commit").body.json()
+            seqno_before = TxID.from_str(r["transaction_id"]).seqno
+
+        primary.trigger_snapshot()
+        network.txs.issue(network, number_txs=3)
+
+        # Wait for a new committed snapshot to appear. Once at the retention
+        # limit the cleanup timer may prune before we observe a higher total,
+        # so we look for a *new* seqno rather than an increased count.
+        def wait_for_new_snapshot(prev, timeout=10):
+            end_time = time.time() + timeout
+            while time.time() < end_time:
+                observed = set()
+                for f in os.listdir(snapshots_dir):
+                    if f.startswith(
+                        "snapshot_"
+                    ) and ccf.ledger.is_snapshot_file_committed(f):
+                        seqno, _ = ccf.ledger.snapshot_index_from_filename(f)
+                        observed.add(seqno)
+                if observed - set(prev):
+                    return sorted(observed)
+                time.sleep(0.1)
+            raise TimeoutError(
+                f"Timed out waiting for a new committed snapshot in "
+                f"{snapshots_dir}. Previous: {prev}, last observed: {sorted(observed)}"
+            )
+
+        current_seqnos = wait_for_new_snapshot(prev_seqnos)
+
+        LOG.info(
+            f"Snapshot {i + 1}: seqnos on disk: {current_seqnos}, "
+            f"previous iteration: {prev_seqnos}"
+        )
+
+        # The latest snapshot is the one we just created
+        assert current_seqnos[-1] >= seqno_before, (
+            f"Expected the newest snapshot seqno {current_seqnos[-1]} "
+            f"to be >= seqno_before {seqno_before}"
+        )
+
+        # Wait for the periodic cleanup timer to prune old snapshots
+        if len(current_seqnos) > max_retained:
+            wait_for_cleanup(max_retained)
+
+        # Re-read the snapshot list after cleanup
+        current_seqnos = sorted(
+            {
+                ccf.ledger.snapshot_index_from_filename(f)[0]
+                for f in os.listdir(snapshots_dir)
+                if f.startswith("snapshot_")
+                and ccf.ledger.is_snapshot_file_committed(f)
+            }
+        )
+
+        assert len(current_seqnos) <= max_retained, (
+            f"Expected at most {max_retained} snapshots after iteration {i + 1}, "
+            f"found {len(current_seqnos)}: {current_seqnos}"
+        )
+
+        # All snapshots except the latest were present in the previous iteration
+        for seqno in current_seqnos[:-1]:
+            assert seqno in prev_seqnos, (
+                f"Snapshot with seqno {seqno} was not present in the previous "
+                f"iteration {prev_seqnos}"
+            )
+
+        prev_seqnos = current_seqnos
+
+    return network
+
+
+def run_max_retained_snapshot_files(const_args):
+    args = copy.deepcopy(const_args)
+    args.common_read_only_ledger_dir = None
+    args.label = f"{args.label}_max_retained_snapshots"
+    args.snapshot_tx_interval = 10000
+    args.files_cleanup_max_snapshots = 3
+    args.files_cleanup_interval = "1s"
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(args)
+        test_max_retained_snapshot_files(network, args)
+
+
+def test_backup_snapshot_cleanup(network, args):
+    max_retained = args.files_cleanup_max_snapshots
+    primary, _ = network.find_primary()
+    backups = network.find_backups()
+    assert len(backups) > 0, "Expected at least one backup node"
+
+    num_snapshots_to_create = max_retained + 3
+    for i in range(num_snapshots_to_create):
+        LOG.info(f"Triggering snapshot {i + 1}/{num_snapshots_to_create}")
+        network.txs.issue(network, number_txs=3)
+        primary.trigger_snapshot()
+        network.txs.issue(network, number_txs=3)
+
+    # Wait for backups to download and clean up snapshots.
+    # The cleanup timer should fire within the configured interval.
+    for backup in backups:
+        backup_snapshots_dir = os.path.join(
+            backup.remote.remote.root, backup.remote.snapshots_dir_name
+        )
+        LOG.info(
+            f"Waiting for backup {backup.local_node_id} to prune snapshots "
+            f"in {backup_snapshots_dir} to at most {max_retained}"
+        )
+
+        timeout_s = 30
+        end_time = time.time() + timeout_s
+        while time.time() < end_time:
+            committed = [
+                f
+                for f in os.listdir(backup_snapshots_dir)
+                if f.startswith("snapshot_")
+                and ccf.ledger.is_snapshot_file_committed(f)
+            ]
+            if len(committed) <= max_retained:
+                LOG.success(
+                    f"Backup {backup.local_node_id}: "
+                    f"{len(committed)} committed snapshots (<= {max_retained})"
+                )
+                break
+            time.sleep(0.5)
+        else:
+            committed = [
+                f
+                for f in os.listdir(backup_snapshots_dir)
+                if f.startswith("snapshot_")
+                and ccf.ledger.is_snapshot_file_committed(f)
+            ]
+            raise AssertionError(
+                f"Backup {backup.local_node_id} has {len(committed)} committed "
+                f"snapshots after {timeout_s}s, expected at most {max_retained}: "
+                f"{sorted(committed)}"
+            )
+
+    return network
+
+
+def run_backup_snapshot_cleanup(const_args):
+    args = copy.deepcopy(const_args)
+    args.common_read_only_ledger_dir = None
+    args.label = f"{args.label}_backup_snapshot_cleanup"
+    args.snapshot_tx_interval = 30
+    args.files_cleanup_max_snapshots = 3
+    args.files_cleanup_interval = "1s"
+    args.nodes = infra.e2e_args.max_nodes(args, f=0)
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(args, backup_snapshot_fetch_enabled=True)
+        test_backup_snapshot_cleanup(network, args)
+
+
+def copy_ledger_chunk_to_read_only_dir(src, dst, mutate=None):
+    """
+    Copy a ledger chunk into a read-only ledger directory without exposing
+    a partial or transient copy under its final name. Ledger cleanup deletes
+    the source as soon as a digest-identical copy is visible in the read-only
+    directory, so the copy is published atomically once the source is no
+    longer needed and, if a mutate callback is given, only after the callback
+    has been applied to the temporary copy.
+    """
+    with tempfile.NamedTemporaryFile(
+        dir=os.path.dirname(dst), delete=False
+    ) as tmp_file:
+        tmp_path = tmp_file.name
+
+    try:
+        shutil.copyfile(src, tmp_path)
+        if mutate is not None:
+            mutate(tmp_path)
+        os.replace(tmp_path, dst)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def test_max_committed_ledger_chunk_files(network, args, read_only_ledger_dir):
+    """
+    Verify that the periodic cleanup timer deletes committed ledger chunks
+    from the main ledger directory down to the configured retention limit.
+    Chunks are copied to the read-only dir so the digest check passes.
+    """
+    max_retained = args.files_cleanup_max_committed_ledger_chunks
+    primary, _ = network.find_primary()
+    main_ledger_dir = primary.get_main_ledger_dir()
+
+    def get_committed_chunks():
+        return sorted(
+            [
+                f
+                for f in os.listdir(main_ledger_dir)
+                if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f)
+            ],
+            key=lambda f: ccf.ledger.range_from_filename(f)[0],
+        )
+
+    def copy_new_committed_to_readonly():
+        """Copy any committed chunks from main dir to read-only dir."""
+        for f in os.listdir(main_ledger_dir):
+            if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f):
+                dst = os.path.join(read_only_ledger_dir, f)
+                if not os.path.exists(dst):
+                    src = os.path.join(main_ledger_dir, f)
+                    copy_ledger_chunk_to_read_only_dir(src, dst)
+
+    def wait_for_cleanup(max_count, timeout=15):
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            committed = get_committed_chunks()
+            if len(committed) <= max_count:
+                return committed
+            time.sleep(0.5)
+        current = get_committed_chunks()
+        raise TimeoutError(
+            f"Timed out waiting for committed chunk count to drop to {max_count} in "
+            f"{main_ledger_dir}. Found {len(current)}: {sorted(current)}"
+        )
+
+    initial_committed = get_committed_chunks()
+    LOG.info(f"Initial committed chunks: {len(initial_committed)}")
+
+    # Generate more committed chunks than the retention limit
+    num_chunks_to_create = max_retained + 4
+    for i in range(num_chunks_to_create):
+        LOG.info(f"Forcing ledger chunk {i + 1}/{num_chunks_to_create}")
+        network.txs.issue(network, number_txs=3)
+        network.consortium.force_ledger_chunk(primary)
+        network.txs.issue(network, number_txs=3)
+        # Copy committed chunks to read-only dir so digest check passes
+        copy_new_committed_to_readonly()
+
+    # Wait for committed chunks to appear then for cleanup to prune
+    time.sleep(2)
+    committed_after = get_committed_chunks()
+    LOG.info(f"Committed chunks after issuing: {len(committed_after)}")
+
+    if len(committed_after) > max_retained:
+        committed_after = wait_for_cleanup(max_retained)
+
+    assert len(committed_after) <= max_retained, (
+        f"Expected at most {max_retained} committed chunks, "
+        f"found {len(committed_after)}: {committed_after}"
+    )
+
+    # Verify the retained chunks are the newest
+    all_start_seqnos = [ccf.ledger.range_from_filename(f)[0] for f in committed_after]
+    assert all_start_seqnos == sorted(
+        all_start_seqnos
+    ), f"Retained chunks are not sorted: {all_start_seqnos}"
+
+    return network
+
+
+def run_max_committed_ledger_chunk_files(const_args):
+    args = copy.deepcopy(const_args)
+    args.label = f"{args.label}_max_committed_ledger_chunks"
+    args.ledger_chunk_bytes = "20KB"
+    args.files_cleanup_max_committed_ledger_chunks = 3
+    args.files_cleanup_interval = "1s"
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        args.common_read_only_ledger_dir = tmp_dir
+
+        with infra.network.network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            pdb=args.pdb,
+            txs=app.LoggingTxs("user0"),
+        ) as network:
+            network.start_and_open(args)
+
+            # Copy all existing committed chunks to read-only dir so they can be pruned
+            primary, _ = network.find_primary()
+            main_ledger_dir = primary.get_main_ledger_dir()
+            for f in os.listdir(main_ledger_dir):
+                if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f):
+                    copy_ledger_chunk_to_read_only_dir(
+                        os.path.join(main_ledger_dir, f), os.path.join(tmp_dir, f)
+                    )
+
+            test_max_committed_ledger_chunk_files(network, args, tmp_dir)
+
+
+def test_ledger_chunk_cleanup_with_read_only_dir(network, args):
+    """
+    When read-only ledger directories are configured, only committed ledger
+    chunks that have an identical copy (by SHA-256 digest) in a read-only
+    directory should be deleted. Chunks not present there must be kept.
+    """
+    max_retained = args.files_cleanup_max_committed_ledger_chunks
+    primary, _ = network.find_primary()
+    main_ledger_dir = primary.get_main_ledger_dir()
+
+    # The read-only ledger dir for this node
+    read_only_ledger_dir = os.path.join(
+        primary.remote.remote.root,
+        primary.remote.read_only_ledger_dirs_names[0],
+    )
+    os.makedirs(read_only_ledger_dir, exist_ok=True)
+
+    def get_committed_chunks(d):
+        return sorted(
+            [
+                f
+                for f in os.listdir(d)
+                if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f)
+            ],
+            key=lambda f: ccf.ledger.range_from_filename(f)[0],
+        )
+
+    # Generate lots of committed chunks
+    num_chunks = max_retained + 5
+    for i in range(num_chunks):
+        network.txs.issue(network, number_txs=3)
+        network.consortium.force_ledger_chunk(primary)
+        network.txs.issue(network, number_txs=3)
+
+    time.sleep(1)
+
+    # Pause cleanup by collecting committed chunks before they're pruned.
+    # Copy only some of the oldest chunks to read-only dir.
+    committed = get_committed_chunks(main_ledger_dir)
+    LOG.info(f"Committed chunks before backup: {len(committed)}")
+
+    # Copy the 2 oldest committed chunks to read-only dir
+    num_to_backup = 2
+    backed_up = []
+    for f in committed[:num_to_backup]:
+        src = os.path.join(main_ledger_dir, f)
+        dst = os.path.join(read_only_ledger_dir, f)
+        copy_ledger_chunk_to_read_only_dir(src, dst)
+        backed_up.append(f)
+        LOG.info(f"Backed up {f} to read-only dir")
+
+    # Wait for the cleanup timer to process
+    timeout = 20
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        current = get_committed_chunks(main_ledger_dir)
+        if len(current) <= max_retained + (
+            len(committed) - max_retained - num_to_backup
+        ):
+            break
+        time.sleep(0.5)
+
+    current = get_committed_chunks(main_ledger_dir)
+    LOG.info(f"Committed chunks after cleanup: {len(current)}, files: {current}")
+
+    # The backed-up chunks should have been deleted from main dir
+    for f in backed_up:
+        assert f not in current, (
+            f"Chunk {f} was backed up to read-only dir but was not deleted "
+            f"from main dir. Current: {current}"
+        )
+
+    # Chunks not in read-only dir that were over the limit should still be present
+    # (they couldn't be safely deleted)
+    not_backed_up_over_limit = [f for f in committed if f not in backed_up][
+        : len(committed) - max_retained - num_to_backup
+    ]
+    for f in not_backed_up_over_limit:
+        assert f in current, (
+            f"Chunk {f} was NOT in read-only dir and should have been kept, "
+            f"but was deleted. Current: {current}"
+        )
+
+    # Clean up read-only dir so leftover files don't interfere with shutdown
+    # ledger validation
+    for f in os.listdir(read_only_ledger_dir):
+        try:
+            os.remove(os.path.join(read_only_ledger_dir, f))
+        except OSError as e:
+            LOG.warning(f"Failed to clean up read-only ledger file {f}: {e}")
+
+    return network
+
+
+def test_ledger_chunk_cleanup_digest_mismatch(network, args):
+    """
+    When a committed chunk exists in the read-only directory but its digest
+    does not match the local copy, the chunk must NOT be deleted.
+    """
+    max_retained = args.files_cleanup_max_committed_ledger_chunks
+    primary, _ = network.find_primary()
+    main_ledger_dir = primary.get_main_ledger_dir()
+
+    read_only_ledger_dir = os.path.join(
+        primary.remote.remote.root,
+        primary.remote.read_only_ledger_dirs_names[0],
+    )
+    os.makedirs(read_only_ledger_dir, exist_ok=True)
+
+    def get_committed_chunks(d):
+        return sorted(
+            [
+                f
+                for f in os.listdir(d)
+                if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f)
+            ],
+            key=lambda f: ccf.ledger.range_from_filename(f)[0],
+        )
+
+    # Generate committed chunks
+    num_chunks = max_retained + 3
+    for i in range(num_chunks):
+        network.txs.issue(network, number_txs=3)
+        network.consortium.force_ledger_chunk(primary)
+        network.txs.issue(network, number_txs=3)
+
+    time.sleep(1)
+    committed = get_committed_chunks(main_ledger_dir)
+    LOG.info(f"Committed chunks: {len(committed)}")
+
+    if len(committed) <= max_retained:
+        LOG.warning("Not enough committed chunks to test cleanup, skipping")
+        return network
+
+    # Copy oldest chunk to read-only dir, but corrupt it. The corruption is
+    # applied before the copy is published under its final name: a transient
+    # digest-identical copy would legitimately allow cleanup to delete the
+    # source, making the assertion below fail spuriously.
+    target_chunk = committed[0]
+    src = os.path.join(main_ledger_dir, target_chunk)
+    dst = os.path.join(read_only_ledger_dir, target_chunk)
+
+    def flip_first_byte(path):
+        with open(path, "r+b") as f:
+            original_byte = f.read(1)
+            f.seek(0)
+            f.write(bytes([original_byte[0] ^ 0xFF]))
+
+    copy_ledger_chunk_to_read_only_dir(src, dst, mutate=flip_first_byte)
+
+    LOG.info(f"Corrupted read-only copy of {target_chunk}")
+
+    # Wait for cleanup timer
+    time.sleep(3)
+
+    current = get_committed_chunks(main_ledger_dir)
+    LOG.info(f"Committed chunks after cleanup: {len(current)}")
+
+    # The target chunk should still exist because the digest didn't match
+    assert target_chunk in current, (
+        f"Chunk {target_chunk} was deleted despite digest mismatch with "
+        f"read-only copy. Current: {current}"
+    )
+
+    # Clean up corrupted read-only copy so it doesn't interfere with shutdown
+    # ledger validation
+    for f in os.listdir(read_only_ledger_dir):
+        try:
+            os.remove(os.path.join(read_only_ledger_dir, f))
+        except OSError as e:
+            LOG.warning(f"Failed to clean up read-only ledger file {f}: {e}")
+
+    return network
+
+
+def test_post_snapshot_chunks_retained(network, args, read_only_ledger_dir):
+    """
+    Verify that committed ledger chunks created after the latest snapshot are
+    NOT deleted even when the total count exceeds max_committed_ledger_chunks.
+    The cleanup logic must preserve all chunks newer than the snapshot watermark
+    so that a node can still recover from that snapshot.
+    """
+    max_retained = args.files_cleanup_max_committed_ledger_chunks
+    primary, _ = network.find_primary()
+    main_ledger_dir = primary.get_main_ledger_dir()
+    snapshots_dir = os.path.join(
+        primary.remote.remote.root,
+        primary.remote.snapshots_dir_name,
+    )
+
+    def get_committed_chunks():
+        return sorted(
+            [
+                f
+                for f in os.listdir(main_ledger_dir)
+                if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f)
+            ],
+            key=lambda f: ccf.ledger.range_from_filename(f)[0],
+        )
+
+    def copy_new_committed_to_readonly():
+        for f in os.listdir(main_ledger_dir):
+            if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f):
+                dst = os.path.join(read_only_ledger_dir, f)
+                if not os.path.exists(dst):
+                    src = os.path.join(main_ledger_dir, f)
+                    copy_ledger_chunk_to_read_only_dir(src, dst)
+
+    def get_latest_committed_snapshot_seqno():
+        best = None
+        for f in os.listdir(snapshots_dir):
+            if f.startswith("snapshot_") and ccf.ledger.is_snapshot_file_committed(f):
+                seqno, _ = ccf.ledger.snapshot_index_from_filename(f)
+                if best is None or seqno > best:
+                    best = seqno
+        return best
+
+    # Step 1: Generate some chunks and trigger a snapshot so we have a watermark
+    LOG.info("Generating initial chunks and triggering a snapshot")
+    for _ in range(3):
+        network.txs.issue(network, number_txs=3)
+        network.consortium.force_ledger_chunk(primary)
+        network.txs.issue(network, number_txs=3)
+    copy_new_committed_to_readonly()
+
+    snapshot_tx_id = primary.trigger_snapshot()
+
+    # Wait for the snapshot to appear
+    timeout = 10
+    end_time = time.time() + timeout
+    snapshot_seqno = None
+    while time.time() < end_time:
+        snapshot_seqno = get_latest_committed_snapshot_seqno()
+        if snapshot_seqno is not None and snapshot_seqno >= snapshot_tx_id.seqno:
+            break
+        time.sleep(0.5)
+    assert (
+        snapshot_seqno is not None
+    ), f"Timed out waiting for a committed snapshot covering {snapshot_tx_id.seqno} in {snapshots_dir}"
+    LOG.info(f"Latest committed snapshot seqno: {snapshot_seqno}")
+
+    # Step 2: Generate many chunks AFTER the snapshot so they exceed max_retained
+    num_post_snapshot_chunks = max_retained + 3
+    LOG.info(
+        f"Generating {num_post_snapshot_chunks} chunks after snapshot "
+        f"(max_retained={max_retained})"
+    )
+    for i in range(num_post_snapshot_chunks):
+        network.txs.issue(network, number_txs=3)
+        network.consortium.force_ledger_chunk(primary)
+        network.txs.issue(network, number_txs=3)
+        copy_new_committed_to_readonly()
+
+    # Step 3: Re-query the latest snapshot seqno, since new snapshots may have
+    # been auto-triggered during Step 2. The C++ cleanup uses the latest
+    # snapshot as its watermark, so the test must compare against the same value.
+    snapshot_seqno = get_latest_committed_snapshot_seqno()
+    assert snapshot_seqno is not None
+    LOG.info(f"Latest committed snapshot seqno (post Step 2): {snapshot_seqno}")
+
+    # Step 4: Let the cleanup timer run
+    time.sleep(3)
+
+    # Step 5: Verify that all chunks after the snapshot watermark are retained
+    committed = get_committed_chunks()
+    LOG.info(f"Committed chunks after cleanup: {len(committed)}")
+
+    post_snapshot_chunks = [
+        f
+        for f in committed
+        if ccf.ledger.range_from_filename(f)[1] is not None
+        and ccf.ledger.range_from_filename(f)[1] >= snapshot_seqno
+    ]
+
+    LOG.info(
+        f"Post-snapshot chunks (end >= {snapshot_seqno}): "
+        f"{len(post_snapshot_chunks)}"
+    )
+
+    # There must be more post-snapshot chunks than max_retained to prove
+    # that the watermark prevented deletion
+    assert len(post_snapshot_chunks) > max_retained, (
+        f"Expected more than {max_retained} post-snapshot chunks to be retained, "
+        f"but only found {len(post_snapshot_chunks)}: {post_snapshot_chunks}. "
+        f"Snapshot watermark: {snapshot_seqno}"
+    )
+
+    # All post-snapshot chunks must still be present
+    for chunk in post_snapshot_chunks:
+        _chunk_start, chunk_end = ccf.ledger.range_from_filename(chunk)
+        assert chunk_end >= snapshot_seqno, (
+            f"Post-snapshot chunk {chunk} (end={chunk_end}) should not have "
+            f"been deleted (snapshot watermark={snapshot_seqno})"
+        )
+
+    return network
+
+
+def run_post_snapshot_chunk_retention(const_args):
+    args = copy.deepcopy(const_args)
+    args.label = f"{args.label}_post_snapshot_chunk_retention"
+    args.ledger_chunk_bytes = "20KB"
+    # Use a very low retention limit so cleanup would aggressively delete
+    # if the snapshot watermark were not respected
+    args.files_cleanup_max_committed_ledger_chunks = 1
+    args.files_cleanup_interval = "1s"
+    # High to avoid tx-count-triggered snapshots during chunk generation
+    args.snapshot_tx_interval = 100000
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        args.common_read_only_ledger_dir = tmp_dir
+
+        with infra.network.network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            pdb=args.pdb,
+            txs=app.LoggingTxs("user0"),
+        ) as network:
+            network.start_and_open(args)
+
+            primary, _ = network.find_primary()
+            main_ledger_dir = primary.get_main_ledger_dir()
+            for f in os.listdir(main_ledger_dir):
+                if f.startswith("ledger_") and ccf.ledger.is_ledger_chunk_committed(f):
+                    src = os.path.join(main_ledger_dir, f)
+                    dst = os.path.join(tmp_dir, f)
+                    copy_ledger_chunk_to_read_only_dir(src, dst)
+
+            test_post_snapshot_chunks_retained(network, args, tmp_dir)
+
+
+def run_ledger_cleanup_no_read_only_dir_check(const_args):
+    """
+    Verify that a node fails to start when max_committed_ledger_chunks is
+    configured but no read-only ledger directory is provided.
+    """
+    args = copy.deepcopy(const_args)
+    args.label = f"{args.label}_ledger_cleanup_no_ro_dir"
+    args.nodes = infra.e2e_args.nodes(args, 1)
+    args.files_cleanup_max_committed_ledger_chunks = 3
+    args.files_cleanup_interval = "1s"
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        try:
+            network.start(args)
+        except Exception as start_error:
+            LOG.debug(f"Ignoring expected network start failure: {start_error}")
+
+        network.skip_verify_chunking = True
+        network.ignore_errors_on_shutdown()
+
+        node = network.nodes[0]
+        expected_msg = (
+            "Exception in ccf::run: files_cleanup.max_committed_ledger_chunks "
+            "requires at least one "
+            "ledger.read_only_directories entry"
+        )
+        out_path, _ = node.get_logs()
+        with open(out_path, encoding="utf-8") as f:
+            output = f.read()
+        error_index = output.find(expected_msg)
+        cleanup_index = output.find("cleanup iteration(s)")
+        assert 0 <= error_index < cleanup_index, (
+            "Expected missing read-only ledger directory error before final "
+            f"cleanup:\n{output}"
+        )
+        assert "Created new node" not in output, output
+        assert "Entering event loop" not in output, output
+
+        LOG.success(
+            "Node correctly refused to start without read-only ledger directory"
+        )
+
+
+def run_ledger_chunk_cleanup_tests(const_args):
+    args = copy.deepcopy(const_args)
+    args.label = f"{args.label}_ledger_chunk_cleanup"
+    args.ledger_chunk_bytes = "20KB"
+    args.files_cleanup_max_committed_ledger_chunks = 3
+    args.files_cleanup_interval = "1s"
+
+    # Use a common read-only ledger dir for the read-only dir tests
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        args.common_read_only_ledger_dir = tmp_dir
+
+        with infra.network.network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            pdb=args.pdb,
+            txs=app.LoggingTxs("user0"),
+            check_file_invariants=False,
+        ) as network:
+            network.start_and_open(args)
+            # These tests intentionally produce [fail] log lines when chunks
+            # are kept because no matching read-only copy exists, or because
+            # the digest does not match.
+            network.ignore_error_pattern_on_shutdown("Keeping ledger chunk")
+            network.ignore_error_pattern_on_shutdown("digest does not match")
+            test_ledger_chunk_cleanup_with_read_only_dir(network, args)
+            test_ledger_chunk_cleanup_digest_mismatch(network, args)
+
+
+@reqs.description("Pending node entries expire after the configured timeout")
+def test_pending_node_expiration(network, args, failover=False):
+    primary, _ = network.find_primary()
+    pending_node = network.create_node()
+    network.join_node(
+        pending_node,
+        args.package,
+        args,
+        target_node=primary,
+        from_snapshot=False,
+    )
+
+    with primary.client() as c:
+        r = c.get(f"/node/network/nodes/{pending_node.node_id}")
+        assert r.status_code == http.HTTPStatus.OK, r
+        assert r.body.json()["status"] == "Pending", r.body.json()
+
+    pending_node.stop()
+
+    if failover:
+        network.wait_for_all_nodes_to_commit(primary)
+        primary.stop()
+        primary, _ = network.wait_for_new_primary(primary)
+
+    timeout_s = infra.e2e_args._convert_time_string(args.pending_node_timeout, "s")
+    end_time = time.time() + 3 * timeout_s
+    with primary.client() as c:
+        while time.time() < end_time:
+            r = c.get(f"/node/network/nodes/{pending_node.node_id}")
+            if r.status_code == http.HTTPStatus.NOT_FOUND:
+                break
+            assert r.status_code == http.HTTPStatus.OK, r
+            assert r.body.json()["status"] == "Pending", r.body.json()
+            time.sleep(0.1)
+        else:
+            raise TimeoutError(f"Pending node {pending_node.node_id} was not removed")
+
+    return network
+
+
+def run_pending_node_expiration(const_args):
+    args = copy.deepcopy(const_args)
+    args.label += "_pending_node_expiration"
+    args.nodes = infra.e2e_args.min_nodes(args, f=1)
+    args.pending_node_timeout = "10s"
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(args)
+        test_pending_node_expiration(network, args)
+
+        primary, _ = network.find_primary()
+        network.consortium.set_all_nodes_certificate_validity(
+            primary,
+            datetime.now(UTC),
+            args.maximum_node_certificate_validity_days,
+        )
+        network.wait_for_all_nodes_to_commit(primary)
+        test_pending_node_expiration(network, args)
+        test_pending_node_expiration(network, args, failover=True)
+
+        primary, _ = network.find_primary()
+        network.stop_all_nodes(skip_verification=True)
+
+    # Expired Pending nodes are removed along with an endorsed certificate
+    # they never had, which full offline verification must accept
+    validator = ccf.ledger.LedgerValidator()
+
+    # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+    class NodeCertificates(dict):
+        def pop(self, key, default=None):
+            return super().pop(key, default)
+
+    validator.node_certificates = NodeCertificates(validator.node_certificates)
+    # END SDK 7.0.18 compatibility.
+    ledger = ccf.ledger.Ledger(
+        primary.remote.ledger_paths(),
+        committed_only=False,
+        contiguous_suffix=True,
+    )
+    for chunk in ledger:
+        for tx in chunk:
+            validator.add_transaction(tx)
+    LOG.info(f"Verified ledger until {validator.last_verified_txid()}")
+
+
+# The operations tests below are split into groups which are run
+# concurrently, as separate ConcurrentRunner sub-tests (see tests/schema.py).
+# Each group runs its own tests sequentially, so tests which share a workspace
+# label must stay within a single group. Keep the groups roughly balanced, as
+# the slowest group bounds the total run time.
+
+
+def run_offline_ledger_tools(args):
+    run_ledger_viz_test(args)
+    run_split_ledger_test(args)
     run_file_operations(args)
+    run_read_ledger_on_testdata(args)
+    run_merkle_verification_level(args)
+
+
+def run_snapshot_manual_and_retention(args):
+    run_forced_snapshot_while_opening(args)
+    run_manual_snapshot_tests(args)
+    run_max_retained_snapshot_files(args)
+    run_backup_snapshot_cleanup(args)
+
+
+def run_ledger_chunk_operations(args):
+    run_max_uncommitted_tx_count(args)
+    run_max_committed_ledger_chunk_files(args)
+    run_post_snapshot_chunk_retention(args)
+    run_ledger_cleanup_no_read_only_dir_check(args)
+    run_ledger_chunk_cleanup_tests(args)
+
+
+def run_node_config_checks(args):
     run_tls_san_checks(args)
+    run_tls_san_join_mismatch(args)
     run_config_timeout_check(args)
+    run_pending_node_expiration(args)
     run_configuration_file_checks(args)
+    run_limit_config_checks(args)
     run_pid_file_check(args)
     run_preopen_readiness_check(args)
     run_sighup_check(args)
+    run_service_subject_name_check(args)
+    run_empty_ledger_dir_check(args)
+    run_propose_request_vote(args)
+
+
+def run_cose_checks(args):
+    run_cose_signatures_config_check(args)
+    run_late_mounted_ledger_check(args)
+    run_cose_only_mode_upgrade(args)
+
+
+def run_time_based_snapshots(args):
+    run_time_based_snapshotting(args)
+
+
+def run_snapshot_persistence(args):
+    run_snapshot_persistence_across_primary_failure(args)

@@ -21,6 +21,7 @@ namespace ccf::pal
     }
 
     AttestationReportData() = default;
+
     AttestationReportData(std::span<const uint8_t> data)
     {
       if (data.size() != size())
@@ -36,10 +37,15 @@ namespace ccf::pal
     }
   };
 
+  // Virtual
+  static constexpr size_t virtual_attestation_report_data_size = 32;
+  using VirtualAttestationReportData =
+    AttestationReportData<virtual_attestation_report_data_size>;
+
   // SGX
   static constexpr size_t sgx_attestation_report_data_size = 32;
   using SgxAttestationReportData =
-    AttestationReportData<sgx_attestation_measurement_size>;
+    AttestationReportData<sgx_attestation_report_data_size>;
 
   // SNP
   static constexpr size_t snp_attestation_report_data_size = 64;
@@ -53,7 +59,7 @@ namespace ccf::pal
 
     PlatformAttestationReportData() = default;
 
-    PlatformAttestationReportData(const crypto::Sha256Hash& hash) :
+    PlatformAttestationReportData(const ccf::crypto::Sha256Hash& hash) :
       data(hash.h.begin(), hash.h.end())
     {}
 
@@ -62,16 +68,16 @@ namespace ccf::pal
       data(report_data.report_data.begin(), report_data.report_data.end())
     {}
 
-    std::string hex_str() const
+    [[nodiscard]] std::string hex_str() const
     {
       return ds::to_hex(data);
     }
 
-    crypto::Sha256Hash to_sha256_hash() const
+    [[nodiscard]] ccf::crypto::Sha256Hash to_sha256_hash() const
     {
-      std::span<const uint8_t, crypto::Sha256Hash::SIZE> s(
-        data.data(), crypto::Sha256Hash::SIZE);
-      return crypto::Sha256Hash::from_span(s);
+      std::span<const uint8_t, ccf::crypto::Sha256Hash::SIZE> s(
+        data.data(), ccf::crypto::Sha256Hash::SIZE);
+      return ccf::crypto::Sha256Hash::from_span(s);
     }
   };
 }

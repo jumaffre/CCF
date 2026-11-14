@@ -8,18 +8,52 @@
 #define FMT_HEADER_ONLY
 #include "crypto/sharing.h"
 
+#include <charconv>
 #include <fmt/format.h>
 
-using namespace crypto;
+using namespace ccf::crypto::sharing;
 
-void share_and_recover(size_t num_shares, size_t threshold, size_t recoveries)
+void check_share_is_not_trivially_wrong(const Share& share)
 {
+  REQUIRE(share.x != 0);
+  bool all_limbs_are_zero = true;
+  bool all_limbs_are_max = true;
+  for (size_t i = 0; i < LIMBS; ++i)
+  {
+    if (share.y[i] != 0)
+    {
+      all_limbs_are_zero = false;
+    }
+    if (share.y[i] != 0xFFFFFFFF)
+    {
+      all_limbs_are_max = false;
+    }
+    if (!all_limbs_are_zero && !all_limbs_are_max)
+    {
+      break;
+    }
+  }
+  REQUIRE(!all_limbs_are_zero);
+  REQUIRE(!all_limbs_are_max);
+}
+
+void share_and_recover(
+  std::mt19937& rng, size_t num_shares, size_t threshold, size_t recoveries)
+{
+  fmt::println(
+    "Testing {} shares with threshold {} for {} recoveries",
+    num_shares,
+    threshold,
+    recoveries);
   std::vector<Share> shares(num_shares);
 
   Share secret;
   sample_secret_and_shares(secret, shares, threshold);
 
-  std::mt19937 rng{std::random_device{}()};
+  for (const auto& share : shares)
+  {
+    check_share_is_not_trivially_wrong(share);
+  }
 
   for (size_t i = 0; i < recoveries; ++i)
   {
@@ -100,13 +134,28 @@ TEST_CASE("Simple sharing and recovery with duplicate shares")
 
 TEST_CASE("Cover a range of share and recover combinations")
 {
+  uint32_t seed = 0;
+  if (std::getenv("RNG_SEED") != nullptr)
+  {
+    std::string rng_seed(std::getenv("RNG_SEED"));
+    std::from_chars(rng_seed.data(), rng_seed.data() + rng_seed.size(), seed);
+  }
+  if (seed == 0)
+  {
+    seed = std::random_device{}();
+  }
+  fmt::println("RNG Seed: {}", seed);
+
+  std::mt19937 rng;
+  rng.seed(seed);
+
   // Shares, Degree, Recoveries
-  share_and_recover(1, 1, 1);
-  share_and_recover(5, 1, 8);
-  share_and_recover(10, 3, 8);
-  share_and_recover(99, 6, 8);
-  share_and_recover(30000, 100, 8);
-  share_and_recover(200000, 400, 8);
+  share_and_recover(rng, 1, 1, 1);
+  share_and_recover(rng, 5, 1, 8);
+  share_and_recover(rng, 10, 3, 8);
+  share_and_recover(rng, 99, 6, 8);
+  share_and_recover(rng, 30000, 100, 8);
+  share_and_recover(rng, 200000, 400, 8);
 }
 
 TEST_CASE("Serialisation")
@@ -123,10 +172,35 @@ TEST_CASE("Serialisation")
   share.y[7] = 6;
   share.y[8] = 7;
   share.y[9] = 56;
-  Share new_share(share.serialise());
+  std::vector<uint8_t> serialised(share.serialised_size);
+  share.serialise(serialised);
+  Share new_share(serialised);
 
   INFO(share.to_str());
   INFO(new_share.to_str());
 
   REQUIRE(share == new_share);
+}
+
+constexpr element prime = (1ul << 31) - 1ul; // a notorious Mersenne prime
+
+static element reduce(element x)
+{
+  // Actually CT, as compiled by Clang 11+, but obviously not guaranteed to be
+  // so
+  return (x % prime);
+}
+
+TEST_CASE("Smoke test ct_reduce against reduce")
+{
+  for (size_t i = 0; i < (1ul << 16); ++i)
+  {
+    size_t under = prime * i - 1;
+    size_t over = prime * i;
+    size_t mid = prime * i + (prime / 2);
+
+    REQUIRE_MESSAGE(reduce(under) == ct_reduce(under), std::to_string(under));
+    REQUIRE_MESSAGE(reduce(over) == ct_reduce(over), std::to_string(over));
+    REQUIRE_MESSAGE(reduce(mid) == ct_reduce(mid), std::to_string(mid));
+  }
 }

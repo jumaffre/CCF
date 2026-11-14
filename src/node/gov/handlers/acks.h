@@ -3,23 +3,38 @@
 #pragma once
 
 #include "ccf/base_endpoint_registry.h"
+#include "ccf/ds/json.h"
 #include "node/gov/api_version.h"
 #include "node/gov/handlers/helpers.h"
+#include "node/history.h"
+#include "node/internal_tables_access.h"
 #include "node/share_manager.h"
-#include "service/internal_tables_access.h"
 
 namespace ccf::gov::endpoints
 {
-  void init_ack_handlers(
-    ccf::BaseEndpointRegistry& registry,
-    NetworkState& network,
-    ShareManager& share_manager)
+  namespace api
   {
-    auto get_state_digest = [&](auto& ctx, ApiVersion api_version) {
+    struct StateDigest
+    {
+      ccf::MemberId member_id;
+      std::string state_digest;
+    };
+
+    DECLARE_JSON_TYPE(StateDigest);
+    DECLARE_JSON_REQUIRED_FIELDS_WITH_RENAMES(
+      StateDigest, member_id, "memberId", state_digest, "stateDigest");
+  }
+
+  namespace detail
+  {
+    template <typename Ctx>
+    inline void get_state_digest(Ctx& ctx, ApiVersion api_version)
+    {
       switch (api_version)
       {
         case ApiVersion::preview_v1:
-        default:
+        case ApiVersion::v1:
+        case ApiVersion::Latest:
         {
           // Get memberId from path parameter
           std::string error;
@@ -53,28 +68,21 @@ namespace ccf::gov::endpoints
             return;
           }
 
-          auto response_body = nlohmann::json::object();
-          response_body["memberId"] = member_id_str;
-          response_body["stateDigest"] = ack->state_digest;
+          const api::StateDigest response_body{member_id, ack->state_digest};
           ctx.rpc_ctx->set_response_json(response_body, HTTP_STATUS_OK);
           return;
         }
       }
-    };
-    registry
-      .make_read_only_endpoint(
-        "/members/state-digests/{memberId}",
-        HTTP_GET,
-        api_version_adapter(get_state_digest),
-        no_auth_required)
-      .set_openapi_hidden(true)
-      .install();
+    }
 
-    auto update_state_digest = [&](auto& ctx, ApiVersion api_version) {
+    template <typename Ctx>
+    inline void update_state_digest(Ctx& ctx, ApiVersion api_version)
+    {
       switch (api_version)
       {
         case ApiVersion::preview_v1:
-        default:
+        case ApiVersion::v1:
+        case ApiVersion::Latest:
         {
           // Get memberId from path parameter
           std::string error;
@@ -122,11 +130,11 @@ namespace ccf::gov::endpoints
             ack = ack_opt.value();
           }
 
-          // Get signature, containing merkle root state digest
-          auto sigs_handle =
-            ctx.tx.template ro<ccf::Signatures>(Tables::SIGNATURES);
-          auto sig = sigs_handle->get();
-          if (!sig.has_value())
+          // Get merkle root state digest from serialised merkle tree
+          auto tree_handle = ctx.tx.template ro<ccf::SerialisedMerkleTree>(
+            Tables::SERIALISED_MERKLE_TREE);
+          auto tree = tree_handle->get();
+          if (!tree.has_value())
           {
             detail::set_gov_error(
               ctx.rpc_ctx,
@@ -135,33 +143,28 @@ namespace ccf::gov::endpoints
               "Service has no signatures to ack yet - try again soon.");
             return;
           }
+          ccf::MerkleTreeHistory history(tree.value());
 
           // Write ack back to the KV
-          ack.state_digest = sig->root.hex_str();
+          ack.state_digest = history.get_root().hex_str();
           acks_handle->put(member_id, ack);
 
-          auto body = nlohmann::json::object();
-          body["memberId"] = member_id_str;
-          body["stateDigest"] = ack.state_digest;
+          const api::StateDigest body{member_id, ack.state_digest};
           ctx.rpc_ctx->set_response_json(body, HTTP_STATUS_OK);
           return;
         }
       }
-    };
-    registry
-      .make_endpoint(
-        "/members/state-digests/{memberId}:update",
-        HTTP_POST,
-        api_version_adapter(update_state_digest),
-        detail::member_sig_only_policies("state_digest"))
-      .set_openapi_hidden(true)
-      .install();
+    }
 
-    auto ack_state_digest = [&](auto& ctx, ApiVersion api_version) {
+    template <typename Ctx>
+    inline void ack_state_digest(
+      Ctx& ctx, ApiVersion api_version, ShareManager& share_manager)
+    {
       switch (api_version)
       {
         case ApiVersion::preview_v1:
-        default:
+        case ApiVersion::v1:
+        case ApiVersion::Latest:
         {
           // Get memberId from path parameter
           std::string error;
@@ -214,9 +217,22 @@ namespace ccf::gov::endpoints
 
           // Check signed digest matches expected digest in KV
           const auto expected_digest = ack->state_digest;
-          const auto signed_body = nlohmann::json::parse(cose_ident.content);
+          const auto signed_body = ccf::parse_json_safe(cose_ident.content);
+          const auto state_digest_it = signed_body.find("stateDigest");
+          if (
+            state_digest_it == signed_body.end() ||
+            !state_digest_it.value().is_string())
+          {
+            detail::set_gov_error(
+              ctx.rpc_ctx,
+              HTTP_STATUS_BAD_REQUEST,
+              ccf::errors::InvalidInput,
+              "Signed request body is not a JSON object containing required "
+              "string field \"stateDigest\"");
+            return;
+          }
           const auto actual_digest =
-            signed_body["stateDigest"].template get<std::string>();
+            state_digest_it.value().template get<std::string>();
           if (expected_digest != actual_digest)
           {
             detail::set_gov_error(
@@ -232,6 +248,27 @@ namespace ccf::gov::endpoints
                 expected_digest,
                 actual_digest));
             return;
+          }
+
+          if (
+            InternalTablesAccess::is_service_recovering(ctx.tx) &&
+            InternalTablesAccess::is_recovery_participant_or_owner(
+              ctx.tx, member_id))
+          {
+            auto member_info =
+              ctx.tx.template ro<ccf::MemberInfo>(Tables::MEMBER_INFO)
+                ->get(member_id);
+            if (
+              member_info.has_value() &&
+              member_info->status != ccf::MemberStatus::ACTIVE)
+            {
+              detail::set_gov_error(
+                ctx.rpc_ctx,
+                HTTP_STATUS_BAD_REQUEST,
+                ccf::errors::InvalidInput,
+                "Recovery members cannot be activated during recovery.");
+              return;
+            }
           }
 
           // Ensure old HTTP signed req is nulled
@@ -263,11 +300,12 @@ namespace ccf::gov::endpoints
               return;
             }
 
-            // If this is a newly-active recovery member in an open service,
-            // allocate them a recovery share immediately
+            // If this is a newly-active recovery participant/owner in an open
+            // service, allocate them a recovery share immediately
             if (
               newly_active &&
-              InternalTablesAccess::is_recovery_member(ctx.tx, member_id))
+              InternalTablesAccess::is_recovery_participant_or_owner(
+                ctx.tx, member_id))
             {
               auto service_status =
                 InternalTablesAccess::get_service_status(ctx.tx);
@@ -306,6 +344,42 @@ namespace ccf::gov::endpoints
           break;
         }
       }
+    }
+  }
+
+  inline void init_ack_handlers(
+    ccf::BaseEndpointRegistry& registry,
+    NetworkState& /*network*/,
+    ShareManager& share_manager)
+  {
+    auto get_state_digest = [](auto& ctx, ApiVersion api_version) {
+      detail::get_state_digest(ctx, api_version);
+    };
+    registry
+      .make_read_only_endpoint(
+        "/members/state-digests/{memberId}",
+        HTTP_GET,
+        api_version_adapter(get_state_digest),
+        no_auth_required)
+      .set_auto_schema<void, api::StateDigest>()
+      .set_openapi_summary("Get a member's state digest")
+      .install();
+
+    auto update_state_digest = [](auto& ctx, ApiVersion api_version) {
+      detail::update_state_digest(ctx, api_version);
+    };
+    registry
+      .make_endpoint(
+        "/members/state-digests/{memberId}:update",
+        HTTP_POST,
+        api_version_adapter(update_state_digest),
+        detail::member_sig_only_policies("state_digest"))
+      .set_auto_schema<ds::openapi::Cose, api::StateDigest>()
+      .set_openapi_summary("Update a member's state digest")
+      .install();
+
+    auto ack_state_digest = [&](auto& ctx, ApiVersion api_version) {
+      detail::ack_state_digest(ctx, api_version, share_manager);
     };
     registry
       .make_endpoint(
@@ -313,7 +387,8 @@ namespace ccf::gov::endpoints
         HTTP_POST,
         api_version_adapter(ack_state_digest),
         {std::make_shared<MemberCOSESign1AuthnPolicy>("ack")})
-      .set_openapi_hidden(true)
+      .set_auto_schema<ds::openapi::Cose, void>()
+      .set_openapi_summary("Acknowledge a member's state digest")
       .install();
   }
 }

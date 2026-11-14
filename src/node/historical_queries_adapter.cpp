@@ -3,11 +3,15 @@
 
 #include "ccf/historical_queries_adapter.h"
 
+#include "ccf/crypto/cose.h"
+#include "ccf/endpoint_registry.h"
 #include "ccf/historical_queries_utils.h"
 #include "ccf/rpc_context.h"
 #include "ccf/service/tables/service.h"
+#include "crypto/cose.h"
 #include "kv/kv_types.h"
 #include "node/rpc/network_identity_subsystem.h"
+#include "node/signature_cache_interface.h"
 #include "node/tx_receipt_impl.h"
 
 namespace ccf
@@ -17,7 +21,11 @@ namespace ccf
     // Legacy JSON format, retained for compatibility
     nlohmann::json out = nlohmann::json::object();
 
-    out["signature"] = crypto::b64_from_raw(receipt.signature);
+    if (!receipt.signature.has_value())
+    {
+      throw std::logic_error("describe_receipt_v1 requires a raw signature TX");
+    }
+    out["signature"] = ccf::crypto::b64_from_raw(receipt.signature.value());
 
     auto proof = nlohmann::json::array();
     if (receipt.path != nullptr)
@@ -48,11 +56,19 @@ namespace ccf
     if (receipt.path == nullptr)
     {
       // Signature transaction
-      out["leaf"] = receipt.root.to_string();
+      if (!receipt.root.has_value())
+      {
+        throw std::logic_error(
+          "describe_receipt_v1 requires root to be set for a raw signature TX");
+      }
+      out["leaf"] = receipt.root.value().to_string();
     }
     else if (!receipt.commit_evidence.has_value())
     {
-      out["leaf"] = receipt.write_set_digest->hex_str();
+      if (receipt.write_set_digest.has_value())
+      {
+        out["leaf"] = receipt.write_set_digest->hex_str();
+      }
     }
     else
     {
@@ -97,9 +113,9 @@ namespace ccf
       {
         const auto direction =
           node.direction == ccf::HistoryTree::Path::Direction::PATH_LEFT ?
-          ccf::ProofReceipt::ProofStep::Left :
-          ccf::ProofReceipt::ProofStep::Right;
-        const auto hash = crypto::Sha256Hash::from_span(
+          ccf::ProofReceipt::ProofStep::Direction::Left :
+          ccf::ProofReceipt::ProofStep::Direction::Right;
+        const auto hash = ccf::crypto::Sha256Hash::from_span(
           std::span<const uint8_t, ccf::ClaimsDigest::Digest::SIZE>(
             node.hash.bytes, sizeof(node.hash.bytes)));
         proof_receipt->proof.push_back({direction, hash});
@@ -127,17 +143,23 @@ namespace ccf
     else
     {
       // Signature transaction
-      auto sig_receipt = std::make_shared<SignatureReceipt>();
-      sig_receipt->signed_root = crypto::Sha256Hash::from_span(
-        std::span<const uint8_t, ccf::ClaimsDigest::Digest::SIZE>(
-          in.root.bytes, sizeof(in.root.bytes)));
 
+      auto sig_receipt = std::make_shared<SignatureReceipt>();
+      if (in.root.has_value())
+      {
+        sig_receipt->signed_root = ccf::crypto::Sha256Hash::from_span(
+          std::span<const uint8_t, ccf::ClaimsDigest::Digest::SIZE>(
+            in.root.value().bytes, sizeof(in.root.value().bytes)));
+      }
       receipt = sig_receipt;
     }
 
     auto& out = *receipt;
 
-    out.signature = in.signature;
+    if (in.signature.has_value())
+    {
+      out.signature = in.signature.value();
+    }
 
     out.node_id = in.node_id;
 
@@ -152,6 +174,152 @@ namespace ccf
     }
 
     return receipt;
+  }
+
+  std::optional<std::vector<uint8_t>> describe_merkle_proof_v1(
+    const TxReceiptImpl& receipt)
+  {
+    if (!receipt.commit_evidence)
+    {
+      LOG_DEBUG_FMT("Merkle proof is missing commit evidence");
+      return std::nullopt;
+    }
+
+    if (!receipt.write_set_digest)
+    {
+      LOG_DEBUG_FMT("Merkle proof is missing write set digest");
+      return std::nullopt;
+    }
+
+    if (!receipt.path)
+    {
+      LOG_DEBUG_FMT("Merkle proof is missing path");
+      return std::nullopt;
+    }
+
+    return encode_merkle_proof(
+      receipt.write_set_digest.value(),
+      receipt.commit_evidence.value(),
+      receipt.claims_digest.value(),
+      *receipt.path);
+  }
+
+  std::optional<SerialisedCoseEndorsements> describe_cose_endorsements_v1(
+    const TxReceiptImpl& receipt)
+  {
+    return receipt.cose_endorsements;
+  }
+
+  std::optional<SerialisedCoseSignature> describe_cose_signature_v1(
+    const TxReceiptImpl& receipt)
+  {
+    // This API exposes a single signature, so it returns the CLASSICAL one.
+    const auto signature =
+      receipt.cose_signatures.find(IdentityType::CLASSICAL);
+    if (signature == receipt.cose_signatures.end())
+    {
+      return std::nullopt;
+    }
+    return signature->second;
+  }
+
+  std::optional<SerialisedCoseReceipt> describe_cose_receipt_v1(
+    const TxReceiptImpl& receipt)
+  {
+    auto signature = describe_cose_signature_v1(receipt);
+    if (!signature.has_value())
+    {
+      return std::nullopt;
+    }
+    auto proof = describe_merkle_proof_v1(receipt);
+    if (!proof.has_value())
+    {
+      return std::nullopt;
+    }
+
+    auto inclusion_proof =
+      ccf::cose::edit::pos::AtKey{ccf::cose::header::iana::INCLUSION_PROOFS};
+    ccf::cose::edit::desc::Value desc{
+      inclusion_proof, ccf::cose::header::iana::VDP, *proof};
+
+    return ccf::cose::edit::set_unprotected_header(*signature, desc);
+  }
+}
+
+namespace ccf::endpoints
+{
+  TxReceiptImplPtr build_receipt_for_committed_tx(
+    ccf::AbstractNodeContext& context, CommittedTxInfo& info)
+  {
+    if (info.commit_evidence.empty())
+    {
+      info.rpc_ctx->set_error(
+        HTTP_STATUS_INTERNAL_SERVER_ERROR,
+        ccf::errors::InternalError,
+        fmt::format(
+          "Cannot construct receipt for TxID {}: transaction produced no "
+          "write set (read-only transactions do not have receipts)",
+          info.tx_id.to_str()));
+      return nullptr;
+    }
+
+    auto sig_cache = context.get_subsystem<ccf::SignatureCacheInterface>();
+    if (sig_cache == nullptr)
+    {
+      info.rpc_ctx->set_error(
+        HTTP_STATUS_INTERNAL_SERVER_ERROR,
+        ccf::errors::InternalError,
+        "SignatureCacheInterface subsystem is not installed");
+      return nullptr;
+    }
+
+    auto cached_sig = sig_cache->get_signature_for(info.tx_id.seqno);
+    if (!cached_sig.has_value())
+    {
+      info.rpc_ctx->set_error(
+        HTTP_STATUS_INTERNAL_SERVER_ERROR,
+        ccf::errors::InternalError,
+        fmt::format(
+          "No cached signature found covering TxID {}", info.tx_id.to_str()));
+      return nullptr;
+    }
+
+    // Reconstruct merkle tree from the cached serialised tree and
+    // extract a proof for this specific seqno
+    ccf::MerkleTreeHistory tree(cached_sig->serialised_tree);
+    if (!tree.in_range(info.tx_id.seqno))
+    {
+      info.rpc_ctx->set_error(
+        HTTP_STATUS_INTERNAL_SERVER_ERROR,
+        ccf::errors::InternalError,
+        fmt::format(
+          "Seqno {} is not in range of cached signature tree",
+          info.tx_id.seqno));
+      return nullptr;
+    }
+    auto proof = tree.get_proof(info.tx_id.seqno);
+
+    std::optional<std::vector<uint8_t>> sig;
+    std::optional<ccf::crypto::Pem> cert;
+    NodeId node{};
+
+    if (cached_sig->sig)
+    {
+      sig = cached_sig->sig->sig;
+      cert = cached_sig->sig->cert;
+      node = cached_sig->sig->node;
+    }
+
+    return std::make_shared<TxReceiptImpl>(
+      sig,
+      cached_sig->cose_signatures,
+      proof.get_root(),
+      proof.get_path(),
+      node,
+      cert,
+      info.write_set_digest,
+      info.commit_evidence,
+      info.claims_digest);
   }
 }
 
@@ -190,8 +358,60 @@ namespace ccf::historical
     return tx_id_opt;
   }
 
+  void default_error_handler(
+    HistoricalQueryErrorCode err,
+    std::string reason,
+    endpoints::CommandEndpointContext& args)
+  {
+    switch (err)
+    {
+      case HistoricalQueryErrorCode::InternalError:
+      {
+        args.rpc_ctx->set_error(
+          HTTP_STATUS_INTERNAL_SERVER_ERROR,
+          ccf::errors::TransactionPendingOrUnknown,
+          std::move(reason));
+        break;
+      }
+      case HistoricalQueryErrorCode::TransactionPending:
+      {
+        args.rpc_ctx->set_response_header(
+          http::headers::CACHE_CONTROL, "no-cache");
+        args.rpc_ctx->set_error(
+          HTTP_STATUS_NOT_FOUND,
+          ccf::errors::TransactionPendingOrUnknown,
+          std::move(reason));
+        break;
+      }
+      case HistoricalQueryErrorCode::TransactionInvalid:
+      case HistoricalQueryErrorCode::TransactionIdMissing:
+      {
+        args.rpc_ctx->set_error(
+          HTTP_STATUS_NOT_FOUND,
+          ccf::errors::TransactionInvalid,
+          std::move(reason));
+        break;
+      }
+      case HistoricalQueryErrorCode::TransactionPartiallyReady:
+      {
+        args.rpc_ctx->set_response_status(HTTP_STATUS_ACCEPTED);
+        constexpr size_t retry_after_seconds = 3;
+        args.rpc_ctx->set_response_header(
+          http::headers::RETRY_AFTER, retry_after_seconds);
+        args.rpc_ctx->set_response_header(
+          http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
+        args.rpc_ctx->set_response_body(std::move(reason));
+        break;
+      }
+      default:
+      {
+        LOG_FAIL_FMT("Unexpected historical query error {}", err);
+      }
+    }
+  }
+
   HistoricalTxStatus is_tx_committed_v2(
-    kv::Consensus* consensus,
+    ccf::kv::Consensus* consensus,
     ccf::View view,
     ccf::SeqNo seqno,
     std::string& error_reason)
@@ -202,16 +422,13 @@ namespace ccf::historical
       return HistoricalTxStatus::Error;
     }
 
-    const auto tx_view = consensus->get_view(seqno);
-    const auto committed_seqno = consensus->get_committed_seqno();
-    const auto committed_view = consensus->get_view(committed_seqno);
+    const auto tx_status = consensus->evaluate_tx_status(view, seqno);
 
-    const auto tx_status = ccf::evaluate_tx_status(
-      view, seqno, tx_view, committed_view, committed_seqno);
     switch (tx_status)
     {
       case ccf::TxStatus::Unknown:
       case ccf::TxStatus::Pending:
+      {
         error_reason = fmt::format(
           "Only committed transactions can be queried. Transaction {}.{} "
           "is "
@@ -220,7 +437,9 @@ namespace ccf::historical
           seqno,
           ccf::tx_status_to_str(tx_status));
         return HistoricalTxStatus::PendingOrUnknown;
+      }
       case ccf::TxStatus::Invalid:
+      {
         error_reason = fmt::format(
           "Only committed transactions can be queried. Transaction {}.{} "
           "is "
@@ -229,7 +448,10 @@ namespace ccf::historical
           seqno,
           ccf::tx_status_to_str(tx_status));
         return HistoricalTxStatus::Invalid;
-      case ccf::TxStatus::Committed:;
+      }
+      case ccf::TxStatus::Committed:
+      {
+      }
     }
 
     return HistoricalTxStatus::Valid;
@@ -239,19 +461,25 @@ namespace ccf::historical
     class TQueryHandler,
     class TEndpointFunction,
     class TEndpointContext,
-    class TTxIDExtractor>
-  TEndpointFunction _adapter_v3(
+    class TTxIDExtractor,
+    class TErrorHandler>
+  TEndpointFunction _adapter_v4(
     const TQueryHandler& f,
-    ccfapp::AbstractNodeContext& node_context,
+    ccf::AbstractNodeContext& node_context,
     const CheckHistoricalTxStatus& available,
-    const TTxIDExtractor& extractor)
+    const TTxIDExtractor& extractor,
+    const TErrorHandler& ehandler)
   {
     auto& state_cache = node_context.get_historical_state();
     auto network_identity_subsystem =
       node_context.get_subsystem<NetworkIdentitySubsystemInterface>();
 
-    return [f, &state_cache, network_identity_subsystem, available, extractor](
-             TEndpointContext& args) {
+    return [f,
+            &state_cache,
+            network_identity_subsystem,
+            available,
+            extractor,
+            ehandler](TEndpointContext& args) {
       // Extract the requested transaction ID
       ccf::TxID target_tx_id;
       {
@@ -262,6 +490,10 @@ namespace ccf::historical
         }
         else
         {
+          ehandler(
+            HistoricalQueryErrorCode::TransactionIdMissing,
+            "Could not extract Transaction Id",
+            args);
           return;
         }
       }
@@ -272,38 +504,60 @@ namespace ccf::historical
           "Transaction {} is not available.", target_tx_id.to_str());
         auto is_available =
           available(target_tx_id.view, target_tx_id.seqno, error_reason);
+
         switch (is_available)
         {
           case HistoricalTxStatus::Error:
           {
-            args.rpc_ctx->set_error(
-              HTTP_STATUS_INTERNAL_SERVER_ERROR,
-              ccf::errors::TransactionPendingOrUnknown,
-              std::move(error_reason));
+            ehandler(
+              HistoricalQueryErrorCode::InternalError,
+              std::move(error_reason),
+              args);
             return;
           }
           case HistoricalTxStatus::PendingOrUnknown:
           {
-            // Set header No-Cache
-            args.rpc_ctx->set_response_header(
-              http::headers::CACHE_CONTROL, "no-cache");
-            args.rpc_ctx->set_error(
-              HTTP_STATUS_NOT_FOUND,
-              ccf::errors::TransactionPendingOrUnknown,
-              std::move(error_reason));
+            ehandler(
+              HistoricalQueryErrorCode::TransactionPending,
+              std::move(error_reason),
+              args);
             return;
           }
           case HistoricalTxStatus::Invalid:
           {
-            args.rpc_ctx->set_error(
-              HTTP_STATUS_NOT_FOUND,
-              ccf::errors::TransactionInvalid,
-              std::move(error_reason));
+            ehandler(
+              HistoricalQueryErrorCode::TransactionInvalid,
+              std::move(error_reason),
+              args);
             return;
           }
           case HistoricalTxStatus::Valid:
           {
+            break;
           }
+        }
+      }
+
+      // If recovery in progress, prohibit any historical queries for previous
+      // epochs, because the service does not yet have access to the
+      // ledger secrets necessary to produce commit evidence.
+      auto service = args.tx.template ro<ccf::Service>(Tables::SERVICE);
+      auto active_service = service->get();
+      if (active_service && active_service->status != ServiceStatus::OPEN)
+      {
+        if (
+          active_service->current_service_create_txid &&
+          target_tx_id.view < active_service->current_service_create_txid->view)
+        {
+          auto reason = fmt::format(
+            "Historical transaction {} is not signed by the current service "
+            "identity key and cannot be retrieved until recovery is complete.",
+            target_tx_id.to_str());
+          ehandler(
+            HistoricalQueryErrorCode::TransactionInvalid,
+            std::move(reason),
+            args);
+          return;
         }
       }
 
@@ -316,20 +570,36 @@ namespace ccf::historical
       // Get a state at the target version from the cache, if it is present
       auto historical_state =
         state_cache.get_state_at(historic_request_handle, target_tx_id.seqno);
-      if (
-        historical_state == nullptr ||
-        (!populate_service_endorsements(
-          args.tx, historical_state, state_cache, network_identity_subsystem)))
+      try
       {
-        args.rpc_ctx->set_response_status(HTTP_STATUS_ACCEPTED);
-        constexpr size_t retry_after_seconds = 3;
-        args.rpc_ctx->set_response_header(
-          http::headers::RETRY_AFTER, retry_after_seconds);
-        args.rpc_ctx->set_response_header(
-          http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
-        args.rpc_ctx->set_response_body(fmt::format(
-          "Historical transaction {} is not currently available.",
-          target_tx_id.to_str()));
+        if (
+          historical_state == nullptr ||
+          (!populate_service_endorsements(
+            args.tx,
+            historical_state,
+            state_cache,
+            network_identity_subsystem)) ||
+          !populate_cose_service_endorsements(
+            args.tx, historical_state, network_identity_subsystem))
+        {
+          auto reason = fmt::format(
+            "Historical transaction {} is not currently available.",
+            target_tx_id.to_str());
+          ehandler(
+            HistoricalQueryErrorCode::TransactionPartiallyReady,
+            std::move(reason),
+            args);
+          return;
+        }
+      }
+      catch (const std::exception& e)
+      {
+        auto reason = fmt::format(
+          "Historical transaction {} failed with error: {}",
+          target_tx_id.to_str(),
+          e.what());
+        ehandler(
+          HistoricalQueryErrorCode::InternalError, std::move(reason), args);
         return;
       }
 
@@ -338,131 +608,31 @@ namespace ccf::historical
     };
   }
 
-  ccf::endpoints::EndpointFunction adapter_v3(
-    const HandleHistoricalQuery& f,
-    ccfapp::AbstractNodeContext& node_context,
-    const CheckHistoricalTxStatus& available,
-    const TxIDExtractor& extractor)
-  {
-    return _adapter_v3<
-      HandleHistoricalQuery,
-      ccf::endpoints::EndpointFunction,
-      ccf::endpoints::EndpointContext>(f, node_context, available, extractor);
-  }
-
-  ccf::endpoints::ReadOnlyEndpointFunction read_only_adapter_v3(
+  ccf::endpoints::ReadOnlyEndpointFunction read_only_adapter_v4(
     const HandleReadOnlyHistoricalQuery& f,
-    ccfapp::AbstractNodeContext& node_context,
+    ccf::AbstractNodeContext& node_context,
     const CheckHistoricalTxStatus& available,
-    const ReadOnlyTxIDExtractor& extractor)
+    const ReadOnlyTxIDExtractor& extractor,
+    const ReadOnlyErrorHandler& ehandler)
   {
-    return _adapter_v3<
+    return _adapter_v4<
       HandleReadOnlyHistoricalQuery,
       ccf::endpoints::ReadOnlyEndpointFunction,
       ccf::endpoints::ReadOnlyEndpointContext>(
-      f, node_context, available, extractor);
+      f, node_context, available, extractor, ehandler);
   }
 
-  ccf::endpoints::EndpointFunction read_write_adapter_v3(
+  ccf::endpoints::EndpointFunction read_write_adapter_v4(
     const HandleReadWriteHistoricalQuery& f,
-    ccfapp::AbstractNodeContext& node_context,
+    ccf::AbstractNodeContext& node_context,
     const CheckHistoricalTxStatus& available,
-    const TxIDExtractor& extractor)
+    const TxIDExtractor& extractor,
+    const ErrorHandler& ehandler)
   {
-    return _adapter_v3<
+    return _adapter_v4<
       HandleReadWriteHistoricalQuery,
       ccf::endpoints::EndpointFunction,
-      ccf::endpoints::EndpointContext>(f, node_context, available, extractor);
-  }
-
-  ccf::endpoints::EndpointFunction adapter_v2(
-    const HandleHistoricalQuery& f,
-    AbstractStateCache& state_cache,
-    const CheckHistoricalTxStatus& available,
-    const TxIDExtractor& extractor)
-  {
-    return [f, &state_cache, available, extractor](
-             endpoints::EndpointContext& args) {
-      // Extract the requested transaction ID
-      ccf::TxID target_tx_id;
-      {
-        const auto tx_id_opt = extractor(args);
-        if (tx_id_opt.has_value())
-        {
-          target_tx_id = tx_id_opt.value();
-        }
-        else
-        {
-          return;
-        }
-      }
-
-      // Check that the requested transaction ID is available
-      {
-        auto error_reason = fmt::format(
-          "Transaction {} is not available.", target_tx_id.to_str());
-        auto is_available =
-          available(target_tx_id.view, target_tx_id.seqno, error_reason);
-        switch (is_available)
-        {
-          case HistoricalTxStatus::Error:
-          {
-            args.rpc_ctx->set_error(
-              HTTP_STATUS_INTERNAL_SERVER_ERROR,
-              ccf::errors::TransactionPendingOrUnknown,
-              std::move(error_reason));
-            return;
-          }
-          case HistoricalTxStatus::PendingOrUnknown:
-          {
-            // Set header No-Cache
-            args.rpc_ctx->set_response_header(
-              http::headers::CACHE_CONTROL, "no-cache");
-            args.rpc_ctx->set_error(
-              HTTP_STATUS_NOT_FOUND,
-              ccf::errors::TransactionPendingOrUnknown,
-              std::move(error_reason));
-            return;
-          }
-          case HistoricalTxStatus::Invalid:
-          {
-            args.rpc_ctx->set_error(
-              HTTP_STATUS_NOT_FOUND,
-              ccf::errors::TransactionInvalid,
-              std::move(error_reason));
-            return;
-          }
-          case HistoricalTxStatus::Valid:
-          {
-          }
-        }
-      }
-
-      // We need a handle to determine whether this request is the 'same' as a
-      // previous one. For simplicity we use target_tx_id.seqno. This means we
-      // keep a lot of state around for old requests! It should be cleaned up
-      // manually
-      const auto historic_request_handle = target_tx_id.seqno;
-
-      // Get a state at the target version from the cache, if it is present
-      auto historical_state =
-        state_cache.get_state_at(historic_request_handle, target_tx_id.seqno);
-      if (historical_state == nullptr)
-      {
-        args.rpc_ctx->set_response_status(HTTP_STATUS_ACCEPTED);
-        constexpr size_t retry_after_seconds = 3;
-        args.rpc_ctx->set_response_header(
-          http::headers::RETRY_AFTER, retry_after_seconds);
-        args.rpc_ctx->set_response_header(
-          http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
-        args.rpc_ctx->set_response_body(fmt::format(
-          "Historical transaction {} is not currently available.",
-          target_tx_id.to_str()));
-        return;
-      }
-
-      // Call the provided handler
-      f(args, historical_state);
-    };
+      ccf::endpoints::EndpointContext>(
+      f, node_context, available, extractor, ehandler);
   }
 }

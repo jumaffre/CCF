@@ -1,20 +1,16 @@
-# The Confidential Consortium Framework [![Docs](https://img.shields.io/badge/Documentation-Up%20to%20date-green)](https://microsoft.github.io/CCF)
+# The Confidential Consortium Framework [![Continuous Integration](https://github.com/microsoft/CCF/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/microsoft/CCF/actions/workflows/ci.yml) [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/7808/badge)](https://www.bestpractices.dev/projects/7808)
 
-<img alt="ccf" align="right" src="doc/_static/ccf.svg" width="200">
+The Confidential Consortium Framework (CCF) is an open-source framework for building a new category of secure, highly available, and performant applications that focus on multi-party compute and data.</p>
 
-- Continuous Build: [![Build Status](https://dev.azure.com/MSRC-CCF/CCF/_apis/build/status/CCF%20Github%20CI?branchName=main)](https://dev.azure.com/MSRC-CCF/CCF/_build/latest?definitionId=3&branchName=main)
-- Daily Build: [![Build Status](https://dev.azure.com/MSRC-CCF/CCF/_apis/build/status/CCF%20GitHub%20Daily?branchName=main)](https://dev.azure.com/MSRC-CCF/CCF/_build/latest?definitionId=7&branchName=main)
-- Doc Build: [![docs](https://dev.azure.com/MSRC-CCF/CCF/_apis/build/status/CCF%20GitHub%20Pages?branchName=main)](https://dev.azure.com/MSRC-CCF/CCF/_build/latest?definitionId=4&branchName=main)
-- Containers: [![Build and Publish Release Containers](https://github.com/microsoft/CCF/actions/workflows/containers.yml/badge.svg)](https://github.com/microsoft/CCF/actions/workflows/containers.yml)
-
-The [Confidential Consortium Framework (CCF)](https://ccf.dev/) is an open-source framework for building a new category of secure, highly available,
-and performant applications that focus on multi-party compute and data.
+<p align="center">
+<img alt="ccf" src="doc/img/ccf_overview.svg" width="700">
+</p>
 
 ## Get Started with CCF
 
-- Read the [CCF overview](https://ccf.microsoft.com/) and get familiar with [CCF's core concepts](https://microsoft.github.io/CCF/main/overview/what_is_ccf.html)
+- Read the [CCF overview](https://microsoft.github.io/CCF/main/overview/index.html) and become familiar with the [core concepts](https://microsoft.github.io/CCF/main/overview/what_is_ccf.html)
 - [Install](https://microsoft.github.io/CCF/main/build_apps/install_bin.html) CCF on Linux
-- Get familiar with CCF core developer API with the [template CCF app](https://github.com/microsoft/ccf-app-template)
+- Become familiar with the CCF core developer API with the [template CCF app](https://github.com/microsoft/ccf-app-template)
 - Quickly build and run [sample CCF apps](https://github.com/microsoft/ccf-app-samples)
 - [Build new CCF applications](https://microsoft.github.io/CCF/main/build_apps/index.html) in TypeScript/JavaScript or C++
 
@@ -28,7 +24,6 @@ and performant applications that focus on multi-party compute and data.
 
 - Browse the [documentation](https://microsoft.github.io/CCF/)
 - Read the [Research Papers](https://microsoft.github.io/CCF/main/research)
-- Learn more about [Azure Confidential Computing](https://azure.microsoft.com/solutions/confidential-compute/) offerings like Azure DC-series (which support Intel SGX TEE) and the [Open Enclave](https://github.com/openenclave/openenclave) SDK
 
 ## Third-party components
 

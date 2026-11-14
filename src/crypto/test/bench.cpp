@@ -2,23 +2,24 @@
 // Licensed under the Apache 2.0 License.
 
 #include "ccf/crypto/base64.h"
+#include "ccf/crypto/ec_key_pair.h"
 #include "ccf/crypto/entropy.h"
 #include "ccf/crypto/hash_provider.h"
 #include "ccf/crypto/hmac.h"
-#include "ccf/crypto/key_pair.h"
 #include "ccf/crypto/sha256.h"
 #include "ccf/crypto/symmetric_key.h"
 #include "crypto/openssl/base64.h"
+#include "crypto/openssl/ec_key_pair.h"
 #include "crypto/openssl/hash.h"
-#include "crypto/openssl/key_pair.h"
 #include "crypto/openssl/rsa_key_pair.h"
 #include "crypto/sharing.h"
 
+#define PICOBENCH_UNIQUE_SYM_SUFFIX __COUNTER__
 #define PICOBENCH_IMPLEMENT_WITH_MAIN
 #include <picobench/picobench.hpp>
 
 using namespace std;
-using namespace crypto;
+using namespace ccf::crypto;
 
 static const string lorem_ipsum =
   "Lorem ipsum dolor sit amet, consectetur adipiscing "
@@ -98,14 +99,111 @@ static void benchmark_hmac(picobench::state& s)
 {
   const auto contents = make_contents<NContents>();
   const auto key =
-    crypto::create_entropy()->random(crypto::GCM_DEFAULT_KEY_SIZE);
+    ccf::crypto::get_entropy()->random(ccf::crypto::GCM_DEFAULT_KEY_SIZE);
 
   s.start_timer();
   for (auto _ : s)
   {
     (void)_;
-    HashBytes hash = crypto::hmac(M, key, contents);
+    HashBytes hash = ccf::crypto::hmac(M, key, contents);
     do_not_optimize(hash);
+    clobber_memory();
+  }
+  s.stop_timer();
+}
+
+template <size_t NContents, bool ReuseContext>
+static void benchmark_aes_gcm_encrypt(picobench::state& s)
+{
+  const std::vector<uint8_t> key(GCM_DEFAULT_KEY_SIZE, 0x42);
+  const auto contents = make_contents<NContents>();
+  auto aes_gcm_key = make_key_aes_gcm(key);
+  auto context = aes_gcm_key->make_context();
+  StandardGcmHeader header;
+  std::vector<uint8_t> cipher;
+  uint64_t iv = 0;
+
+  s.start_timer();
+  for (auto _ : s)
+  {
+    (void)_;
+    memcpy(header.iv.data(), &iv, sizeof(iv));
+    ++iv;
+    if constexpr (ReuseContext)
+    {
+      context->encrypt(header.get_iv(), contents, {}, cipher, header.tag);
+    }
+    else
+    {
+      aes_gcm_key->encrypt(header.get_iv(), contents, {}, cipher, header.tag);
+    }
+    do_not_optimize(cipher);
+    clobber_memory();
+  }
+  s.stop_timer();
+}
+
+template <size_t NContents, bool ReuseContext>
+static void benchmark_aes_gcm_encrypt_span(picobench::state& s)
+{
+  const std::vector<uint8_t> key(GCM_DEFAULT_KEY_SIZE, 0x42);
+  const auto contents = make_contents<NContents>();
+  auto aes_gcm_key = make_key_aes_gcm(key);
+  auto context = aes_gcm_key->make_context();
+  StandardGcmHeader header;
+  std::vector<uint8_t> cipher(contents.size());
+  uint64_t iv = 0;
+
+  s.start_timer();
+  for (auto _ : s)
+  {
+    (void)_;
+    memcpy(header.iv.data(), &iv, sizeof(iv));
+    ++iv;
+    if constexpr (ReuseContext)
+    {
+      context->encrypt(
+        header.get_iv(), contents, {}, std::span<uint8_t>(cipher), header.tag);
+    }
+    else
+    {
+      aes_gcm_key->encrypt(
+        header.get_iv(), contents, {}, std::span<uint8_t>(cipher), header.tag);
+    }
+    do_not_optimize(cipher);
+    clobber_memory();
+  }
+  s.stop_timer();
+}
+
+template <size_t NContents, bool ReuseContext>
+static void benchmark_aes_gcm_decrypt(picobench::state& s)
+{
+  const std::vector<uint8_t> key(GCM_DEFAULT_KEY_SIZE, 0x42);
+  const auto contents = make_contents<NContents>();
+  auto aes_gcm_key = make_key_aes_gcm(key);
+  auto context = aes_gcm_key->make_context();
+  StandardGcmHeader header;
+  std::vector<uint8_t> cipher;
+  std::vector<uint8_t> plain;
+  aes_gcm_key->encrypt(header.get_iv(), contents, {}, cipher, header.tag);
+
+  s.start_timer();
+  for (auto _ : s)
+  {
+    (void)_;
+    bool valid = false;
+    if constexpr (ReuseContext)
+    {
+      valid = context->decrypt(header.get_iv(), header.tag, cipher, {}, plain);
+    }
+    else
+    {
+      valid =
+        aes_gcm_key->decrypt(header.get_iv(), header.tag, cipher, {}, plain);
+    }
+    do_not_optimize(valid);
+    do_not_optimize(plain);
     clobber_memory();
   }
   s.stop_timer();
@@ -121,8 +219,22 @@ static void benchmark_hash(picobench::state& s)
   {
     (void)_;
     P hp;
-    HashBytes hash = hp.Hash(contents.data(), contents.size(), M);
+    HashBytes hash = hp.hash(contents.data(), contents.size(), M);
     do_not_optimize(hash);
+    clobber_memory();
+  }
+  s.stop_timer();
+}
+
+template <typename P, CurveID Curve>
+static void benchmark_create(picobench::state& s)
+{
+  s.start_timer();
+  for (auto _ : s)
+  {
+    (void)_;
+    P kp(Curve);
+    do_not_optimize(kp);
     clobber_memory();
   }
   s.stop_timer();
@@ -130,138 +242,122 @@ static void benchmark_hash(picobench::state& s)
 
 const std::vector<int> sizes = {10};
 
-#define PICO_SUFFIX(CURVE) iterations(sizes).samples(10)
+#define PICO_SUFFIX(CURVE) iterations(sizes)
 
-#define PICO_HASH_SUFFIX() iterations(sizes).samples(10)
+#define PICO_HASH_SUFFIX() iterations(sizes)
+
+PICOBENCH_SUITE("create ec keypairs");
+
+namespace CREATE_KEYPAIRS
+{
+  auto create_256r1 = benchmark_create<ECKeyPair_OpenSSL, CurveID::SECP256R1>;
+  PICOBENCH(create_256r1).iterations({1000});
+
+  auto create_384r1 = benchmark_create<ECKeyPair_OpenSSL, CurveID::SECP384R1>;
+  PICOBENCH(create_384r1).iterations({1000});
+}
 
 PICOBENCH_SUITE("sign secp384r1");
+
 namespace SIGN_SECP384R1
 {
   auto sign_384_ossl_1byte =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP384R1, 1>;
+    benchmark_sign<ECKeyPair_OpenSSL, CurveID::SECP384R1, 1>;
   PICOBENCH(sign_384_ossl_1byte).PICO_SUFFIX(CurveID::SECP384R1);
 
   auto sign_384_ossl_1k =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP384R1, 1024>;
+    benchmark_sign<ECKeyPair_OpenSSL, CurveID::SECP384R1, 1024>;
   PICOBENCH(sign_384_ossl_1k).PICO_SUFFIX(CurveID::SECP384R1);
 
   auto sign_384_ossl_100k =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP384R1, 102400>;
+    benchmark_sign<ECKeyPair_OpenSSL, CurveID::SECP384R1, 102400>;
   PICOBENCH(sign_384_ossl_100k).PICO_SUFFIX(CurveID::SECP384R1);
 }
 
 PICOBENCH_SUITE("sign secp256r1");
+
 namespace SIGN_SECP256R1
 {
   auto sign_256r1_ossl_1byte =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP256R1, 1>;
+    benchmark_sign<ECKeyPair_OpenSSL, CurveID::SECP256R1, 1>;
   PICOBENCH(sign_256r1_ossl_1byte).PICO_SUFFIX(CurveID::SECP256R1);
 
   auto sign_256r1_ossl_1k =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP256R1, 1024>;
+    benchmark_sign<ECKeyPair_OpenSSL, CurveID::SECP256R1, 1024>;
   PICOBENCH(sign_256r1_ossl_1k).PICO_SUFFIX(CurveID::SECP256R1);
 
   auto sign_256r1_ossl_100k =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP256R1, 102400>;
+    benchmark_sign<ECKeyPair_OpenSSL, CurveID::SECP256R1, 102400>;
   PICOBENCH(sign_256r1_ossl_100k).PICO_SUFFIX(CurveID::SECP256R1);
 }
 
-PICOBENCH_SUITE("sign secp256k1");
-namespace SIGN_SECP256K1
-{
-  auto sign_256k1_ossl_1byte =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP256K1, 1>;
-  PICOBENCH(sign_256k1_ossl_1byte).PICO_SUFFIX(CurveID::SECP256K1);
-
-  auto sign_256k1_ossl_1k =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP256K1, 1024>;
-  PICOBENCH(sign_256k1_ossl_1k).PICO_SUFFIX(CurveID::SECP256K1);
-
-  auto sign_256k1_ossl_100k =
-    benchmark_sign<KeyPair_OpenSSL, CurveID::SECP256K1, 102400>;
-  PICOBENCH(sign_256k1_ossl_100k).PICO_SUFFIX(CurveID::SECP256K1);
-}
-
 PICOBENCH_SUITE("verify secp384r1");
+
 namespace SECP384R1
 {
-  auto verify_384_ossl_1byte =
-    benchmark_verify<KeyPair_OpenSSL, PublicKey_OpenSSL, CurveID::SECP384R1, 1>;
+  auto verify_384_ossl_1byte = benchmark_verify<
+    ECKeyPair_OpenSSL,
+    ECPublicKey_OpenSSL,
+    CurveID::SECP384R1,
+    1>;
   PICOBENCH(verify_384_ossl_1byte).PICO_SUFFIX(CurveID::SECP384R1);
 
   auto verify_384_ossl_1k = benchmark_verify<
-    KeyPair_OpenSSL,
-    PublicKey_OpenSSL,
+    ECKeyPair_OpenSSL,
+    ECPublicKey_OpenSSL,
     CurveID::SECP384R1,
     1024>;
   PICOBENCH(verify_384_ossl_1k).PICO_SUFFIX(CurveID::SECP384R1);
 
   auto verify_384_ossl_100k = benchmark_verify<
-    KeyPair_OpenSSL,
-    PublicKey_OpenSSL,
+    ECKeyPair_OpenSSL,
+    ECPublicKey_OpenSSL,
     CurveID::SECP384R1,
     102400>;
   PICOBENCH(verify_384_ossl_100k).PICO_SUFFIX(CurveID::SECP384R1);
 }
 
 PICOBENCH_SUITE("verify secp256r1");
+
 namespace SECP256R1
 {
-  auto verify_256r1_ossl_1byte =
-    benchmark_verify<KeyPair_OpenSSL, PublicKey_OpenSSL, CurveID::SECP256R1, 1>;
+  auto verify_256r1_ossl_1byte = benchmark_verify<
+    ECKeyPair_OpenSSL,
+    ECPublicKey_OpenSSL,
+    CurveID::SECP256R1,
+    1>;
   PICOBENCH(verify_256r1_ossl_1byte).PICO_SUFFIX(CurveID::SECP256R1);
 
   auto verify_256r1_ossl_1k = benchmark_verify<
-    KeyPair_OpenSSL,
-    PublicKey_OpenSSL,
+    ECKeyPair_OpenSSL,
+    ECPublicKey_OpenSSL,
     CurveID::SECP256R1,
     1024>;
   PICOBENCH(verify_256r1_ossl_1k).PICO_SUFFIX(CurveID::SECP256R1);
 
   auto verify_256r1_ossl_100k = benchmark_verify<
-    KeyPair_OpenSSL,
-    PublicKey_OpenSSL,
+    ECKeyPair_OpenSSL,
+    ECPublicKey_OpenSSL,
     CurveID::SECP256R1,
     102400>;
   PICOBENCH(verify_256r1_ossl_100k).PICO_SUFFIX(CurveID::SECP256R1);
 }
 
-PICOBENCH_SUITE("verify secp256k1");
-namespace SECP256K1
-{
-  auto verify_256k1_ossl_1byte =
-    benchmark_verify<KeyPair_OpenSSL, PublicKey_OpenSSL, CurveID::SECP256K1, 1>;
-  PICOBENCH(verify_256k1_ossl_1byte).PICO_SUFFIX(CurveID::SECP256K1);
-
-  auto verify_256k1_ossl_1k = benchmark_verify<
-    KeyPair_OpenSSL,
-    PublicKey_OpenSSL,
-    CurveID::SECP256K1,
-    1024>;
-  PICOBENCH(verify_256k1_ossl_1k).PICO_SUFFIX(CurveID::SECP256K1);
-
-  auto verify_256k1_ossl_100k = benchmark_verify<
-    KeyPair_OpenSSL,
-    PublicKey_OpenSSL,
-    CurveID::SECP256K1,
-    102400>;
-  PICOBENCH(verify_256k1_ossl_100k).PICO_SUFFIX(CurveID::SECP256K1);
-}
-
 PICOBENCH_SUITE("sign RSA-2048");
+
 namespace SIGN_RSA2048
 {
   template <typename P, size_t KSZ, size_t NContents>
   static void benchmark_sign(picobench::state& s)
   {
-    P kp(KSZ);
+    auto kp = make_rsa_key_pair(KSZ);
     auto contents = make_contents<NContents>();
 
     s.start_timer();
     for (auto _ : s)
     {
       (void)_;
-      auto signature = kp.sign(contents, MDType::SHA256);
+      auto signature = kp->sign(contents, MDType::SHA256);
       do_not_optimize(signature);
       clobber_memory();
     }
@@ -279,20 +375,21 @@ namespace SIGN_RSA2048
 }
 
 PICOBENCH_SUITE("verify RSA-2048");
+
 namespace VERIFY_RSA2048
 {
   template <typename P, size_t KSZ, size_t NContents>
   static void benchmark_verify(picobench::state& s)
   {
-    P kp(KSZ);
+    auto kp = make_rsa_key_pair(KSZ);
     auto contents = make_contents<NContents>();
-    auto signature = kp.sign(contents, MDType::SHA256);
+    auto signature = kp->sign(contents, MDType::SHA256);
 
     s.start_timer();
     for (auto _ : s)
     {
       (void)_;
-      if (!kp.verify(
+      if (!kp->verify(
             contents.data(),
             contents.size(),
             signature.data(),
@@ -319,6 +416,7 @@ namespace VERIFY_RSA2048
 }
 
 PICOBENCH_SUITE("hash");
+
 namespace Hashes
 {
   auto sha_384_ossl_1byte =
@@ -355,45 +453,71 @@ namespace Hashes
 template <size_t size>
 static void sha256_bench(picobench::state& s)
 {
-  crypto::openssl_sha256_init();
-
   std::vector<uint8_t> v(size);
   for (size_t i = 0; i < size; ++i)
   {
     v[i] = rand();
   }
 
-  crypto::Sha256Hash h;
+  ccf::crypto::Sha256Hash h;
 
   s.start_timer();
   for (size_t i = 0; i < 10; ++i)
   {
-    crypto::openssl_sha256(v, h.h.data());
+    ccf::crypto::openssl_sha256(v, h.h.data());
   }
   s.stop_timer();
-  crypto::openssl_sha256_shutdown();
 }
 
-PICOBENCH_SUITE("digest sha256");
-namespace SHA256_bench
+// Variant of the code above that uses the OpenSSL API
+// directly without any MD or CTX caching/pre-creation
+// for comparison. This is fine for larger inputs, but
+// substantially slower for smaller inputs, such as
+// digests in Merkle Trees.
+template <size_t size>
+static void sha256_noopt_bench(picobench::state& s)
 {
-  auto openssl_sha256_base = sha256_bench<2 << 6>;
-  PICOBENCH(openssl_sha256_base).PICO_HASH_SUFFIX();
+  std::vector<uint8_t> v(size);
+  for (size_t i = 0; i < size; ++i)
+  {
+    v[i] = rand();
+  }
 
-  auto openssl_sha256_8 = sha256_bench<2 << 8>;
-  PICOBENCH(openssl_sha256_8).PICO_HASH_SUFFIX();
+  std::vector<uint8_t> out(EVP_MD_size(EVP_sha256()));
 
-  auto openssl_sha256_12 = sha256_bench<2 << 12>;
-  PICOBENCH(openssl_sha256_12).PICO_HASH_SUFFIX();
-
-  auto openssl_sha256_16 = sha256_bench<2 << 16>;
-  PICOBENCH(openssl_sha256_16).PICO_HASH_SUFFIX();
-
-  auto openssl_sha256_18 = sha256_bench<2 << 18>;
-  PICOBENCH(openssl_sha256_18).PICO_HASH_SUFFIX();
+  s.start_timer();
+  for (size_t i = 0; i < 10; ++i)
+  {
+    auto* md = EVP_MD_fetch(nullptr, "SHA2-256", nullptr);
+    auto* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, md, NULL);
+    EVP_DigestUpdate(ctx, v.data(), v.size());
+    EVP_DigestFinal_ex(ctx, out.data(), nullptr);
+    EVP_MD_free(md);
+    EVP_MD_CTX_free(ctx);
+  }
+  s.stop_timer();
 }
+
+#define DEFINE_SHA256_BENCH(SHIFT) \
+  PICOBENCH_SUITE("digest sha256 (2 << " #SHIFT ")"); \
+  namespace SHA256_bench_##SHIFT \
+  { \
+    auto openssl_sha256_##SHIFT##_no = sha256_noopt_bench<2 << SHIFT>; \
+    PICOBENCH(openssl_sha256_##SHIFT##_no).PICO_HASH_SUFFIX().baseline(); \
+    auto openssl_sha256_##SHIFT = sha256_bench<2 << SHIFT>; \
+    PICOBENCH(openssl_sha256_##SHIFT).PICO_HASH_SUFFIX(); \
+  }
+
+DEFINE_SHA256_BENCH(6)
+DEFINE_SHA256_BENCH(8)
+DEFINE_SHA256_BENCH(10)
+DEFINE_SHA256_BENCH(12)
+DEFINE_SHA256_BENCH(14)
+DEFINE_SHA256_BENCH(16)
 
 PICOBENCH_SUITE("base64");
+
 namespace Base64_bench
 {
   template <size_t size>
@@ -410,8 +534,8 @@ namespace Base64_bench
     {
       // We don't check the outputs as this is done elsewhere
       std::string encoded =
-        crypto::Base64_openssl::b64_from_raw(v.data(), v.size());
-      crypto::Base64_openssl::raw_from_b64(encoded);
+        ccf::crypto::Base64_openssl::b64_from_raw(v.data(), v.size());
+      ccf::crypto::Base64_openssl::raw_from_b64(encoded);
     }
     s.stop_timer();
   }
@@ -438,6 +562,7 @@ namespace Base64_bench
 }
 
 PICOBENCH_SUITE("hmac");
+
 namespace HMAC_bench
 {
   auto openssl_hmac_sha256_32 = benchmark_hmac<MDType::SHA256, 32>;
@@ -447,9 +572,62 @@ namespace HMAC_bench
   PICOBENCH(openssl_hmac_sha256_64).PICO_HASH_SUFFIX();
 }
 
-std::vector<crypto::Share> shares;
+PICOBENCH_SUITE("aes gcm encrypt 64 bytes");
+
+namespace AES_GCM_ENCRYPT_64
+{
+  auto aes_gcm_encrypt_new_context = benchmark_aes_gcm_encrypt<64, false>;
+  PICOBENCH(aes_gcm_encrypt_new_context).iterations({100000}).baseline();
+
+  auto aes_gcm_encrypt_reused_context = benchmark_aes_gcm_encrypt<64, true>;
+  PICOBENCH(aes_gcm_encrypt_reused_context).iterations({100000});
+
+  auto aes_gcm_encrypt_new_context_span =
+    benchmark_aes_gcm_encrypt_span<64, false>;
+  PICOBENCH(aes_gcm_encrypt_new_context_span).iterations({100000});
+
+  auto aes_gcm_encrypt_reused_context_span =
+    benchmark_aes_gcm_encrypt_span<64, true>;
+  PICOBENCH(aes_gcm_encrypt_reused_context_span).iterations({100000});
+}
+
+PICOBENCH_SUITE("aes gcm encrypt 1024 bytes");
+
+namespace AES_GCM_ENCRYPT_1024
+{
+  auto aes_gcm_encrypt_new_context = benchmark_aes_gcm_encrypt<1024, false>;
+  PICOBENCH(aes_gcm_encrypt_new_context).iterations({100000}).baseline();
+
+  auto aes_gcm_encrypt_reused_context = benchmark_aes_gcm_encrypt<1024, true>;
+  PICOBENCH(aes_gcm_encrypt_reused_context).iterations({100000});
+}
+
+PICOBENCH_SUITE("aes gcm decrypt 64 bytes");
+
+namespace AES_GCM_DECRYPT_64
+{
+  auto aes_gcm_decrypt_new_context = benchmark_aes_gcm_decrypt<64, false>;
+  PICOBENCH(aes_gcm_decrypt_new_context).iterations({100000}).baseline();
+
+  auto aes_gcm_decrypt_reused_context = benchmark_aes_gcm_decrypt<64, true>;
+  PICOBENCH(aes_gcm_decrypt_reused_context).iterations({100000});
+}
+
+PICOBENCH_SUITE("aes gcm decrypt 1024 bytes");
+
+namespace AES_GCM_DECRYPT_1024
+{
+  auto aes_gcm_decrypt_new_context = benchmark_aes_gcm_decrypt<1024, false>;
+  PICOBENCH(aes_gcm_decrypt_new_context).iterations({100000}).baseline();
+
+  auto aes_gcm_decrypt_reused_context = benchmark_aes_gcm_decrypt<1024, true>;
+  PICOBENCH(aes_gcm_decrypt_reused_context).iterations({100000});
+}
+
+std::vector<ccf::crypto::sharing::Share> shares;
 
 PICOBENCH_SUITE("share");
+
 namespace SHARE_bench
 {
   template <size_t nshares, size_t threshold>
@@ -461,8 +639,8 @@ namespace SHARE_bench
     for (auto _ : s)
     {
       (void)_;
-      crypto::Share secret;
-      crypto::sample_secret_and_shares(secret, shares, threshold);
+      ccf::crypto::sharing::Share secret;
+      ccf::crypto::sharing::sample_secret_and_shares(secret, shares, threshold);
       do_not_optimize(secret);
       clobber_memory();
     }
@@ -494,9 +672,10 @@ namespace SHARE_bench
     for (auto _ : s)
     {
       (void)_;
-      crypto::Share secret;
-      crypto::sample_secret_and_shares(secret, shares, threshold);
-      crypto::recover_unauthenticated_secret(secret, shares, threshold);
+      ccf::crypto::sharing::Share secret;
+      ccf::crypto::sharing::sample_secret_and_shares(secret, shares, threshold);
+      ccf::crypto::sharing::recover_unauthenticated_secret(
+        secret, shares, threshold);
       do_not_optimize(secret);
       clobber_memory();
     }

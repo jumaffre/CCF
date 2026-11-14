@@ -2,10 +2,10 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/crypto/key_pair.h"
-#include "ccf/ds/logger.h"
-#include "crypto/openssl/openssl_wrappers.h"
-#include "crypto/openssl/public_key.h"
+#include "ccf/crypto/ec_key_pair.h"
+#include "ccf/crypto/openssl/openssl_wrappers.h"
+#include "crypto/openssl/ec_public_key.h"
+#include "ds/internal_logger.h"
 
 #include <iostream>
 #include <map>
@@ -19,16 +19,16 @@ namespace tls
   class KeyExchangeContext
   {
   private:
-    crypto::KeyPairPtr own_key;
-    crypto::PublicKeyPtr peer_key;
-    crypto::CurveID curve;
+    ccf::crypto::ECKeyPairPtr own_key;
+    ccf::crypto::ECPublicKeyPtr peer_key;
+    ccf::crypto::CurveID curve{ccf::crypto::CurveID::SECP384R1};
     std::vector<uint8_t> shared_secret;
 
     void compute_shared_secret()
     {
       if (!own_key)
       {
-        own_key = make_key_pair(curve);
+        own_key = make_ec_key_pair(curve);
       }
 
       if (!peer_key)
@@ -41,15 +41,15 @@ namespace tls
     }
 
   public:
-    KeyExchangeContext() : curve(crypto::CurveID::SECP384R1) {}
+    KeyExchangeContext() = default;
 
-    ~KeyExchangeContext() {}
+    ~KeyExchangeContext() = default;
 
     std::vector<uint8_t> get_own_key_share()
     {
       if (!own_key)
       {
-        own_key = make_key_pair(curve);
+        own_key = make_ec_key_pair(curve);
         shared_secret.clear();
       }
 
@@ -61,7 +61,7 @@ namespace tls
       return tmp;
     }
 
-    std::vector<uint8_t> get_peer_key_share() const
+    [[nodiscard]] std::vector<uint8_t> get_peer_key_share() const
     {
       if (!peer_key)
       {
@@ -83,7 +83,7 @@ namespace tls
 
     void load_peer_key_share(std::span<const uint8_t> ks)
     {
-      if (ks.size() == 0)
+      if (ks.empty())
       {
         throw std::runtime_error("Provided peer key share is empty");
       }
@@ -91,15 +91,9 @@ namespace tls
       std::vector<uint8_t> tmp(ks.begin(), ks.end());
       tmp.erase(tmp.begin());
 
-      int nid = crypto::PublicKey_OpenSSL::get_openssl_group_id(curve);
-      auto pk = crypto::key_from_raw_ec_point(tmp, nid);
-
-      if (!pk)
-      {
-        throw std::runtime_error("Failed to parse peer key share");
-      }
-
-      peer_key = std::make_shared<crypto::PublicKey_OpenSSL>(pk);
+      int nid = ccf::crypto::ECPublicKey_OpenSSL::get_openssl_group_id(curve);
+      peer_key = std::make_shared<ccf::crypto::ECPublicKey_OpenSSL>(
+        ccf::crypto::key_from_raw_ec_point(tmp, nid));
       shared_secret.clear();
     }
 

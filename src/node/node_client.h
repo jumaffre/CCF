@@ -3,9 +3,11 @@
 #pragma once
 
 #include "ccf/crypto/pem.h"
-#include "consensus/aft/raft_types.h"
-#include "enclave/rpc_map.h"
+#include "consensus/aft/cft_types.h"
 #include "http/http_builder.h"
+#include "node/rpc/rpc_map.h"
+
+#include <functional>
 
 namespace ccf
 {
@@ -13,24 +15,18 @@ namespace ccf
   {
   protected:
     std::shared_ptr<ccf::RPCMap> rpc_map;
-    crypto::KeyPairPtr node_sign_kp;
-    const crypto::Pem& self_signed_node_cert;
-    const std::optional<crypto::Pem>& endorsed_node_cert = std::nullopt;
+    const std::function<ccf::crypto::Pem()> get_node_certificate;
 
   public:
     NodeClient(
       std::shared_ptr<ccf::RPCMap> rpc_map_,
-      crypto::KeyPairPtr node_sign_kp_,
-      const crypto::Pem& self_signed_node_cert_,
-      const std::optional<crypto::Pem>& endorsed_node_cert_) :
-      rpc_map(rpc_map_),
-      node_sign_kp(node_sign_kp_),
-      self_signed_node_cert(self_signed_node_cert_),
-      endorsed_node_cert(endorsed_node_cert_)
+      std::function<ccf::crypto::Pem()> get_node_certificate_) :
+      rpc_map(std::move(rpc_map_)),
+      get_node_certificate(std::move(get_node_certificate_))
     {}
 
-    virtual ~NodeClient() {}
+    virtual ~NodeClient() = default;
 
-    virtual bool make_request(http::Request& request) = 0;
+    virtual bool make_request(::http::Request& request) = 0;
   };
 }

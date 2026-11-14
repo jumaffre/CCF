@@ -38,7 +38,7 @@ while [ "$1" != "" ]; do
     shift
 done
 
-set -e
+set -eo pipefail
 
 function service_http_status()
 {
@@ -81,11 +81,14 @@ if [ -n "$PYTHON_PACKAGE_PATH" ]; then
     PYTHON_PACKAGE_PATH=$(realpath -s "${PYTHON_PACKAGE_PATH}")
 fi
 
+echo "** Setting up venv"
+"${ccf_install_path}"/bin/sandbox.sh -h
+
 echo "** Start original service"
 "${ccf_install_path}"/bin/sandbox.sh --sig-tx-interval "${signature_tx_interval}" & 
 sandbox_pid=$!
 
-network_live_time=60
+network_live_time=120
 if poll_for_service_open ${network_live_time} ${sandbox_pid}; then
     echo "Error: Timeout waiting ${network_live_time}s for service to open"
     kill "$(jobs -p)"
@@ -93,9 +96,10 @@ if poll_for_service_open ${network_live_time} ${sandbox_pid}; then
 fi
 
 echo "** Load service"
-python3.8 -m venv .recovery_bench_env
+python3 -m venv --without-pip .recovery_bench_env
+bash "${ccf_install_path}"/bin/install_uv.sh "$PWD"/.recovery_bench_env/bin
 source .recovery_bench_env/bin/activate
-python -m pip -q install locust
+uv pip install -q locust
 
 locust --headless --locustfile ../tests/infra/locust_file.py --ca ./workspace/sandbox_common/service_cert.pem --key ./workspace/sandbox_common/user0_privk.pem --cert ./workspace/sandbox_common/user0_cert.pem --spawn-rate 100 --users 100 --rate 1000000 --node-host https://127.0.0.1:8000 --host https://0.0.0.0 --run-time "${load_run_time_s}s"
 

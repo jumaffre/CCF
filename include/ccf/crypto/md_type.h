@@ -4,9 +4,9 @@
 
 #include "ccf/ds/json.h"
 
-namespace crypto
+namespace ccf::crypto
 {
-  enum class MDType
+  enum class MDType : uint8_t
   {
     NONE = 0,
     SHA1,

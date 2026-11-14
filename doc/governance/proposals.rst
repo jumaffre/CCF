@@ -9,11 +9,11 @@ Proposals are submitted as JSON documents, which if resolved successfully are ap
 Ballots are submitted as JavaScript modules exporting a single ``vote()`` function, executed transactionally, and are able to read from the current KV state but not write to it.
 Each vote script is given the proposal as a JSON document, typically containing list of actions, and returns a Boolean value indicating whether it supports or rejects it.
 
-Any member can submit a new proposal. All members can then vote, once at most, on this proposal using its unique proposal id.
+Any active member can submit a new proposal. All active members can then vote, once at most, on this proposal using its unique proposal id.
 The proposer has the ability to `withdraw` a proposal as long as it is open.
 
 Each time a vote is submitted, all vote ballots for this proposal are re-executed on the current state to determine whether they are `for` or `against` the proposal.
-This vote tally is passed to the ``resolve()`` call in the :term:`Constitution`, which determines whether the proposal is accepted or remains open.
+This vote tally is passed to the ``resolve()`` call in the :term:`Constitution`, which determines whether the proposal is accepted, rejected, or remains open.
 Once a proposal is accepted under the rules of the :term:`Constitution`, it is executed via ``apply()`` and its effects are applied to the state and recorded in the ledger.
 
 For transparency and auditability, all governance operations (including votes) are recorded in plaintext in the ledger and members are required to sign their requests.
@@ -27,14 +27,14 @@ For transparency and auditability, all governance operations (including votes) a
         participant Constitution
 
         Note over MemberFrontend, Constitution: CCF
-        Member 0->>+MemberFrontend: Submit Proposal to /gov/proposals
+        Member 0->>+MemberFrontend: Submit Proposal to /gov/members/proposals:create
         MemberFrontend->>+Constitution: call validate(Proposal)
         Constitution-->>-MemberFrontend: no exception
         MemberFrontend->>+Constitution: call resolve(Proposal, {})
         Constitution-->>-MemberFrontend: not enough votes, return Proposal is Open
         MemberFrontend-->>-Member 0: Proposal is Open
 
-        Member 1->>+MemberFrontend: Submit Ballot containing vote() to /gov/proposals/ProposalID/ballots
+        Member 1->>+MemberFrontend: Submit Ballot containing vote()
         MemberFrontend->>MemberFrontend: evaluate vote(Proposal, KV State) to boolean Vote
         MemberFrontend->>+Constitution: call resolve(Proposal, {Member 1: Vote})
         Constitution-->>-MemberFrontend: enough positive votes, return Proposal is Accepted
@@ -59,7 +59,7 @@ Some examples of proposals which could be sent to the default sample constitutio
         {
           "name": "set_user",
           "args": {
-            "cert": "-----BEGIN CERTIFICATE-----\nMIIBszCCATigAwIBAgIUeYsXeSyujwWWSySPlaVxP0pfO/EwCgYIKoZIzj0EAwMw\nEDEOMAwGA1UEAwwFdXNlcjMwHhcNMjIwMTEyMTAxOTM0WhcNMjMwMTEyMTAxOTM0\nWjAQMQ4wDAYDVQQDDAV1c2VyMzB2MBAGByqGSM49AgEGBSuBBAAiA2IABLWb5TWU\nX9+ldfOZAyEZkbgb7n5CDZcfWXkyL6QXQI7OJb0uF9P6AOuErd/q5Vv2Mqg8LnJs\nmZafY9qZ1Z9XbfOkh5DI08PipIgDBIQ7BYIgstWege/rppcFKuqgjGm1waNTMFEw\nHQYDVR0OBBYEFOhjbOPTvy4iZ7+PFXvYY8Sm1lxcMB8GA1UdIwQYMBaAFOhjbOPT\nvy4iZ7+PFXvYY8Sm1lxcMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwMDaQAw\nZgIxAJHzWMG/CeEg+lfI7gwCv4GEPqc1mZj5PT9uIvFso5NQe36L1UFhMCJDx4g0\nx7rQdwIxAJ5145d33LLc+Row4lOEAiHJpzivurLl4y5Kx6SkY3JMQbmGPJaslPWm\nxfWXoAcGhQ==\n-----END CERTIFICATE-----\n",
+            "cert": "-----BEGIN CERTIFICATE-----\nMIIBszCCATigAwIBAgIUeYsXeSyujwWWSySPlaVxP0pfO/EwCgYIKoZIzj0EAwMw\nEDEOMAwGA1UEAwwFdXNlcjMwHhcNMjIwMTEyMTAxOTM0WhcNMjMwMTEyMTAxOTM0\nWjAQMQ4wDAYDVQQDDAV1c2VyMzB2MBAGByqGSM49AgEGBSuBBAAiA2IABLWb5TWU\nX9+ldfOZAyEZkbgb7n5CDZcfWXkyL6QXQI7OJb0uF9P6AOuErd/q5Vv2Mqg8LnJs\nmZafY9qZ1Z9XbfOkh5DI08PipIgDBIQ7BYIgstWege/rppcFKuqgjGm1waNTMFEw\nHQYDVR0OBBYEFOhjbOPTvy4iZ7+PFXvYY8Sm1lxcMB8GA1UdIwQYMBaAFOhjbOPT\nvy4iZ7+PFXvYY8Sm1lxcMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwMDaQAw\nZgIxAJHzWMG/CeEg+lfI7gwCv4GEPqc1mZj5PT9uIvFso5NQe36L1UFhMCJDx4g0\nx7rQdwIxAJ5145d33LLc+Row4lOEAiHJpzivurLl4y5Kx6SkY3JMQbmGPJaslPWm\nxfWXoAcGhQ==\n-----END CERTIFICATE-----\n"
           }
         }
       ]
@@ -74,7 +74,7 @@ Some examples of proposals which could be sent to the default sample constitutio
           "args": {
             "node_id": "ba9faac9683f7854c2cf0a97f57e63c260bf8d06f8183772c5655093c0af6e19",
             "valid_from": "220112101937Z",
-            "validity_period_days": 366
+            "validity_period_days": 365
           }
         }
       ]
@@ -233,7 +233,7 @@ The CCF repository includes a sample Jinja template which will automatically bui
           }
 
           // Compare stringified JSON representation, to cover object equality
-          const expected = JSON.stringify(366);
+          const expected = JSON.stringify(365);
           if (JSON.stringify(args["validity_period_days"]) !== expected)
           {
             return false;
@@ -251,7 +251,9 @@ These proposals and votes should be sent as the body of HTTP requests as describ
 Submitting a New Proposal
 -------------------------
 
-Assuming that 3 members (``member1``, ``member2`` and ``member3``) are already registered in the CCF network and that the sample constitution is used, a member can submit a new proposal using :http:POST:`/gov/proposals` and vote using :http:POST:`/gov/proposals/{proposal_id}/ballots`.
+.. note:: The `ccf_cose_sign1` script is distributed in the `ccf` Python package, available on PyPI. It can be installed with `pip install ccf`.
+
+Assuming that 3 members (``member1``, ``member2`` and ``member3``) are already registered in the CCF network and that the sample constitution is used, a member can submit a new proposal using :http:POST:`/gov/members/proposals:create` and vote using :http:POST:`/gov/members/proposals/{proposalId}/ballots/{memberId}:submit`.
 
 For example, ``member1`` may submit a proposal to add a new member (``member4``) to the consortium:
 
@@ -272,16 +274,24 @@ For example, ``member1`` may submit a proposal to add a new member (``member4``)
 
 .. code-block:: bash
 
-    $ ccf_cose_sign1 --ccf-gov-msg-type proposal --ccf-gov-msg-created_at `date -uIs` --signing-key member1_privk.pem --signing-cert member1_cert.pem --content add_member.json | \
-      curl https://<ccf-node-address>/gov/proposals --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type proposal \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --signing-key member1_privk.pem \
+      --signing-cert member1_cert.pem \
+      --content set_member.json \
+    | curl https://<ccf-node-address>/gov/members/proposals:create?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-      "ballot_count": 0,
-      "proposal_id": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
-      "proposer_id": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
-      "state": "Open"
+      "ballotCount": 0,
+      "proposalId": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
+      "proposerId": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
+      "proposalState": "Open"
     }
 
-Here a new proposal has successfully been created, and nobody has yet voted for it. The proposal is in state ``Open``, meaning it will can receive additional votes. Members can then vote to accept or reject the proposal:
+Here a new proposal has successfully been created, and nobody has yet voted for it. The proposal is in state ``Open``, meaning it can receive additional votes. Members can then vote to accept or reject the proposal:
 
 .. code-block:: bash
 
@@ -298,78 +308,110 @@ Here a new proposal has successfully been created, and nobody has yet voted for 
 .. code-block:: bash
 
     # Member 1 approves the proposal (votes in favour: 1/3)
-    $ ccf_cose_sign1 --ccf-gov-msg-type ballot --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd --signing-key member1_privk.pem --signing-cert member1_cert.pem --content vote_accept.json | \
-      curl https://<ccf-node-address>/gov/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd/ballots --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type ballot \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd \
+      --signing-key member1_privk.pem \
+      --signing-cert member1_cert.pem \
+      --content vote_accept.json \
+    | curl https://<ccf-node-address>/gov/members/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd/ballots/52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73:submit?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-      "ballot_count": 1,
-      "proposal_id": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
-      "proposer_id": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
-      "state": "Open"
+      "ballotCount": 1,
+      "proposalId": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
+      "proposerId": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
+      "proposalState": "Open"
     }
 
-    # Member 2 approves the proposal (votes in favour: 1/3)
-    $ ccf_cose_sign1 --ccf-gov-msg-type ballot --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd --signing-key member2_privk.pem --signing-cert member2_cert.pem --content vote_reject.json | \
-      curl https://<ccf-node-address>/gov/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd/ballots --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    # Member 2 rejects the proposal (votes in favour: 1/3)
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type ballot \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd \
+      --signing-key member2_privk.pem \
+      --signing-cert member2_cert.pem \
+      --content vote_reject.json \
+    | curl https://<ccf-node-address>/gov/members/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd/ballots/fe6ed012e8184f28afb48d0d58dca7f461dc997c43179acf97362dc0b76ddeb7:submit?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-      "ballot_count": 2,
-      "proposal_id": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
-      "proposer_id": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
-      "state": "Open"
+      "ballotCount": 2,
+      "proposalId": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
+      "proposerId": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
+      "proposalState": "Open"
     }
 
     # Member 3 approves the proposal (votes in favour: 2/3)
-    $ ccf_cose_sign1 --ccf-gov-msg-type ballot --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd --signing-key member3_privk.pem --signing-cert member3_cert.pem --content vote_accept.json | \
-      curl https://<ccf-node-address>/gov/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd/ballots --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type ballot \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd \
+      --signing-key member3_privk.pem \
+      --signing-cert member3_cert.pem \
+      --content vote_accept.json \
+    | curl https://<ccf-node-address>/gov/members/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd/ballots/75b86775f1253c308f4e9aeddf912d40b8d77db9eaa9a0f0026f581920d5e9b8:submit?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-      "ballot_count": 3,
-      "proposal_id": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
-      "proposer_id": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
-      "state": "Accepted"
+      "ballotCount": 3,
+      "proposalId": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
+      "proposerId": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
+      "proposalState": "Accepted"
     }
 
     # As a majority of members have accepted the proposal, member 4 is added to the consortium
 
 As soon as ``member3`` accepts the proposal, a majority (2 out of 3) of members has been reached and the proposal completes, successfully adding ``member4``. The response shows this, as the proposal's state is now ``Accepted``.
 
-.. note:: Once a new member has been accepted to the consortium, the new member must acknowledge that it is active by sending a :http:POST:`/gov/ack` request. See :ref:`governance/adding_member:Activating a New Member`.
+.. note:: Once a new member has been accepted to the consortium, the new member must acknowledge that it is active by sending a :http:POST:`/gov/members/state-digests/{memberId}:ack` request. See :ref:`governance/adding_member:Activating a New Member`.
 
 Displaying Proposals
 --------------------
 
-The details of pending proposals, can be queried from the service by calling :http:GET:`/gov/proposals/{proposal_id}`. For example, after accepting the proposal above:
+The details of proposals can be queried from the service by calling :http:GET:`/gov/members/proposals/{proposalId}`. For example, after accepting the proposal above:
 
 .. code-block:: bash
 
-    $ curl https://<ccf-node-address>/gov/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd --cacert service_cert.pem -X GET
+    $ curl https://<ccf-node-address>/gov/members/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd?api-version=2024-07-01 --cacert service_cert.pem -X GET
     {
-      "ballots": {
-        "0d8866bf4623a685963f3c087cd6fdcdf48fc483d774f7fc28bf428e31755aaa": "export function vote (proposal, proposerId) { return true }",
-        "466cc43f0cd17df4b49ded4b833f7bbba43b15ebee5be896d91e823fcce96a69": "export function vote (proposal, proposerId) { return true }",
-        "fe1b9b511fb3cf3ca3a1289b0d44db83a80dee8a54492f29467c52ebef9dbe40": "export function vote (proposal, proposerId) { return false }"
+      "ballotCount": 3,
+      "finalVotes": {
+        "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73": true,
+        "75b86775f1253c308f4e9aeddf912d40b8d77db9eaa9a0f0026f581920d5e9b8": true,
+        "fe6ed012e8184f28afb48d0d58dca7f461dc997c43179acf97362dc0b76ddeb7": false
       },
-      "final_votes": {
-        "0d8866bf4623a685963f3c087cd6fdcdf48fc483d774f7fc28bf428e31755aaa": true,
-        "466cc43f0cd17df4b49ded4b833f7bbba43b15ebee5be896d91e823fcce96a69": true,
-        "fe1b9b511fb3cf3ca3a1289b0d44db83a80dee8a54492f29467c52ebef9dbe40": false
-      },
-      "proposer_id": "0d8866bf4623a685963f3c087cd6fdcdf48fc483d774f7fc28bf428e31755aaa",
-      "state": "Accepted"
+      "proposalId": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
+      "proposerId": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
+      "proposalState": "Accepted"
     }
 
 Withdrawing a Proposal
 ----------------------
 
-At any stage during the voting process, before the proposal is accepted, the proposing member may decide to withdraw a pending proposal:
+At any stage during the voting process, before the proposal is accepted, the proposing member may unilaterally withdraw a proposal by calling :http:POST:`/gov/members/proposals/{proposalId}:withdraw`:
 
 .. code-block:: bash
 
-    $ ccf_cose_sign1 --ccf-gov-msg-type withdrawal --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd --signing-key member1_privk.pem --signing-cert member1_cert.pem | \
-      curl https://<ccf-node-address>/gov/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd/withdraw --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type withdrawal \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --ccf-gov-msg-proposal_id d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd \
+      --signing-key member1_privk.pem \
+      --signing-cert member1_cert.pem \
+    | curl https://<ccf-node-address>/gov/members/proposals/d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd:withdraw?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-      "ballot_count": 1,
-      "proposal_id": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
-      "proposer_id": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
-      "state": "Withdrawn"
+      "ballotCount": 1,
+      "proposalId": "d4ec2de82267f97d3d1b464020af0bd3241f1bedf769f0fee73cd00f08e9c7fd",
+      "proposerId": "52af2620fa1b005a93d55d7d819a249ee2cb79f5262f54e8db794c5281a0ce73",
+      "proposalState": "Withdrawn"
     }
 
 This means future votes will be rejected, and the proposal will never be accepted. However it remains visible as a proposal so members can easily audit historic proposals.
@@ -395,5 +437,3 @@ The `assert_service_identity` action, provided as a sample, illustrates how this
     }
 
 A constitution wishing to enforce that all proposals must be specific to a service could enforce the presence of this action in its ``validate()`` implementation.
-
-.. warning:: HTTP request signing could be used in previous versions of CCF, but has been removed as of 4.0, in favour of COSE Sign1.

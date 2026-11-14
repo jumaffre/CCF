@@ -3,6 +3,7 @@
 #pragma once
 
 #include "ccf/service/map.h"
+#include "kv/internal_table_names.h"
 
 #include <map>
 #include <optional>
@@ -23,33 +24,35 @@ namespace ccf
     EncryptedSharesMap encrypted_shares;
 
     // Version at which the previous ledger secret was written to the store
-    std::optional<kv::Version> previous_secret_stored_version = std::nullopt;
+    std::optional<ccf::kv::Version> previous_secret_stored_version =
+      std::nullopt;
   };
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(RecoverySharesInfo)
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(RecoverySharesInfo);
   DECLARE_JSON_REQUIRED_FIELDS(
-    RecoverySharesInfo, wrapped_latest_ledger_secret, encrypted_shares)
+    RecoverySharesInfo, wrapped_latest_ledger_secret, encrypted_shares);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    RecoverySharesInfo, previous_secret_stored_version)
+    RecoverySharesInfo, previous_secret_stored_version);
 
   struct PreviousLedgerSecretInfo
   {
     // Past ledger secret encrypted with the latest ledger secret
-    std::vector<uint8_t> encrypted_data = {};
+    std::vector<uint8_t> encrypted_data;
 
     // Version at which the ledger secret is applicable from
-    kv::Version version = kv::NoVersion;
+    ccf::kv::Version version = ccf::kv::NoVersion;
 
     // Version at which the ledger secret _before_ this one was written to the
     // store
-    std::optional<kv::Version> previous_secret_stored_version = std::nullopt;
+    std::optional<ccf::kv::Version> previous_secret_stored_version =
+      std::nullopt;
 
     PreviousLedgerSecretInfo() = default;
 
     PreviousLedgerSecretInfo(
       std::vector<uint8_t>&& encrypted_data_,
-      kv::Version version_,
-      std::optional<kv::Version> stored_version_) :
+      ccf::kv::Version version_,
+      std::optional<ccf::kv::Version> stored_version_) :
       encrypted_data(std::move(encrypted_data_)),
       version(version_),
       previous_secret_stored_version(stored_version_)
@@ -68,11 +71,11 @@ namespace ccf
     }
   };
 
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(PreviousLedgerSecretInfo)
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(PreviousLedgerSecretInfo);
   DECLARE_JSON_REQUIRED_FIELDS(
-    PreviousLedgerSecretInfo, encrypted_data, version)
+    PreviousLedgerSecretInfo, encrypted_data, version);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    PreviousLedgerSecretInfo, previous_secret_stored_version)
+    PreviousLedgerSecretInfo, previous_secret_stored_version);
 
   struct EncryptedLedgerSecretInfo
   {
@@ -89,14 +92,14 @@ namespace ccf
     // integrity on the public-only transactions. However, the corresponding
     // shares are only written at a later version, once the previous ledger
     // secrets have been restored.
-    std::optional<kv::Version> next_version = std::nullopt;
+    std::optional<ccf::kv::Version> next_version = std::nullopt;
   };
 
   // Note: Both fields are never empty at the same time
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(EncryptedLedgerSecretInfo)
-  DECLARE_JSON_REQUIRED_FIELDS(EncryptedLedgerSecretInfo)
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(EncryptedLedgerSecretInfo);
+  DECLARE_JSON_REQUIRED_FIELDS(EncryptedLedgerSecretInfo);
   DECLARE_JSON_OPTIONAL_FIELDS(
-    EncryptedLedgerSecretInfo, previous_ledger_secret, next_version)
+    EncryptedLedgerSecretInfo, previous_ledger_secret, next_version);
 
   // The following two tables are distinct because some operations trigger a
   // re-share without requiring the ledger secrets to be updated (e.g. updating
@@ -118,7 +121,5 @@ namespace ccf
   namespace Tables
   {
     static constexpr auto SHARES = "public:ccf.internal.recovery_shares";
-    static constexpr auto ENCRYPTED_PAST_LEDGER_SECRET =
-      "public:ccf.internal.historical_encrypted_ledger_secret";
   }
 }

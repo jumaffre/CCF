@@ -11,10 +11,10 @@ namespace ccf
 {
   static inline llhttp_method http_method_from_str(const std::string_view& s)
   {
-    const auto hashed_name = ds::fnv_1a<size_t>(s);
+    const auto hashed_name = ccf::ds::fnv_1a<size_t>(s);
 
 #define XX(num, name, string) \
-  case (ds::fnv_1a<size_t>(#string)): \
+  case (ccf::ds::fnv_1a<size_t>(#string)): \
   { \
     return llhttp_method(num); \
   }
@@ -48,18 +48,20 @@ namespace ccf
 
   public:
     RESTVerb() : verb(std::numeric_limits<int>::min()) {}
+
     RESTVerb(const llhttp_method& hm) : verb(hm) {}
+
     RESTVerb(const std::string& s)
     {
-      verb = http_method_from_str(s.c_str());
+      verb = http_method_from_str(s);
     }
 
-    std::optional<llhttp_method> get_http_method() const
+    [[nodiscard]] std::optional<llhttp_method> get_http_method() const
     {
       return static_cast<llhttp_method>(verb);
     }
 
-    const char* c_str() const
+    [[nodiscard]] const char* c_str() const
     {
       return llhttp_method_name(static_cast<llhttp_method>(verb));
     }
@@ -85,7 +87,7 @@ namespace ccf
   inline void to_json(nlohmann::json& j, const RESTVerb& verb)
   {
     std::string s(verb.c_str());
-    nonstd::to_lower(s);
+    ccf::nonstd::to_lower(s);
     j = s;
   }
 
@@ -98,17 +100,18 @@ namespace ccf
     }
 
     std::string s = j.get<std::string>();
-    nonstd::to_upper(s);
+    ccf::nonstd::to_upper(s);
 
-    verb = RESTVerb(s.c_str());
+    verb = RESTVerb(s);
   }
 
-  inline std::string schema_name(const RESTVerb*)
+  inline std::string schema_name([[maybe_unused]] const RESTVerb* verb_type)
   {
     return "HttpMethod";
   }
 
-  inline void fill_json_schema(nlohmann::json& schema, const RESTVerb*)
+  inline void fill_json_schema(
+    nlohmann::json& schema, [[maybe_unused]] const RESTVerb* verb_type)
   {
     schema["type"] = "string";
   }

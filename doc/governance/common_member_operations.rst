@@ -25,7 +25,7 @@ The operator can establish if it is safe to remove a node by calling :http:GET:`
 Updating Code Version
 ---------------------
 
-For new nodes to be able to join the network, the version of the code they run (as specified by ``enclave.file``) should be first trusted by the consortium of members.
+For new nodes to be able to join the network, the version of the code they run should be first trusted by the consortium of members.
 
 The specifics of how to manage code updates depends on the :doc:`platform <../operations/platforms/index>` being run.
 
@@ -36,6 +36,8 @@ The specifics of how to manage code updates depends on the :doc:`platform <../op
 
 Rekeying Ledger
 ---------------
+
+.. note:: The `ccf_cose_sign1` script is distributed in the `ccf` Python package, available on PyPI. It can be installed with `pip install ccf`.
 
 To limit the scope of key compromise, members of the consortium can refresh the key used to encrypt the ledger. For example, rekeying can be triggered by members when existing nodes are removed from the service.
 
@@ -53,41 +55,67 @@ To limit the scope of key compromise, members of the consortium can refresh the 
 
 .. code-block:: bash
 
-    $ ccf_cose_sign1 --ccf-gov-msg-type proposal --ccf-gov-msg-created_at `date -uIs` --signing-key member1_privk.pem --signing-cert member1_cert.pem --content trigger_ledger_rekey.json | \
-      curl https://<ccf-node-address>/gov/proposals --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type proposal \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --signing-key member1_privk.pem \
+      --signing-cert member1_cert.pem \
+      --content trigger_ledger_rekey.json \
+    | curl https://<ccf-node-address>/gov/members/proposals:create?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-        "ballot_count": 0,
-        "proposal_id": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
-        "proposer_id": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
-        "state": "Open"
+        "ballotCount": 0,
+        "proposalId": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
+        "proposerId": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
+        "proposalState": "Open"
     }
 
-    $ ccf_cose_sign1 --ccf-gov-msg-type ballot --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id 2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e --signing-key member2_privk.pem --signing-cert member2_cert.pem --content vote_accept_1.json | \
-      curl https://<ccf-node-address>/gov/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type ballot \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --ccf-gov-msg-proposal_id 2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e \
+      --signing-key member2_privk.pem \
+      --signing-cert member2_cert.pem \
+      --content vote_accept_1.json \
+    | curl https://<ccf-node-address>/gov/members/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots/fe6ed012e8184f28afb48d0d58dca7f461dc997c43179acf97362dc0b76ddeb7:submit?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-        "ballot_count": 1,
-        "proposal_id": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
-        "proposer_id": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
-        "state": "Open"
+        "ballotCount": 1,
+        "proposalId": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
+        "proposerId": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
+        "proposalState": "Open"
     }
 
-    $ ccf_cose_sign1 --ccf-gov-msg-type ballot --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id 2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e --signing-key member3_privk.pem --signing-cert member3_cert.pem --content vote_accept_1.json | \
-      curl https://<ccf-node-address>/gov/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
+    $ ccf_cose_sign1 \
+      --ccf-gov-msg-type ballot \
+      --ccf-gov-msg-created_at `date -uIs` \
+      --ccf-gov-msg-proposal_id 2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e \
+      --signing-key member3_privk.pem \
+      --signing-cert member3_cert.pem \
+      --content vote_accept_1.json \
+    | curl https://<ccf-node-address>/gov/members/proposals/2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e/ballots/75b86775f1253c308f4e9aeddf912d40b8d77db9eaa9a0f0026f581920d5e9b8:submit?api-version=2024-07-01 \
+      --cacert service_cert.pem \
+      --data-binary @- \
+      -H "content-type: application/cose"
     {
-        "ballot_count": 2,
-        "proposal_id": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
-        "proposer_id": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
-        "state": "Accepted"
+        "ballotCount": 2,
+        "proposalId": "2f739d154b8cddacd7fc6d03cc8d4d20626e477ec4b1af10a74c670bb38bed5e",
+        "proposerId": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
+        "proposalState": "Accepted"
     }
 
-Once the proposal is accepted (``"state": "Accepted"``) it is immediately enacted. All subsequent transactions will be encrypted with a fresh new ledger encryption key.
+Once the proposal is accepted (``"proposalState": "Accepted"``) it is immediately enacted. All subsequent transactions will be encrypted with a fresh new ledger encryption key.
 
 Updating Recovery Threshold
 ---------------------------
 
 To protect the ledger secrets required to recover an existing service, CCF requires :ref:`members to submit their recovery shares <governance/accept_recovery:Submitting Recovery Shares>`.
 
-.. note:: The initial value of the recovery threshold is set via the ``start.service_configuration.recovery_threshold`` configuration entry when starting the first node in a new service. If this value is unspecified, it is set to the initial number of consortium members.
+.. note:: The initial value of the recovery threshold is set via the ``command.start.service_configuration.recovery_threshold`` configuration entry when starting the first node in a new service. If this value is unspecified, it is set to the number of initial consortium members with a public encryption key. If the consortium contains only recovery owners, it defaults to 1.
 
 The number of member shares required to restore the private ledger (``recovery_threshold``) is part of the service configuration and can be updated by members via the usual propose and vote process.
 
@@ -105,36 +133,15 @@ The number of member shares required to restore the private ledger (``recovery_t
         ]
     }
 
-.. code-block:: bash
-
-    $ ccf_cose_sign1 --ccf-gov-msg-type proposal --ccf-gov-msg-created_at `date -uIs` --signing-key member1_privk.pem --signing-cert member1_cert.pem --content set_recovery_threshold.json | \
-      curl https://<ccf-node-address>/gov/proposals --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
-    {
-        "ballot_count": 0,
-        "proposal_id": "b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8",
-        "proposer_id": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
-        "state": "Open"
-    }
-
-    $ ccf_cose_sign1 --ccf-gov-msg-type ballot --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8 --signing-key member2_privk.pem --signing-cert member2_cert.pem --content vote_accept_1.json | \
-      curl https://<ccf-node-address>/gov/proposals/b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8/ballots --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
-    {
-        "ballot_count": 1,
-        "proposal_id": "b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8",
-        "proposer_id": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
-        "state": "Open"
-    }
-
-    $ ccf_cose_sign1 --ccf-gov-msg-type ballot --ccf-gov-msg-created_at `date -uIs` --ccf-gov-msg-proposal_id b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8 --signing-key member3_privk.pem --signing-cert member3_cert.pem --content vote_accept_1.json | \
-      curl https://<ccf-node-address>/gov/proposals/b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8/ballots --cacert service_cert.pem --data-binary @- -H "content-type: application/cose"
-    {
-        "ballot_count": 2,
-        "proposal_id": "b9c08b3861395eca904d913427dcb436136e277cf4712eb14e9e9cddf9d231a8",
-        "proposer_id": "2af6cb6c0af07818186f7ef7151061174c3cb74b4a4c30a04a434f0c2b00a8c0",
-        "state": "Accepted"
-    }
-
 .. note:: The new recovery threshold has to be in the range between 1 and the current number of active recovery members.
+
+Recovery FAQ
+------------
+
+Can recovery members be changed during recovery?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+No. While a service is recovering, members that have share encryption keys cannot be added, removed, or activated, and the recovery threshold cannot be changed. The at-recovery ledger secrets cannot be rekeyed, so changing the set of recovery members at this point would not have the effect operators usually expect. Complete the recovery first, then change recovery membership or threshold as needed.
 
 Renewing Node Certificate
 -------------------------
@@ -143,7 +150,7 @@ Renewing Node Certificate
 
 To renew the soon-to-be-expired certificate of a node, members should issue a ``set_node_certificate_validity`` proposal, specifying the date at which the validity period of the renewed certificate should start (``valid_from``), as well as its validity period in days (``validity_period_days`` -- optional).
 
-- The ``valid_from`` date/time argument accepts time points in ASN.1 UTCTime format (``"YYMMDDhhmmssZ"``) or ISO 8601 format (``"YYYY-MM-DD HH:MM:SS.ssssss+HH:MM"``), with optional fractional seconds and timezone offset. For details see :ccf_repo:`src/ds/x509_time_fmt.h`.
+- The ``valid_from`` date/time argument accepts time points in ASN.1 UTCTime format (``"YYMMDDhhmmssZ"``) or ISO 8601 format (``"YYYY-MM-DD HH:MM:SS.ssssss+HH:MM"``), with optional fractional seconds and timezone offset. For details see :ccf_repo:`include/ccf/ds/x509_time_fmt.h`.
 - If set, the ``validity_period_days`` should be less than the service-wide maximum validity period configured by operators. If omitted, the ``validity_period_days`` defaults to the service-wide maximum validity period configured by operators (see :ref:`operations/certificates:Node Certificates`).
 - Both Service-endorsed and self-signed node certificates are renewed by this proposal.
 
@@ -157,7 +164,7 @@ A sample proposal is:
             {
                 "name": "set_node_certificate_validity",
                 "args": {
-                    "node_id": "86c0ccfab4b869abbc779937c51158c9dd2a130d58323643a3119e83b33dcf5c"
+                    "node_id": "86c0ccfab4b869abbc779937c51158c9dd2a130d58323643a3119e83b33dcf5c",
                     "valid_from": "220101143018Z",
                     "validity_period_days": 365
                 }
@@ -185,6 +192,32 @@ A sample proposal is:
         "actions": [
             {
                 "name": "set_service_certificate_validity",
+                "args": {
+                    "valid_from": "220101143018Z",
+                    "validity_period_days": 365
+                }
+            }
+        ]
+    }
+
+Renewing ML-DSA Service Certificate
+-----------------------------------
+
+.. note:: This proposal only applies to services with an ML-DSA service certificate (see :ref:`operations/certificates:Service Certificate`), and is rejected otherwise.
+
+Similarly, the ML-DSA service certificate can be renewed via the ``set_pq_service_certificate_validity`` proposal, which takes the same arguments.
+Its validity period is independent of the service certificate's.
+The proposal fails if the primary node cannot issue the ML-DSA certificate, for example when it is built without ML-DSA support.
+
+A sample proposal is:
+
+.. code-block:: bash
+
+    $ cat set_pq_service_certificate_validity.json
+    {
+        "actions": [
+            {
+                "name": "set_pq_service_certificate_validity",
                 "args": {
                     "valid_from": "220101143018Z",
                     "validity_period_days": 365

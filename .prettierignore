@@ -7,8 +7,8 @@ CMakeFiles/
 !.vscode/launch.json
 .vs/
 libuv/
-raft_tests.md
-tests/raft_scenarios
+cft_tests.md
+tests/cft_scenarios
 *.pyc
 __pycache__/
 sphinx/build/
@@ -23,10 +23,10 @@ latex/
 env/
 *.egg-info
 **/dist
-python/setup.py
 .mypy_cache
 3rdparty/
 *.html
 SECURITY.md
 doc/schemas/
 .venv_ccf_sandbox
+.github/**/*.md

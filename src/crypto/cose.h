@@ -1,0 +1,195 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+
+#pragma once
+
+#include "ccf/crypto/curve.h"
+#include "ccf/crypto/md_type.h"
+#include "ccf/crypto/mldsa_parameter_set.h"
+
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace ccf::crypto
+{
+  class ECKeyPair;
+  class MLDSAKeyPair;
+}
+
+namespace ccf
+{
+  namespace cose
+  {
+    std::vector<uint8_t> make_cose_sign1_tbs(
+      std::span<const uint8_t> protected_header,
+      std::span<const uint8_t> payload);
+
+    std::vector<uint8_t> make_cose_sign1_envelope(
+      std::span<const uint8_t> protected_header,
+      std::span<const uint8_t> payload,
+      std::span<const uint8_t> signature,
+      bool detached);
+
+    /// @throws std::runtime_error if header construction, signing, or
+    /// encoding fails.
+    std::vector<uint8_t> sign_ledger(
+      const crypto::ECKeyPair& key,
+      std::string_view kid,
+      int64_t iat,
+      std::string_view issuer,
+      std::string_view subject,
+      std::string_view txid,
+      std::span<const uint8_t> payload);
+
+    /// Same protected header, signed with pure ML-DSA over the Sig_structure
+    /// and an empty context (RFC 9964).
+    /// @throws std::runtime_error if header construction, signing, or
+    /// encoding fails.
+    std::vector<uint8_t> sign_ledger(
+      const crypto::MLDSAKeyPair& key,
+      std::string_view kid,
+      int64_t iat,
+      std::string_view issuer,
+      std::string_view subject,
+      std::string_view txid,
+      std::span<const uint8_t> payload);
+
+    /// Curve-specific COSE algorithm and digest.
+    struct SigningAlgorithm
+    {
+      int64_t alg;
+      crypto::MDType md;
+    };
+
+    /// @throws std::runtime_error if the curve has no COSE signing algorithm
+    SigningAlgorithm algorithm_for_curve(crypto::CurveID curve);
+
+    /// COSE algorithm of an ML-DSA parameter set (RFC 9964).
+    /// @throws std::runtime_error for an unknown parameter set
+    int64_t algorithm_for_parameter_set(
+      crypto::MLDSAParameterSet parameter_set);
+
+    /// The ML-DSA parameter set of a COSE algorithm, or std::nullopt if alg
+    /// is not an ML-DSA algorithm.
+    std::optional<crypto::MLDSAParameterSet> parameter_set_for_algorithm(
+      int64_t alg);
+
+    /// @throws std::runtime_error if header construction, signing, or
+    /// encoding fails.
+    std::vector<uint8_t> sign_endorsement(
+      const crypto::ECKeyPair& key,
+      int64_t iat,
+      std::string_view epoch_begin,
+      std::string_view epoch_end,
+      std::span<const uint8_t> previous_merkle_root,
+      std::span<const uint8_t> payload);
+
+    namespace header
+    {
+      namespace iana // https://www.iana.org/assignments/cose/cose.xhtml
+      {
+        static constexpr int64_t ALG = 1;
+        static constexpr int64_t CONTENT_TYPE = 3;
+        static constexpr int64_t KID = 4;
+        static constexpr int64_t CWT_CLAIMS = 15;
+        static constexpr int64_t X5CHAIN = 33;
+        static constexpr int64_t PREIMAGE_CONTENT_TYPE = 259;
+        static constexpr int64_t VDS = 395;
+        static constexpr int64_t VDP = 396;
+
+        // https://www.ietf.org/archive/id/draft-ietf-cose-merkle-tree-proofs-18.html#name-cose-header-parameter
+        static constexpr int64_t INCLUSION_PROOFS = -1;
+        static constexpr int64_t CONSISTENCY_PROOFS = -2;
+      }
+
+      namespace custom
+      {
+        static constexpr std::string_view CCF_V1 = "ccf.v1";
+        static constexpr std::string_view TX_ID = "txid";
+        static constexpr std::string_view TX_RANGE_BEGIN = "epoch.start.txid";
+        static constexpr std::string_view TX_RANGE_END = "epoch.end.txid";
+        static constexpr std::string_view EPOCH_LAST_MERKLE_ROOT =
+          "epoch.end.merkle.root";
+      }
+    }
+
+    namespace value
+    {
+      // https://www.ietf.org/archive/id/draft-birkholz-cose-receipts-ccf-profile-05.html#section-2
+      static constexpr int64_t CCF_LEDGER_SHA256 = 2;
+
+      static constexpr std::string_view CT_JSON = "application/json";
+      static constexpr std::string_view CT_OCTET_STREAM =
+        "application/octet-stream";
+    }
+
+    namespace alg // https://www.iana.org/assignments/cose/cose.xhtml
+    {
+      static constexpr int64_t ES256 = -7;
+      static constexpr int64_t ES384 = -35;
+      static constexpr int64_t ES512 = -36;
+      // Fully-specified ECDSA identifiers, RFC 9864.
+      static constexpr int64_t ESP256 = -9;
+      static constexpr int64_t ESP384 = -51;
+      static constexpr int64_t ESP512 = -52;
+      static constexpr int64_t PS256 = -37;
+      static constexpr int64_t PS384 = -38;
+      static constexpr int64_t PS512 = -39;
+      static constexpr int64_t EDDSA = -8;
+      // Fully-specified EdDSA identifier, RFC 9864.
+      static constexpr int64_t ED25519 = -19;
+      // Pure ML-DSA identifiers, RFC 9964.
+      static constexpr int64_t ML_DSA_44 = -48;
+      static constexpr int64_t ML_DSA_65 = -49;
+      static constexpr int64_t ML_DSA_87 = -50;
+    }
+
+    using Signature = std::span<const uint8_t>;
+
+    static bool is_ecdsa_alg(int64_t cose_alg)
+    {
+      // RFC 9864 deprecates the curve-agnostic ES identifiers in favour of the
+      // fully-specified ESP ones. Both are accepted, since the curve, and
+      // therefore the digest, is fixed by the verification key.
+      return cose_alg == alg::ES256 || cose_alg == alg::ES384 ||
+        cose_alg == alg::ES512 || cose_alg == alg::ESP256 ||
+        cose_alg == alg::ESP384 || cose_alg == alg::ESP512;
+    }
+
+    static bool is_rsa_alg(int64_t cose_alg)
+    {
+      return cose_alg == alg::PS256 || cose_alg == alg::PS384 ||
+        cose_alg == alg::PS512;
+    }
+  }
+
+  namespace cwt::header
+  {
+    namespace iana // https://www.iana.org/assignments/cwt/cwt.xhtml
+    {
+      static constexpr int64_t ISS = 1;
+      static constexpr int64_t SUB = 2;
+
+      /* Value is **PLAIN INTEGER**, as per
+       * https://www.rfc-editor.org/rfc/rfc8392#section-2. Quote:
+       *
+       * The "NumericDate" term in this specification has the same meaning and
+       * processing rules as the JWT "NumericDate" term defined in Section 2 of
+       * [RFC7519], except that it is represented as a CBOR numericdate (from
+       * Section 2.4.1 of [RFC7049]) instead of a JSON number. The encoding is
+       * modified so that the leading tag 1 (epoch-based date/time) MUST be
+       * omitted.
+       */
+      static constexpr int64_t IAT = 6;
+    }
+
+    namespace custom
+    {
+      static constexpr std::string_view SVN = "svn";
+    }
+  }
+}

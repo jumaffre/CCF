@@ -1,7 +1,7 @@
-import { Base64 } from "js-base64";
-
 import * as ccfapp from "@microsoft/ccf-app";
 import * as ccfsnp from "@microsoft/ccf-app/snp_attestation";
+import { toUint8ArrayBuffer } from "@microsoft/ccf-app/utils";
+import { base64ToUint8Array } from "./base64";
 
 interface ErrorResponse {
   error: {
@@ -57,6 +57,9 @@ interface SnpAttestationResult {
     report_id: string;
     report_id_ma: string;
     reported_tcb: TcbVersion;
+    cpuid_fam_id: number;
+    cpuid_mod_id: number;
+    cpuid_step: number;
     chip_id: string;
     committed_tcb: TcbVersion;
     current_minor: number;
@@ -85,15 +88,17 @@ export function verifySnpAttestation(
     const body = request.body.json();
     const evidence = ccfapp
       .typedArray(Uint8Array)
-      .encode(Base64.toUint8Array(body.evidence));
+      .encode(toUint8ArrayBuffer(base64ToUint8Array(body.evidence)));
     const endorsements = ccfapp
       .typedArray(Uint8Array)
-      .encode(Base64.toUint8Array(body.endorsements));
+      .encode(toUint8ArrayBuffer(base64ToUint8Array(body.endorsements)));
     const uvm_endorsements =
       body.uvm_endorsements !== undefined
         ? ccfapp
             .typedArray(Uint8Array)
-            .encode(Base64.toUint8Array(body.uvm_endorsements))
+            .encode(
+              toUint8ArrayBuffer(base64ToUint8Array(body.uvm_endorsements)),
+            )
         : undefined;
 
     const r = ccfsnp.verifySnpAttestation(

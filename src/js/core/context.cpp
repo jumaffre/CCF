@@ -1,0 +1,679 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+
+#include "ccf/js/core/context.h"
+
+#include "ccf/ds/hex.h"
+#include "ccf/js/core/runtime.h"
+#include "ccf/js/core/wrapped_value.h"
+#include "ccf/js/extensions/console.h"
+#include "ccf/js/tx_access.h"
+#include "ds/internal_logger.h"
+#include "js/checks.h"
+#include "js/global_class_ids.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdarg>
+#include <quickjs/quickjs.h>
+
+namespace ccf::js::core
+{
+  namespace
+  {
+    inline JSModuleDef* load_module_via_context(
+      JSContext* ctx, const char* module_name, void* opaque)
+    {
+      auto* context = reinterpret_cast<Context*>(opaque);
+
+      try
+      {
+        auto opt_module = context->get_module(module_name);
+        if (!opt_module.has_value())
+        {
+          return nullptr;
+        }
+        return reinterpret_cast<JSModuleDef*>(
+          JS_VALUE_GET_PTR(opt_module->val));
+      }
+      catch (const std::exception& exc)
+      {
+        JS_ThrowReferenceError(ctx, "%s", exc.what());
+        js::core::Context& jsctx =
+          *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+        auto [reason, trace] = jsctx.error_message();
+
+        auto& rt = jsctx.runtime();
+        if (rt.log_exception_details)
+        {
+          CCF_APP_FAIL(
+            "Failed to load module '{}': {} {}",
+            module_name,
+            reason,
+            trace.value_or("<no trace>"));
+        }
+        return nullptr;
+      }
+    }
+
+    // QuickJS reports failures of the interpreter itself (out of memory, stack
+    // overflow, interruption) as InternalErrors. When even the error object
+    // cannot be allocated, it throws null instead.
+    bool is_interpreter_failure(
+      const Context& jsctx, const JSWrappedValue& exception)
+    {
+      if (JS_IsNull(exception.val) != 0)
+      {
+        return true;
+      }
+
+      if (!exception.is_error())
+      {
+        return false;
+      }
+
+      const auto name_val = exception["name"];
+      if (name_val.is_exception())
+      {
+        // Discard whatever an unusual name getter threw
+        JS_FreeValue(jsctx, JS_GetException(jsctx));
+        return false;
+      }
+
+      const auto name = jsctx.to_str(name_val);
+      return name.has_value() && name.value() == "InternalError";
+    }
+  }
+
+  Context::Context(TxAccess acc) : access(acc)
+  {
+    ctx = JS_NewContext(rt);
+    if (ctx == nullptr)
+    {
+      throw std::runtime_error("Failed to initialise QuickJS context");
+    }
+    JS_SetContextOpaque(ctx, this);
+
+    JS_SetModuleLoaderFunc(rt, nullptr, load_module_via_context, this);
+  }
+
+  Context::~Context()
+  {
+    JS_SetInterruptHandler(JS_GetRuntime(ctx), nullptr, nullptr);
+    JS_FreeContext(ctx);
+  }
+
+  std::optional<JSWrappedValue> Context::get_module(
+    std::string_view module_name)
+  {
+    auto it = loaded_modules_cache.find(module_name);
+    if (it == loaded_modules_cache.end())
+    {
+      LOG_TRACE_FMT("Module cache miss for '{}'", module_name);
+
+      // If not currently in cache, ask configured loader
+      if (module_loader == nullptr)
+      {
+        LOG_FAIL_FMT("Unable to load module: No module loader configured");
+        return std::nullopt;
+      }
+
+      auto module_val = module_loader->get_module(module_name, *this);
+      if (module_val.has_value())
+      {
+        // If returned a new module:
+        // - store it in cache
+        loaded_modules_cache.emplace_hint(it, module_name, *module_val);
+
+        // - ensure its dependencies are resolved
+        if (JS_ResolveModule(ctx, module_val->val) < 0)
+        {
+          auto [reason, trace] = error_message();
+
+          if (rt.log_exception_details)
+          {
+            CCF_APP_FAIL("{}: {}", reason, trace.value_or("<no trace>"));
+          }
+
+          throw std::runtime_error(fmt::format(
+            "Failed to resolve dependencies for module '{}': {}",
+            module_name,
+            reason));
+        }
+      }
+
+      return module_val;
+    }
+    LOG_TRACE_FMT("Module cache hit for '{}'", module_name);
+
+    return it->second;
+  }
+
+  JSWrappedValue Context::wrap(JSValue&& val) const
+  {
+    // NOLINTBEGIN(performance-move-const-arg)
+    // Retained to call distinct overload of JSWrappedValue constructor, which
+    // avoids DupValue
+    return {ctx, std::move(val)};
+    // NOLINTEND(performance-move-const-arg)
+  };
+
+  JSWrappedValue Context::wrap(const JSValue& val) const
+  {
+    return {ctx, val};
+  };
+
+  JSValue Context::extract_string_array(
+    JSValueConst& argv, std::vector<std::string>& out)
+  {
+    auto args = wrap(argv);
+
+    if (JS_IsArray(ctx, argv) == 0)
+    {
+      return JS_ThrowTypeError(ctx, "First argument must be an array");
+    }
+
+    auto len_val = args["length"];
+    uint32_t len = 0;
+    if (JS_ToUint32(ctx, &len, len_val.val) != 0)
+    {
+      return ccf::js::core::constants::Exception;
+    }
+
+    if (len == 0)
+    {
+      return JS_ThrowRangeError(
+        ctx, "First argument must be a non-empty array");
+    }
+
+    for (uint32_t i = 0; i < len; i++)
+    {
+      auto arg_val = args[i];
+      if (!arg_val.is_str())
+      {
+        return JS_ThrowTypeError(
+          ctx, "First argument must be an array of strings, found non-string");
+      }
+      auto s = to_str(arg_val);
+      if (!s)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Failed to extract C string from JS string at position %d", i);
+      }
+      out.push_back(*s);
+    }
+
+    return ccf::js::core::constants::Undefined;
+  }
+
+  std::pair<std::string, std::optional<std::string>> Context::error_message()
+  {
+    auto exception_val = wrap(JS_GetException(ctx));
+    std::optional<std::string> message;
+    bool is_error = exception_val.is_error();
+    if (!is_error && exception_val.is_obj())
+    {
+      auto rval = json_stringify(exception_val);
+      message = to_str(rval);
+    }
+    else
+    {
+      message = to_str(exception_val);
+    }
+
+    std::optional<std::string> trace = std::nullopt;
+    if (is_error)
+    {
+      auto val = exception_val["stack"];
+      if (!val.is_undefined())
+      {
+        trace = to_str(val);
+      }
+    }
+
+    // Converting the original exception (json_stringify, toString, reading the
+    // stack property) executes JavaScript and can itself raise, or hit the
+    // active runtime limits. Drain any resulting secondary exception so this
+    // interpreter never returns to the cache with a pending exception.
+    JS_FreeValue(ctx, JS_GetException(ctx));
+
+    return {message.value_or(""), trace};
+  }
+
+  JSWrappedValue Context::get_property(
+    JSValue object, char const* property_name) const
+  {
+    return wrap(JS_GetPropertyStr(ctx, object, property_name));
+  }
+
+  JSWrappedValue Context::get_global_obj() const
+  {
+    return wrap(JS_GetGlobalObject(ctx));
+  }
+
+  JSWrappedValue Context::get_global_property(const char* s) const
+  {
+    auto g = Context::get_global_obj();
+    return wrap(JS_GetPropertyStr(ctx, g.val, s));
+  }
+
+  JSWrappedValue Context::get_or_create_global_property(
+    const char* s, JSWrappedValue&& default_value) const
+  {
+    auto g = Context::get_global_obj();
+    auto val = wrap(JS_GetPropertyStr(ctx, g.val, s));
+    if (val.is_undefined())
+    {
+      val = default_value;
+      JS_CHECK_OR_THROW(g.set(s, std::move(default_value)));
+    }
+
+    return val;
+  }
+
+  JSWrappedValue Context::get_typed_array_buffer(
+    const JSWrappedValue& obj,
+    size_t* pbyte_offset,
+    size_t* pbyte_length,
+    size_t* pbytes_per_element) const
+  {
+    return wrap(JS_GetTypedArrayBuffer(
+      ctx, obj.val, pbyte_offset, pbyte_length, pbytes_per_element));
+  }
+
+  std::optional<std::vector<uint8_t>> Context::copy_array_buffer(
+    JSValueConst val) const
+  {
+    size_t size = 0;
+    uint8_t* data = JS_GetArrayBuffer(ctx, &size, val);
+    if (data == nullptr)
+    {
+      return std::nullopt;
+    }
+    return std::vector<uint8_t>(data, data + size);
+  }
+
+  JSWrappedValue Context::get_exported_function(
+    const std::string& code, const std::string& func, const std::string& path)
+  {
+    auto module = eval(
+      code.c_str(),
+      code.size(),
+      path.c_str(),
+      JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+
+    if (module.is_exception())
+    {
+      throw std::runtime_error(fmt::format("Failed to compile {}", path));
+    }
+
+    return get_exported_function(module, func, path);
+  }
+
+  JSWrappedValue Context::get_exported_function(
+    const JSWrappedValue& module,
+    const std::string& func,
+    const std::string& path)
+  {
+    // JS_EvalFunction consumes one reference to the module value, so we must
+    // provide it with its own via JS_DupValue. Our JSWrappedValue destructor
+    // will free the original reference separately.
+    auto eval_val = wrap(JS_EvalFunction(ctx, JS_DupValue(ctx, module.val)));
+
+    // Evaluating a module produces a promise, which is rejected if the module
+    // body threw, rather than that exception being returned. Failures of the
+    // interpreter itself while evaluating the module (out of memory, stack
+    // overflow, interruption) are re-raised here, so that a module which
+    // exhausted its limits is not used. Other exceptions thrown at module scope
+    // are not reported.
+    if (JS_PromiseState(ctx, eval_val.val) == JS_PROMISE_REJECTED)
+    {
+      auto reason = wrap(JS_PromiseResult(ctx, eval_val.val));
+      if (is_interpreter_failure(*this, reason))
+      {
+        // JS_Throw takes ownership of the reference it is given
+        eval_val = wrap(JS_Throw(ctx, JS_DupValue(ctx, reason.val)));
+      }
+    }
+
+    if (eval_val.is_exception())
+    {
+      auto [reason, trace] = error_message();
+
+      if (rt.log_exception_details)
+      {
+        CCF_APP_FAIL("{}: {}", reason, trace.value_or("<no trace>"));
+      }
+      throw std::runtime_error(
+        fmt::format("Failed to execute {}: {}", path, reason));
+    }
+
+    // Get exported function from module via namespace object
+    assert(JS_VALUE_GET_TAG(module.val) == JS_TAG_MODULE);
+    auto* module_def =
+      reinterpret_cast<JSModuleDef*>(JS_VALUE_GET_PTR(module.val));
+    auto ns = wrap(JS_GetModuleNamespace(ctx, module_def));
+    if (JS_IsException(ns.val) != 0)
+    {
+      throw std::runtime_error(
+        fmt::format("Failed to get namespace for module '{}'", path));
+    }
+
+    auto func_atom = JS_NewAtom(ctx, func.c_str());
+    auto export_func = wrap(JS_GetProperty(ctx, ns.val, func_atom));
+    JS_FreeAtom(ctx, func_atom);
+
+    if (JS_IsUndefined(export_func.val) != 0)
+    {
+      throw std::runtime_error(
+        fmt::format("Failed to find export '{}' in module '{}'", func, path));
+    }
+    if (JS_IsFunction(ctx, export_func.val) == 0)
+    {
+      throw std::runtime_error(fmt::format(
+        "Export '{}' of module '{}' is not a function", func, path));
+    }
+    return export_func;
+  }
+
+  JSWrappedValue Context::null() const
+  {
+    return wrap(ccf::js::core::constants::Null);
+  }
+
+  JSWrappedValue Context::undefined() const
+  {
+    return wrap(ccf::js::core::constants::Undefined);
+  }
+
+  JSWrappedValue Context::new_obj() const
+  {
+    return wrap(JS_NewObject(ctx));
+  }
+
+  JSWrappedValue Context::new_obj_class(JSClassID class_id) const
+  {
+    return wrap(JS_NewObjectClass(ctx, class_id));
+  }
+
+  JSWrappedValue Context::new_array() const
+  {
+    return wrap(JS_NewArray(ctx));
+  }
+
+  JSWrappedValue Context::new_array_buffer_copy(
+    const uint8_t* buf, size_t buf_len) const
+  {
+    return wrap(JS_NewArrayBufferCopy(ctx, buf, buf_len));
+  }
+
+  JSWrappedValue Context::new_array_buffer_copy(
+    const char* buf, size_t buf_len) const
+  {
+    return {
+      ctx,
+      JS_NewArrayBufferCopy(
+        ctx, reinterpret_cast<const uint8_t*>(buf), buf_len)};
+  }
+
+  JSWrappedValue Context::new_array_buffer_copy(
+    std::span<const uint8_t> data) const
+  {
+    return {ctx, JS_NewArrayBufferCopy(ctx, data.data(), data.size())};
+  }
+
+  JSWrappedValue Context::new_string(const std::string_view& str) const
+  {
+    return new_string_len(str.data(), str.size());
+  }
+
+  JSWrappedValue Context::new_string_len(const char* buf, size_t buf_len) const
+  {
+    return wrap(JS_NewStringLen(ctx, buf, buf_len));
+  }
+
+  JSWrappedValue Context::new_string_len(
+    const std::span<const uint8_t> buf) const
+  {
+    return wrap(JS_NewStringLen(
+      ctx, reinterpret_cast<const char*>(buf.data()), buf.size()));
+  }
+
+  JSWrappedValue Context::new_type_error(const char* fmt, ...) const
+  {
+    va_list ap;
+    va_start(ap, fmt);
+    auto r = wrap(JS_ThrowTypeError(ctx, fmt, ap));
+    va_end(ap);
+    return r;
+  }
+
+  JSWrappedValue Context::new_internal_error(const char* fmt, ...) const
+  {
+    va_list ap;
+    va_start(ap, fmt);
+    auto r = wrap(JS_ThrowInternalError(ctx, fmt, ap));
+    va_end(ap);
+    return r;
+  }
+
+  JSWrappedValue Context::new_tag_value(int tag, int32_t val) const
+  {
+// "compound literals are a C99-specific feature"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc99-extensions"
+    return wrap(JS_MKVAL(tag, val));
+#pragma clang diagnostic pop
+  }
+
+  JSWrappedValue Context::new_c_function(
+    JSCFunction* func, const char* name, int length) const
+  {
+    return wrap(JS_NewCFunction(ctx, func, name, length));
+  }
+
+  JSWrappedValue Context::new_getter_c_function(
+    JSCFunction* func, const char* name, size_t arg_count) const
+  {
+    return wrap(JS_NewCFunction2(
+      ctx, func, name, arg_count, JS_CFUNC_getter, JS_CFUNC_getter_magic));
+  }
+
+  JSWrappedValue Context::duplicate_value(JSValueConst original) const
+  {
+    return wrap(JS_DupValue(ctx, original));
+  }
+
+  JSWrappedValue Context::eval(
+    const char* input,
+    size_t input_len,
+    const char* filename,
+    int eval_flags) const
+  {
+    return wrap(JS_Eval(ctx, input, input_len, filename, eval_flags));
+  }
+
+  JSWrappedValue Context::read_object(
+    const uint8_t* buf, size_t buf_len, int flags) const
+  {
+    return wrap(JS_ReadObject(ctx, buf, buf_len, flags));
+  }
+
+  namespace
+  {
+    int js_custom_interrupt_handler(JSRuntime* rt, void* opaque)
+    {
+      (void)rt;
+      auto* inter = reinterpret_cast<InterruptData*>(opaque);
+      auto now = std::chrono::high_resolution_clock::now();
+      auto elapsed_time = now - inter->start_time;
+      auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed_time);
+      if (elapsed_ms.count() >= inter->max_execution_time.count())
+      {
+        extensions::ConsoleExtension::log_info_with_tag(
+          inter->access,
+          fmt::format(
+            "JS execution has timed out after {}ms (max is {}ms)",
+            elapsed_ms.count(),
+            inter->max_execution_time.count()));
+        inter->request_timed_out = true;
+        return 1;
+      }
+      return 0;
+    }
+  }
+
+  RuntimeLimitsScope::RuntimeLimitsScope(
+    Context& context,
+    const std::optional<ccf::JSRuntimeOptions>& options,
+    RuntimeLimitsPolicy policy,
+    const std::optional<InterruptData>& inherited) :
+    ctx(context)
+  {
+    auto& rt = ctx.runtime();
+    rt.set_runtime_options(options, policy);
+    ctx.interrupt_data.request_timed_out = false;
+
+    if (inherited.has_value())
+    {
+      ctx.interrupt_data.start_time = inherited->start_time;
+      // Never allow more than either the inherited budget, or the budget
+      // produced by the options being applied here
+      ctx.interrupt_data.max_execution_time =
+        std::min(inherited->max_execution_time, rt.get_max_exec_time());
+      ctx.interrupt_data.access = inherited->access;
+    }
+    else
+    {
+      ctx.interrupt_data.start_time =
+        decltype(InterruptData::start_time)::clock::now();
+      ctx.interrupt_data.max_execution_time = rt.get_max_exec_time();
+    }
+
+    JS_SetInterruptHandler(
+      rt, js_custom_interrupt_handler, &ctx.interrupt_data);
+  }
+
+  RuntimeLimitsScope::~RuntimeLimitsScope()
+  {
+    auto& rt = ctx.runtime();
+    JS_SetInterruptHandler(rt, nullptr, nullptr);
+    rt.reset_runtime_options();
+  }
+
+  JSWrappedValue Context::call_with_rt_options(
+    const JSWrappedValue& f,
+    const std::vector<JSWrappedValue>& argv,
+    const std::optional<ccf::JSRuntimeOptions>& options,
+    RuntimeLimitsPolicy policy)
+  {
+    const RuntimeLimitsScope limits(*this, options, policy);
+
+    return inner_call(f, argv);
+  }
+
+  JSWrappedValue Context::inner_call(
+    const JSWrappedValue& f, const std::vector<JSWrappedValue>& argv)
+  {
+    std::vector<JSValue> argvn;
+    argvn.reserve(argv.size());
+    for (const auto& a : argv)
+    {
+      argvn.push_back(a.val);
+    }
+
+    return wrap(JS_Call(
+      ctx,
+      f.val,
+      ccf::js::core::constants::Undefined,
+      argv.size(),
+      argvn.data()));
+  }
+
+  JSWrappedValue Context::json_stringify(const JSWrappedValue& obj) const
+  {
+    return wrap(JS_JSONStringify(
+      ctx,
+      obj.val,
+      ccf::js::core::constants::Null,
+      ccf::js::core::constants::Null));
+  }
+
+  JSWrappedValue Context::parse_json(const nlohmann::json& j) const
+  {
+    const auto buf = j.dump();
+    return wrap(JS_ParseJSON(ctx, buf.data(), buf.size(), "<json>"));
+  }
+
+  JSWrappedValue Context::parse_json(
+    const char* buf, size_t buf_len, const char* filename) const
+  {
+    return wrap(JS_ParseJSON(ctx, buf, buf_len, filename));
+  }
+
+  std::optional<std::string> Context::to_str(const JSWrappedValue& x) const
+  {
+    return to_str(x.val);
+  }
+
+  std::optional<std::string> Context::to_str(const JSValue& x) const
+  {
+    size_t len = 0;
+    return to_str(x, len);
+  }
+
+  std::optional<std::string> Context::to_str(
+    const JSValue& x, size_t& len) const
+  {
+    const auto free_cstring = [this](const char* str) {
+      JS_FreeCString(ctx, str);
+    };
+    const std::unique_ptr<const char, decltype(free_cstring)> val(
+      JS_ToCStringLen(ctx, &len, x), free_cstring);
+    if (val == nullptr)
+    {
+      // JS_ToCStringLen returns nullptr when a JS exception is already set (eg
+      // OOM, or an exception during coercion). Preserve that exception for
+      // caller
+      return std::nullopt;
+    }
+    // Preserve embedded NUL bytes. The QuickJS buffer may alias a live JS
+    // string, so release it even if copying throws, but do not cleanse it.
+    return std::string(val.get(), len);
+  }
+
+  std::optional<std::string> Context::to_str(const JSAtom& atom) const
+  {
+    size_t len = 0;
+    const auto free_cstring = [this](const char* str) {
+      JS_FreeCString(ctx, str);
+    };
+    const std::unique_ptr<const char, decltype(free_cstring)> val(
+      JS_AtomToCStringLen(ctx, &len, atom), free_cstring);
+    if (val == nullptr)
+    {
+      // JS_AtomToCStringLen returns nullptr when a JS exception is already set
+      // (eg OOM). Preserve that exception for callers.
+      return std::nullopt;
+    }
+    return std::string(val.get(), len);
+  }
+
+  void Context::add_extension(const js::extensions::ExtensionPtr& extension)
+  {
+    extensions.push_back(extension);
+    extension->install(*this);
+  }
+
+  bool Context::remove_extension(const js::extensions::ExtensionPtr& extension)
+  {
+    auto it = std::find(extensions.begin(), extensions.end(), extension);
+    if (it != extensions.end())
+    {
+      extensions.erase(it);
+      return true;
+    }
+    return false;
+  }
+}

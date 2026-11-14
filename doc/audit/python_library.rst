@@ -51,7 +51,19 @@ Finally, the ledger can be iterated over. For each transaction in the ledger, th
     :start-after: SNIPPET_START: iterate_over_ledger
     :end-before: SNIPPET_END: iterate_over_ledger
 
-.. tip:: The integrity of the ledger is automatically verified when iterating over transactions.
+To verify ledger integrity, pass each transaction to a ``LedgerValidator``:
+
+.. code-block:: python
+
+    validator = ccf.ledger.LedgerValidator()
+    for chunk in ledger:
+        for transaction in chunk:
+            validator.add_transaction(transaction)
+
+``LedgerValidator`` automatically prunes its Merkle tree to limit memory use when verifying large ledgers.
+
+For trees used directly, ``ccf.merkletree.MerkleTree.flush(index)`` discards leaves before ``index`` without changing the root.
+New leaves can still be appended.
 
 .. _read_ledger.py:
 
@@ -66,18 +78,44 @@ The ``read_ledger.py`` command line utility can be used to parse, verify the int
     Reading ledger from ['/path/to/ledger/dir']
     Contains 9 chunks
     chunk /path/to/first/ledger/chunk (committed)
-      seqno 1 (9 public tables) # Number of tables written at seqno 1
-        table "public:ccf.gov.constitution" (1 write): # 1 write to this table at seqno 1
+      txid 2.1 (9 public tables) [1234 bytes] # Number of tables written at transaction 2.1
+        table "public:ccf.gov.constitution" (1 write): # 1 write to this table at transaction 2.1
           <u64: 0>: # key
             "class Action ..." # value
-        table "public:ccf.gov.members.acks" (2 writes): # 2 writes to this table at seqno 1
+        table "public:ccf.gov.members.acks" (2 writes): # 2 writes to this table at transaction 2.1
             ...
-      seqno 31 (0 public tables) # transaction at seqno 31 is private only
+      txid 2.31 (0 public tables) [94 bytes] # transaction 2.31 is private only
       -- private: 94 bytes # size of private entry
     ...
-    Ledger verification complete. Found 15 signatures, and verified until 2.52 # Ledger integrity verified up to seqno 2.52
+    Ledger verification complete
+    Verified FULL - 52 transactions, 15 signatures, until 2.52 # Ledger integrity verified up to transaction 2.52
 
 By default, non-committed ledger files are ignored, unless the ``--uncommitted`` command line argument is specified.
+
+Verification Levels
+~~~~~~~~~~~~~~~~~~~
+
+The ``read_ledger.py`` utility supports multiple verification levels via the ``--verification-level`` option, allowing you to trade off between computation cost and security guarantees:
+
+- ``NONE``: No verification, just parse the ledger structure. Use this for quickly reading individual ledger chunks or when integrity is not a concern.
+- ``OFFSETS``: Validate that the offset table is consistent and points to valid transaction boundaries.
+- ``HEADERS``: Validate transaction headers (size, version, and flags are valid values).
+- ``MERKLE``: Validate merkle tree consistency by checking that each signature's merkle root matches the computed tree (trusts the first signature).
+- ``FULL`` (default): Full cryptographic verification including signature validation and node certificate checks.
+
+.. code-block:: bash
+
+    # Parse a single ledger chunk without verification
+    $ read_ledger.py /path/to/ledger/chunk --verification-level=NONE
+
+    # Validate structure but skip expensive cryptographic operations
+    $ read_ledger.py /path/to/ledger/dir --verification-level=HEADERS
+
+    # Full verification (default)
+    $ read_ledger.py /path/to/ledger/dir --verification-level=FULL
+
+.. note::
+    The ``--insecure-skip-verification`` flag is deprecated. Use ``--verification-level=NONE`` instead.
 
 Alternatively, ``read_ledger.py`` can parse the content of a snapshot file:
 
@@ -85,7 +123,7 @@ Alternatively, ``read_ledger.py`` can parse the content of a snapshot file:
 
     $ read_ledger.py --snapshot /path/to/snapshot/file
     Reading snapshot from /path/to/snapshot/file (committed)
-      seqno 12 (15 public tables)
+      txid 2.12 (15 public tables) [1234 bytes]
     ...
 
 .. note::
@@ -105,9 +143,9 @@ An example of how to read and verify entries on the ledger can be found in :ccf_
 Since every vote request is signed by the voting member, verified by the primary node and then stored on the ledger, the test performs the following (this sequence of operations is performed sequentially per transaction):
 
  1. Read and store the member certificates
- 2. Read an entry from the ``public:ccf.gov.history`` table (each entry in the table contains the member id of the voting member, along with their latest signed request)
+ 2. Read an entry from the ``public:ccf.gov.cose_history`` table (each entry in the table contains the member id of the voting member, along with their latest COSE Sign1 signed request)
  3. Create a public key using the certificate of the voting member (which was stored on step 1)
- 4. Verify the signature using the public key and the raw request
+ 4. Verify the COSE Sign1 signature using the public key. Proposal creation entries have a detached payload, so the proposal body must first be read from the ``public:ccf.gov.proposals`` table in the same transaction and supplied as the detached payload. Entries written by older versions of CCF embed the proposal payload instead, and the example accepts both forms
  5. Repeat steps 2 - 4 until all voting history entries have been read
 
 ``ledger_code.py`` command line utility
@@ -118,28 +156,32 @@ The ``ledger_code.py`` command line utility can be used to display the history o
 .. code-block:: bash
 
     $ ledger_code.py -s /path/to/ledger/dir
-    2.1 Introduced : [('OE_SGX_v1', '3258fb')]
-    2.103 Introduced : [('OE_SGX_v1', '048b8c')]
-    3.175 Removed : [('OE_SGX_v1', '3258fb')]
+    2.1 Introduced : [('AMD_SEV_SNP_v1', '3258fb')]
+    2.103 Introduced : [('AMD_SEV_SNP_v1', '048b8c')]
+    3.175 Removed : [('AMD_SEV_SNP_v1', '3258fb')]
 
     $ ledger_code.py -vs /path/to/ledger/dir
-    2.1: {('OE_SGX_v1', '3258fb'): ['9b013f']}
-    2.3: {('OE_SGX_v1', '3258fb'): ['9b013f', 'beb114']}
-    2.5: {('OE_SGX_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4']}
-    2.103: {('OE_SGX_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4'], ('OE_SGX_v1', '048b8c'): ['3ebd58']}
-    2.119: {('OE_SGX_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4'], ('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a']}
-    2.146: {('OE_SGX_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4'], ('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
-    2.152: {('OE_SGX_v1', '3258fb'): ['beb114', '6ff2f4'], ('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
-    3.156: {('OE_SGX_v1', '3258fb'): ['beb114', '6ff2f4'], ('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
-    3.165: {('OE_SGX_v1', '3258fb'): ['6ff2f4'], ('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
-    3.168: {('OE_SGX_v1', '3258fb'): ['6ff2f4'], ('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
-    3.175: {('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
-    4.179: {('OE_SGX_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
+    2.1: {('AMD_SEV_SNP_v1', '3258fb'): ['9b013f']}
+    2.3: {('AMD_SEV_SNP_v1', '3258fb'): ['9b013f', 'beb114']}
+    2.5: {('AMD_SEV_SNP_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4']}
+    2.103: {('AMD_SEV_SNP_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4'], ('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58']}
+    2.119: {('AMD_SEV_SNP_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4'], ('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a']}
+    2.146: {('AMD_SEV_SNP_v1', '3258fb'): ['9b013f', 'beb114', '6ff2f4'], ('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
+    2.152: {('AMD_SEV_SNP_v1', '3258fb'): ['beb114', '6ff2f4'], ('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
+    3.156: {('AMD_SEV_SNP_v1', '3258fb'): ['beb114', '6ff2f4'], ('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
+    3.165: {('AMD_SEV_SNP_v1', '3258fb'): ['6ff2f4'], ('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
+    3.168: {('AMD_SEV_SNP_v1', '3258fb'): ['6ff2f4'], ('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
+    3.175: {('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
+    4.179: {('AMD_SEV_SNP_v1', '048b8c'): ['3ebd58', '53cb2a', '1d1396']}
 
 As with ``read_ledger.py``, non-committed ledger files are ignored, unless the ``--uncommitted`` command line argument is specified.
 
 API
 ---
+
+.. autoclass:: ccf.ledger.VerificationLevel
+    :members:
+    :undoc-members:
 
 .. autoclass:: ccf.ledger.Ledger
     :members:
@@ -160,3 +202,5 @@ API
 
 .. automodule:: ccf.receipt
     :members:
+
+.. autofunction:: ccf.cose.verify_receipt

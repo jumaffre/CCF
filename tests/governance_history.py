@@ -1,29 +1,32 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.e2e_args
-import infra.network
-import infra.proc
-import infra.remote
-import infra.crypto
-import ccf.ledger
-import infra.doc
-from infra.proposal import ProposalState
-import http
-import os
+
 import base64
+import http
 import json
-from loguru import logger as LOG
-import suite.test_requirements as reqs
+
+import cbor2
+import ccf.ledger
 import ccf.read_ledger
+import ccf.signatures
+import cwt
+import infra.crypto
+import infra.doc
 import infra.logging_app as app
-import infra.signing
+import infra.network
+import suite.test_requirements as reqs
+from ccf.cose import cert_fingerprint
 from ccf.tx_id import TxID
+from infra.proposal import ProposalState
+from loguru import logger as LOG
+from pyasn1.codec.der.decoder import decode as decode_der
 
 
-def check_operations(ledger, operations):
+def check_operations(ledger, operations, expect_detached_proposals=True):
     LOG.debug("Audit the ledger file for governance operations")
 
     members = {}
+    embedded_proposals = []
     for chunk in ledger:
         for tr in chunk:
             tables = tr.get_public_domain().get_tables()
@@ -68,33 +71,73 @@ def check_operations(ledger, operations):
                     assert member_id in members
                     cert = members[member_id]
 
-                    msg = infra.signing.verify_cose_sign1(
-                        base64.b64decode(cose_sign1), cert.decode()
+                    cose_sign1 = base64.b64decode(cose_sign1)
+                    msg = cwt.COSEMessage.loads(cose_sign1)
+                    assert msg.type == cwt.COSETypes.SIGN1, msg
+                    assert "ccf.gov.msg.type" in msg.protected, msg.protected
+                    msg_type = msg.protected["ccf.gov.msg.type"]
+
+                    # Proposal creation always writes the signed proposal
+                    # body to public:ccf.gov.proposals in the same
+                    # transaction. Proposal entries now detach their payload
+                    # to avoid storing it twice, so it must be supplied from
+                    # that table for verification. Ledgers written by older
+                    # versions embed the payload in the envelope as well.
+                    # Ballots and withdrawals always embed their payload, as
+                    # it is not recorded elsewhere.
+                    detached_payload = None
+                    if msg_type == "proposal":
+                        proposals = {
+                            proposal_id: proposal
+                            for proposal_id, proposal in tables[
+                                "public:ccf.gov.proposals"
+                            ].items()
+                            if proposal is not None
+                        }
+                        ((proposal_id, proposal_body),) = proposals.items()
+                        if msg.payload is None:
+                            detached_payload = proposal_body
+                        else:
+                            embedded_proposals.append(proposal_id.decode())
+                    else:
+                        assert msg.payload is not None, msg
+
+                    cose_ctx = cwt.COSE.new()
+                    cert_pem = cert.decode()
+                    cose_key = cwt.COSEKey.from_pem(
+                        cert_pem, kid=cert_fingerprint(cert_pem)
                     )
-                    assert "ccf.gov.msg.type" in msg.phdr
-                    msg_type = msg.phdr["ccf.gov.msg.type"]
+                    phdr, uhdr, payload = cose_ctx.decode_with_headers(
+                        cose_sign1, cose_key, detached_payload=detached_payload
+                    )
+
                     if msg_type == "ballot":
+                        assert "ballot" in json.loads(payload), payload
                         op = (
-                            msg.phdr["ccf.gov.msg.proposal_id"],
+                            phdr["ccf.gov.msg.proposal_id"],
                             member_id.decode(),
                             "vote",
                         )
                     elif msg_type == "withdrawal":
                         op = (
-                            msg.phdr["ccf.gov.msg.proposal_id"],
+                            phdr["ccf.gov.msg.proposal_id"],
                             member_id.decode(),
                             "withdraw",
                         )
                     elif msg_type == "proposal":
-                        (proposal_id,) = tables["public:ccf.gov.proposals"].keys()
+                        # Whether detached or embedded, the signed payload must
+                        # be the proposal body stored in the proposals table
+                        assert payload == proposal_body, (payload, proposal_body)
                         op = (proposal_id.decode(), member_id.decode(), "propose")
                     else:
-                        assert False, msg
+                        assert False, (phdr, uhdr, payload)
 
                     if op in operations:
                         operations.remove(op)
 
     assert operations == set(), operations
+    if expect_detached_proposals:
+        assert embedded_proposals == [], embedded_proposals
 
 
 def check_signatures(ledger):
@@ -104,33 +147,63 @@ def check_signatures(ledger):
     for chunk in ledger:
         for tr in chunk:
             tables = tr.get_public_domain().get_tables()
-            signatures_table_name = "public:ccf.internal.signatures"
-            if signatures_table_name in tables:
-                signatures_table = tables[signatures_table_name]
-                signatures = list(signatures_table.items())
-                assert len(signatures) == 1, signatures
-                signature_raw = signatures[0][1]
-                signature = json.loads(signature_raw)
-                # commit_view and commit_seqno fields are unsigned, deprecated, and set to 0
-                assert signature["commit_view"] == 0, signature
-                assert signature["commit_seqno"] == 0, signature
-                # view and seqno fields are unsigned, and always match the txID contained in the GcmHeader
-                assert tr.gcm_header.view == signature["view"]
-                assert tr.gcm_header.seqno == signature["seqno"]
+            if not ccf.signatures.is_signature_transaction(tables):
+                continue
 
-                sig_txid = TxID(tr.gcm_header.view, tr.gcm_header.seqno)
+            gcm_view = tr.gcm_header.view
+            gcm_seqno = tr.gcm_header.seqno
+            sig_txid = TxID(gcm_view, gcm_seqno)
 
-                # Adjacent signatures only occur on a view change
-                if prev_sig_txid is not None:
-                    if prev_sig_txid.seqno + 1 == sig_txid.seqno:
-                        # Reduced from assert while investigating cause
-                        # https://github.com/microsoft/CCF/issues/5078
-                        if sig_txid.view <= prev_sig_txid.view:
-                            LOG.error(
-                                f"Adjacent signatures at {prev_sig_txid} and {sig_txid}"
-                            )
+            raw_table = tables.get(ccf.signatures.SIGNATURE_TX_TABLE_NAME)
+            if raw_table is not None:
+                payload = ccf.signatures.parse_raw_signature_from_tx(tables)
+                assert payload is not None, raw_table
+                assert payload.view == gcm_view, (payload, gcm_view)
+                assert payload.seqno == gcm_seqno, (payload, gcm_seqno)
+                raw_entries = list(raw_table.items())
+                assert len(raw_entries) == 1, raw_entries
+                raw_sig = json.loads(raw_entries[0][1])
+                assert raw_sig["commit_view"] == 0, raw_sig
+                assert raw_sig["commit_seqno"] == 0, raw_sig
 
-                prev_sig_txid = sig_txid
+            if ccf.signatures.COSE_SIGNATURE_TX_TABLE_NAME in tables:
+                cose_sign1 = ccf.signatures.parse_cose_signature_from_tx(tables)
+                assert cose_sign1 is not None, tables[
+                    ccf.signatures.COSE_SIGNATURE_TX_TABLE_NAME
+                ]
+                msg = cwt.COSEMessage.loads(cose_sign1)
+                assert msg.type == cwt.COSETypes.SIGN1, msg
+                assert msg.payload is None, msg
+                phdr = msg.protected
+
+                KID = 4
+                kid = phdr.get(KID)
+                assert isinstance(kid, bytes) and len(kid) > 0, phdr
+
+                VDS = 395
+                CCF_LEDGER_SHA256 = 2
+                assert phdr[VDS] == CCF_LEDGER_SHA256, phdr
+
+                IAT, ISS, SUB = 6, 1, 2
+                cwt_claims = phdr[int(cwt.COSEHeaders.CWT_CLAIMS)]
+                for label in (IAT, ISS, SUB):
+                    assert label in cwt_claims, (label, cwt_claims)
+
+                cose_txid = TxID.from_str(phdr["ccf.v1"]["txid"])
+                assert cose_txid.view == gcm_view, (cose_txid, gcm_view)
+                assert cose_txid.seqno == gcm_seqno, (cose_txid, gcm_seqno)
+
+            # Adjacent signatures only occur on a view change
+            if (
+                prev_sig_txid is not None
+                and prev_sig_txid.seqno + 1 == sig_txid.seqno
+                and sig_txid.view <= prev_sig_txid.view
+            ):
+                # Reduced from assert while investigating cause
+                # https://github.com/microsoft/CCF/issues/5078
+                LOG.error(f"Adjacent signatures at {prev_sig_txid} and {sig_txid}")
+
+            prev_sig_txid = sig_txid
 
 
 def check_all_tables_are_documented(table_names_in_ledger, doc_path):
@@ -152,9 +225,9 @@ def check_all_tables_are_documented(table_names_in_ledger, doc_path):
             f"Experimental tables {experimental_table_names_in_ledger} were present in ledger"
         )
 
-    public_table_names_in_ledger = set(
-        [tn for tn in table_names_in_ledger if tn.startswith("public:ccf.")]
-    )
+    public_table_names_in_ledger = {
+        tn for tn in table_names_in_ledger if tn.startswith("public:ccf.")
+    }
     undocumented_tables = public_table_names_in_ledger - set(table_names)
     assert undocumented_tables == set(), undocumented_tables
 
@@ -165,47 +238,79 @@ def remove_prefix(s, prefix):
     return s
 
 
-def check_all_tables_have_wrapper_endpoints(table_names, node):
-    gov_prefix = "public:ccf.gov."
-    missing = []
-    with node.client() as c:
-        for table_name in table_names:
-            if table_name.startswith(gov_prefix):
-                LOG.info(f"Testing {table_name}")
-                uri = table_name[len(gov_prefix) :]
-                uri = uri.replace(".", "/")
-                r = c.get(f"/gov/kv/{uri}")
-                if r.status_code != http.HTTPStatus.OK:
-                    missing.append(table_name)
-
-    assert (
-        len(missing) == 0
-    ), f"Missing endpoints to access the following tables: {missing}"
-
-
-@reqs.description("Check tables are documented and wrapped")
+@reqs.description("Check tables are documented")
 def test_tables_doc(network, args):
     primary, _ = network.find_primary()
-    ledger_directories = primary.remote.ledger_paths()
-    ledger = ccf.ledger.Ledger(ledger_directories)
-    table_names_in_ledger = ledger.get_latest_public_state()[0].keys()
+    target_seqno = network.create_and_wait_for_ledger_chunk(primary)
+    public_state, _ = primary.get_public_state_from_api(target_seqno)
+    table_names_in_ledger = public_state.keys()
     check_all_tables_are_documented(
         table_names_in_ledger, "../doc/audit/builtin_maps.rst"
     )
-    check_all_tables_have_wrapper_endpoints(table_names_in_ledger, primary)
     return network
 
 
-@reqs.description("Test that all nodes' ledgers can be read")
+@reqs.description("Check service signing identities are published with certificates")
+def test_service_signing_identities(network, args):
+    # COSE_Key labels (RFC 9052) and the AKP public key parameter (RFC 9964)
+    KTY, ALG, PUB = 1, 3, -1
+    KTY_EC2, KTY_AKP = 2, 7
+    public_key_sizes = {-48: 1312, -49: 1952, -50: 2592}
+    algorithm_oids = {
+        -48: "2.16.840.1.101.3.4.3.17",
+        -49: "2.16.840.1.101.3.4.3.18",
+        -50: "2.16.840.1.101.3.4.3.19",
+    }
+
+    def cose_key(identity):
+        assert identity["kind"] == "COSE_KEY", identity
+        return cbor2.loads(base64.b64decode(identity["value"], validate=True))
+
+    primary, _ = network.find_primary()
+    target_seqno = network.create_and_wait_for_ledger_chunk(primary)
+    public_state, _ = primary.get_public_state_from_api(target_seqno)
+    service_info = json.loads(public_state["public:ccf.gov.service.info"][bytes(8)])
+    identities = public_state["public:ccf.gov.service.signing_identities"]
+    classical_key = cose_key(json.loads(identities[bytes(8)]))
+    assert classical_key[KTY] == KTY_EC2, classical_key
+
+    pq_entry = identities.get((1).to_bytes(8, "little"))
+    pq_cert = service_info.get("pq_cert")
+    assert (pq_entry is not None) == (pq_cert is not None)
+    if pq_entry is not None:
+        key = cose_key(json.loads(pq_entry))
+        assert set(key) == {KTY, ALG, PUB}, key
+        assert key[KTY] == KTY_AKP, key
+        assert key[ALG] in public_key_sizes, key
+        assert isinstance(key[PUB], bytes), key
+        assert len(key[PUB]) == public_key_sizes[key[ALG]], key
+        assert pq_cert == network.get_pq_service_certificate()
+        cert, trailing = decode_der(infra.crypto.cert_pem_to_der(pq_cert))
+        assert not trailing
+        # CCF issues v3 certificates; SPKI is the seventh TBSCertificate field.
+        tbs_cert = cert[0]
+        assert int(tbs_cert[0]) == 2
+        spki = tbs_cert[6]
+        spki_algorithm_oid = str(spki[0][0])
+        spki_public_key = spki[1].asOctets()
+        assert spki_algorithm_oid == algorithm_oids[key[ALG]], spki
+        assert key[PUB] == spki_public_key
+    return network
+
+
+@reqs.description("Test that all nodes' API-readable ledger chunks can be read")
 def test_ledger_is_readable(network, args):
     primary, backups = network.find_nodes()
+    target_seqno = network.create_and_wait_for_ledger_chunk(primary)
     for node in (primary, *backups):
-        ledger_dirs = node.remote.ledger_paths()
-        LOG.info(f"Reading ledger from {ledger_dirs}")
-        ledger = ccf.ledger.Ledger(ledger_dirs)
-        for chunk in ledger:
-            for _ in chunk:
-                pass
+        with node.get_ledger_from_api(
+            target_seqno,
+            local_only=True,
+            timeout=args.ledger_recovery_timeout,
+        ) as ledger:
+            for chunk in ledger:
+                for _ in chunk:
+                    pass
     return network
 
 
@@ -217,16 +322,21 @@ def test_read_ledger_utility(network, args):
     format_rule = [(".*records.*", {"key": fmt_str, "value": fmt_str})]
 
     network.txs.issue(network, number_txs=args.snapshot_tx_interval)
-    network.get_latest_ledger_public_state()
+    target_seqno = network.create_and_wait_for_ledger_chunk()
 
     primary, backups = network.find_nodes()
     for node in (primary, *backups):
-        ledger_dirs = node.remote.ledger_paths()
-        assert ccf.read_ledger.run(paths=ledger_dirs, tables_format_rules=format_rule)
+        with node.download_ledger(target_seqno, local_only=True) as ledger_paths:
+            assert ccf.read_ledger.run(
+                paths=ledger_paths,
+                print_mode=ccf.read_ledger.PrintMode.Contents,
+                tables_format_rules=format_rule,
+            )
 
-    snapshot_dir = network.get_committed_snapshots(primary)
+    snapshot_path = primary.wait_for_snapshot(target_seqno)
     assert ccf.read_ledger.run(
-        paths=[os.path.join(snapshot_dir, os.listdir(snapshot_dir)[-1])],
+        paths=[snapshot_path],
+        print_mode=ccf.read_ledger.PrintMode.Contents,
         is_snapshot=True,
         tables_format_rules=format_rule,
     )
@@ -242,7 +352,6 @@ def run(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
         txs=txs,
     ) as network:
@@ -251,7 +360,6 @@ def run(args):
 
         network.consortium.set_authenticate_session(args.authenticate_session)
 
-        ledger_directories = primary.remote.ledger_paths()
         LOG.info("Add new member proposal (implicit vote)")
         (
             new_member_proposal,
@@ -292,7 +400,7 @@ def run(args):
             ).withdraw(primary, new_member_proposal)
             infra.checker.Checker(c)(response)
         assert response.status_code == http.HTTPStatus.OK.value
-        assert response.body.json()["state"] == ProposalState.WITHDRAWN.value
+        assert response.body.json()["proposalState"] == ProposalState.WITHDRAWN.value
         member = network.consortium.get_member_by_local_id(
             new_member_proposal.proposer_id
         )
@@ -300,13 +408,13 @@ def run(args):
             (new_member_proposal.proposal_id, member.service_id, "withdraw")
         )
 
-        # Force ledger flush of all transactions so far
-        network.get_latest_ledger_public_state()
+        target_seqno = network.create_and_wait_for_ledger_chunk(primary)
 
-        ledger = ccf.ledger.Ledger(ledger_directories)
-        check_operations(ledger, governance_operations)
-        check_signatures(ledger)
+        with primary.get_ledger_from_api(target_seqno) as ledger:
+            check_operations(ledger, governance_operations)
+            check_signatures(ledger)
 
         test_ledger_is_readable(network, args)
         test_read_ledger_utility(network, args)
         test_tables_doc(network, args)
+        test_service_signing_identities(network, args)

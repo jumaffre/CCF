@@ -11,15 +11,29 @@
 #include <optional>
 #include <string>
 
-namespace kv::untyped
+namespace ccf::kv
+{
+  class BaseTx;
+
+  template <typename K, typename V, typename KSerialiser, typename VSerialiser>
+  class MapDiff;
+}
+
+namespace ccf::kv::untyped
 {
   struct ChangeSet;
 
-  class MapDiff : public kv::AbstractHandle
+  /** Read-only view of the changes made to a single map by the transaction
+   * which committed at a given version.
+   *
+   * Only constructible by a transaction (ccf::kv::TxDiff::diff), which
+   * guarantees the change set was created for a diff.
+   */
+  class MapDiff : public ccf::kv::AbstractHandle
   {
   public:
-    using KeyType = kv::serialisers::SerialisedEntry;
-    using ValueType = kv::serialisers::SerialisedEntry;
+    using KeyType = ccf::kv::serialisers::SerialisedEntry;
+    using ValueType = ccf::kv::serialisers::SerialisedEntry;
 
     using ElementVisitor =
       std::function<void(const KeyType& k, const std::optional<ValueType>& V)>;
@@ -28,14 +42,18 @@ namespace kv::untyped
       std::function<bool(const KeyType& k, const std::optional<ValueType>& V)>;
 
   protected:
-    kv::untyped::Write& writes;
+    friend class ccf::kv::BaseTx;
+    template <typename, typename, typename, typename>
+    friend class ccf::kv::MapDiff;
+
+    ccf::kv::untyped::ChangeSet& change_set;
     std::string map_name;
+
+    MapDiff(ccf::kv::untyped::ChangeSet& cs, std::string map_name);
 
     void foreach_(const ElementVisitorWithEarlyOut& fn);
 
   public:
-    MapDiff(kv::untyped::ChangeSet& cs, const std::string& map_name);
-
     std::optional<std::optional<ValueType>> get(const KeyType& key);
 
     bool has(const KeyType& key);

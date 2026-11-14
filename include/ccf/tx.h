@@ -2,7 +2,6 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ccf_assert.h"
 #include "ccf/crypto/sha256_hash.h"
 #include "ccf/tx_id.h"
 
@@ -12,7 +11,7 @@
 #include <optional>
 #include <string>
 
-namespace kv
+namespace ccf::kv
 {
   class AbstractHandle;
   class AbstractMap;
@@ -51,7 +50,7 @@ namespace kv
 
     OrderedChanges all_changes;
 
-    std::optional<crypto::Sha256Hash> root_at_read_version = std::nullopt;
+    std::optional<ccf::crypto::Sha256Hash> root_at_read_version = std::nullopt;
 
     void retain_change_set(
       const std::string& map_name,
@@ -73,7 +72,7 @@ namespace kv
       const std::string& map_name, bool track_deletes_on_missing_keys)
     {
       auto possible_handles = get_possible_handles(map_name);
-      for (auto handle : possible_handles)
+      for (auto* handle : possible_handles)
       {
         auto typed_handle = dynamic_cast<THandle*>(handle);
         if (typed_handle != nullptr)
@@ -87,31 +86,30 @@ namespace kv
       {
         auto& [abstract_map, change_set] = it->second;
 
+        // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
         auto typed_handle = new THandle(*change_set, map_name);
         std::unique_ptr<AbstractHandle> abstract_handle(typed_handle);
         retain_handle(map_name, std::move(abstract_handle));
         return typed_handle;
       }
-      else
+      auto [abstract_map, change_set] =
+        get_map_and_change_set_by_name(map_name, track_deletes_on_missing_keys);
+
+      if (change_set == nullptr)
       {
-        auto [abstract_map, change_set] = get_map_and_change_set_by_name(
-          map_name, track_deletes_on_missing_keys);
-
-        if (change_set == nullptr)
-        {
-          compacted_version_conflict(map_name);
-        }
-
-        auto typed_handle = new THandle(*change_set, map_name);
-        std::unique_ptr<AbstractHandle> abstract_handle(typed_handle);
-        retain_handle(map_name, std::move(abstract_handle));
-        retain_change_set(map_name, std::move(change_set), abstract_map);
-        return typed_handle;
+        compacted_version_conflict(map_name);
       }
+
+      // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+      auto typed_handle = new THandle(*change_set, map_name);
+      std::unique_ptr<AbstractHandle> abstract_handle(typed_handle);
+      retain_handle(map_name, std::move(abstract_handle));
+      retain_change_set(map_name, std::move(change_set), abstract_map);
+      return typed_handle;
     }
 
   public:
-    BaseTx(AbstractStore* _store);
+    BaseTx(AbstractStore* store_);
 
     // To avoid accidental copies and promote use of pass-by-reference, this is
     // non-copyable
@@ -122,7 +120,7 @@ namespace kv
 
     virtual ~BaseTx();
 
-    std::optional<crypto::Sha256Hash> get_root_at_read_version()
+    std::optional<ccf::crypto::Sha256Hash> get_root_at_read_version()
     {
       return root_at_read_version;
     }
@@ -196,7 +194,7 @@ namespace kv
    * type-safety, prefer restricted handles returned by @c ro or @c wo where
    * possible, rather than the general @c rw.
    *
-   * @see kv::ReadOnlyTx
+   * @see ccf::kv::ReadOnlyTx
    */
   class Tx : public ReadOnlyTx
   {

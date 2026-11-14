@@ -1,91 +1,10 @@
 {
   "endpoints": {
-    "/jwt": {
-      "get": {
-        "js_module": "endpoints/jwt.js",
-        "js_function": "jwt",
-        "forwarding_required": "sometimes",
-        "authn_policies": [],
-        "mode": "readonly",
-        "openapi": {
-          "responses": {
-            "200": {
-              "description": "Ok",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "properties": {
-                      "userId": {
-                        "type": "string"
-                      }
-                    },
-                    "required": ["userId"],
-                    "type": "object",
-                    "additionalProperties": false
-                  }
-                }
-              }
-            },
-            "401": {
-              "description": "Unauthorized",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "properties": {
-                      "msg": {
-                        "type": "string"
-                      }
-                    },
-                    "required": ["msg"],
-                    "type": "object",
-                    "additionalProperties": false
-                  }
-                }
-              }
-            }
-          },
-          "security": [],
-          "parameters": []
-        }
-      }
-    },
-    "/crypto": {
-      "get": {
-        "js_module": "endpoints/crypto.js",
-        "js_function": "crypto",
-        "forwarding_required": "sometimes",
-        "authn_policies": ["user_cert"],
-        "mode": "readonly",
-        "openapi": {
-          "responses": {
-            "200": {
-              "description": "Ok",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "properties": {
-                      "available": {
-                        "type": "boolean"
-                      }
-                    },
-                    "required": ["available"],
-                    "type": "object",
-                    "additionalProperties": false
-                  }
-                }
-              }
-            }
-          },
-          "security": [],
-          "parameters": []
-        }
-      }
-    },
     "/generateAesKey": {
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "generateAesKey",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -119,7 +38,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "generateRsaKeyPair",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -170,7 +89,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "generateEcdsaKeyPair",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -218,7 +137,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "generateEddsaKeyPair",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -266,7 +185,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "wrapKey",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -282,7 +201,7 @@
                     "wrappingKey": {
                       "type": "string"
                     },
-                    "parameters": {
+                    "wrapAlgo": {
                       "type": "object"
                     }
                   },
@@ -302,11 +221,51 @@
         }
       }
     },
+    "/unwrapKey": {
+      "post": {
+        "js_module": "endpoints/crypto.js",
+        "js_function": "unwrapKey",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "key": {
+                      "type": "string"
+                    },
+                    "unwrappingKey": {
+                      "type": "string"
+                    },
+                    "wrapAlgo": {
+                      "type": "object"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Unwrapped key",
+              "content": {
+                "application/octet-stream": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/sign": {
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "sign",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -354,7 +313,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "verifySignature",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -405,7 +364,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "digest",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -442,7 +401,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "isValidX509CertBundle",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -471,7 +430,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "isValidX509CertChain",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -512,7 +471,7 @@
       "post": {
         "js_module": "endpoints/partition.js",
         "js_function": "partition",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -546,88 +505,11 @@
         }
       }
     },
-    "/proto": {
-      "post": {
-        "js_module": "endpoints/proto.js",
-        "js_function": "proto",
-        "forwarding_required": "sometimes",
-        "authn_policies": ["user_cert"],
-        "mode": "readonly",
-        "openapi": {
-          "requestBody": {
-            "required": true,
-            "content": {
-              "text/plain": {}
-            }
-          },
-          "responses": {
-            "200": {
-              "description": "Protobuf encoded data",
-              "content": {
-                "application/x-protobuf": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/verifyOpenEnclaveEvidence": {
-      "post": {
-        "js_module": "endpoints/oe.js",
-        "js_function": "verifyOpenEnclaveEvidence",
-        "forwarding_required": "sometimes",
-        "authn_policies": ["user_cert"],
-        "mode": "readonly",
-        "openapi": {
-          "requestBody": {
-            "required": true,
-            "content": {
-              "application/json": {
-                "schema": {
-                  "properties": {
-                    "format": {
-                      "type": "string"
-                    },
-                    "evidence": {
-                      "type": "string"
-                    },
-                    "endorsements": {
-                      "type": "string"
-                    }
-                  },
-                  "type": "object"
-                }
-              }
-            }
-          },
-          "responses": {
-            "200": {
-              "description": "Ok",
-              "content": {
-                "application/json": {
-                  "schema": {
-                    "properties": {
-                      "claims": {
-                        "type": "object"
-                      },
-                      "customClaims": {
-                        "type": "object"
-                      }
-                    },
-                    "type": "object"
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/verifySnpAttestation": {
       "post": {
         "js_module": "endpoints/snp_attestation.js",
         "js_function": "verifySnpAttestation",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -665,93 +547,191 @@
                       "attestation": {
                         "type": "object",
                         "properties": {
-                          "version": { "type": "number" },
-                          "guest_svn": { "type": "number" },
+                          "version": {
+                            "type": "number"
+                          },
+                          "guest_svn": {
+                            "type": "number"
+                          },
                           "policy": {
                             "type": "object",
                             "properties": {
-                              "abi_minor": { "type": "number" },
-                              "abi_major": { "type": "number" },
-                              "smt": { "type": "number" },
-                              "migrate_ma": { "type": "number" },
-                              "debug": { "type": "number" },
-                              "single_socket": { "type": "number" }
+                              "abi_minor": {
+                                "type": "number"
+                              },
+                              "abi_major": {
+                                "type": "number"
+                              },
+                              "smt": {
+                                "type": "number"
+                              },
+                              "migrate_ma": {
+                                "type": "number"
+                              },
+                              "debug": {
+                                "type": "number"
+                              },
+                              "single_socket": {
+                                "type": "number"
+                              }
                             }
                           },
-                          "family_id": { "type": "string" },
-                          "image_id": { "type": "string" },
-                          "vmpl": { "type": "number" },
-                          "signature_algo": { "type": "number" },
+                          "family_id": {
+                            "type": "string"
+                          },
+                          "image_id": {
+                            "type": "string"
+                          },
+                          "vmpl": {
+                            "type": "number"
+                          },
+                          "signature_algo": {
+                            "type": "number"
+                          },
                           "platform_version": {
                             "type": "object",
                             "properties": {
-                              "boot_loader": { "type": "number" },
-                              "tee": { "type": "number" },
-                              "snp": { "type": "number" },
-                              "microcode": { "type": "number" }
+                              "boot_loader": {
+                                "type": "number"
+                              },
+                              "tee": {
+                                "type": "number"
+                              },
+                              "snp": {
+                                "type": "number"
+                              },
+                              "microcode": {
+                                "type": "number"
+                              }
                             }
                           },
                           "platform_info": {
                             "type": "object",
                             "properties": {
-                              "smt_en": { "type": "number" },
-                              "tsme_en": { "type": "number" }
+                              "smt_en": {
+                                "type": "number"
+                              },
+                              "tsme_en": {
+                                "type": "number"
+                              }
                             }
                           },
                           "flags": {
                             "type": "object",
                             "properties": {
-                              "author_key_en": { "type": "number" },
-                              "mask_chip_key": { "type": "number" },
-                              "signing_key": { "type": "number" }
+                              "author_key_en": {
+                                "type": "number"
+                              },
+                              "mask_chip_key": {
+                                "type": "number"
+                              },
+                              "signing_key": {
+                                "type": "number"
+                              }
                             }
                           },
-                          "report_data": { "type": "string" },
-                          "measurement": { "type": "string" },
-                          "host_data": { "type": "string" },
-                          "id_key_digest": { "type": "string" },
-                          "author_key_digest": { "type": "string" },
-                          "report_id": { "type": "string" },
-                          "report_id_ma": { "type": "string" },
+                          "report_data": {
+                            "type": "string"
+                          },
+                          "measurement": {
+                            "type": "string"
+                          },
+                          "host_data": {
+                            "type": "string"
+                          },
+                          "id_key_digest": {
+                            "type": "string"
+                          },
+                          "author_key_digest": {
+                            "type": "string"
+                          },
+                          "report_id": {
+                            "type": "string"
+                          },
+                          "report_id_ma": {
+                            "type": "string"
+                          },
                           "reported_tcb": {
                             "type": "object",
                             "properties": {
-                              "boot_loader": { "type": "number" },
-                              "tee": { "type": "number" },
-                              "snp": { "type": "number" },
-                              "microcode": { "type": "number" }
+                              "boot_loader": {
+                                "type": "number"
+                              },
+                              "tee": {
+                                "type": "number"
+                              },
+                              "snp": {
+                                "type": "number"
+                              },
+                              "microcode": {
+                                "type": "number"
+                              }
                             }
                           },
-                          "chip_id": { "type": "string" },
+                          "chip_id": {
+                            "type": "string"
+                          },
                           "committed_tcb": {
                             "type": "object",
                             "properties": {
-                              "boot_loader": { "type": "number" },
-                              "tee": { "type": "number" },
-                              "snp": { "type": "number" },
-                              "microcode": { "type": "number" }
+                              "boot_loader": {
+                                "type": "number"
+                              },
+                              "tee": {
+                                "type": "number"
+                              },
+                              "snp": {
+                                "type": "number"
+                              },
+                              "microcode": {
+                                "type": "number"
+                              }
                             }
                           },
-                          "current_minor": { "type": "number" },
-                          "current_build": { "type": "number" },
-                          "current_major": { "type": "number" },
-                          "committed_build": { "type": "number" },
-                          "committed_minor": { "type": "number" },
-                          "committed_major": { "type": "number" },
+                          "current_minor": {
+                            "type": "number"
+                          },
+                          "current_build": {
+                            "type": "number"
+                          },
+                          "current_major": {
+                            "type": "number"
+                          },
+                          "committed_build": {
+                            "type": "number"
+                          },
+                          "committed_minor": {
+                            "type": "number"
+                          },
+                          "committed_major": {
+                            "type": "number"
+                          },
                           "launch_tcb": {
                             "type": "object",
                             "properties": {
-                              "boot_loader": { "type": "number" },
-                              "tee": { "type": "number" },
-                              "snp": { "type": "number" },
-                              "microcode": { "type": "number" }
+                              "boot_loader": {
+                                "type": "number"
+                              },
+                              "tee": {
+                                "type": "number"
+                              },
+                              "snp": {
+                                "type": "number"
+                              },
+                              "microcode": {
+                                "type": "number"
+                              }
                             }
                           },
                           "signature": {
                             "type": "object",
                             "properties": {
-                              "r": { "type": "string" },
-                              "s": { "type": "string" }
+                              "r": {
+                                "type": "string"
+                              },
+                              "s": {
+                                "type": "string"
+                              }
                             }
                           }
                         }
@@ -759,9 +739,15 @@
                       "uvm_endorsements": {
                         "type": "object",
                         "properties": {
-                          "did": { "type": "string" },
-                          "feed": { "type": "string" },
-                          "svn": { "type": "string" }
+                          "did": {
+                            "type": "string"
+                          },
+                          "feed": {
+                            "type": "string"
+                          },
+                          "svn": {
+                            "type": "string"
+                          }
                         }
                       }
                     }
@@ -777,7 +763,7 @@
       "get": {
         "js_module": "endpoints/log.js",
         "js_function": "getLogItem",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -806,7 +792,7 @@
       "post": {
         "js_module": "endpoints/log.js",
         "js_function": "setLogItem",
-        "forwarding_required": "always",
+        "redirection_strategy": "to_primary",
         "authn_policies": ["user_cert"],
         "mode": "readwrite",
         "openapi": {
@@ -842,7 +828,7 @@
       "get": {
         "js_module": "endpoints/log.js",
         "js_function": "getAllLogItems",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -876,7 +862,7 @@
       "get": {
         "js_module": "endpoints/log.js",
         "js_function": "getLogItemVersion",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -907,7 +893,7 @@
       "post": {
         "js_module": "endpoints/rpc.js",
         "js_function": "postApplyWrites",
-        "forwarding_required": "always",
+        "redirection_strategy": "to_primary",
         "authn_policies": ["user_cert"],
         "mode": "readwrite",
         "openapi": {
@@ -921,7 +907,7 @@
       "get": {
         "js_module": "endpoints/rpc.js",
         "js_function": "getApplyWrites",
-        "forwarding_required": "always",
+        "redirection_strategy": "to_primary",
         "authn_policies": ["user_cert"],
         "mode": "readwrite",
         "openapi": {
@@ -937,7 +923,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "pubPemToJwk",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -978,7 +964,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "pemToJwk",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1019,7 +1005,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "pubRsaPemToJwk",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1060,7 +1046,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "rsaPemToJwk",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1101,7 +1087,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "pubEddsaPemToJwk",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1142,7 +1128,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "eddsaPemToJwk",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1183,7 +1169,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "pubJwkToPem",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1226,7 +1212,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "jwkToPem",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1269,7 +1255,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "rsaJwkToPem",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1312,7 +1298,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "pubRsaJwkToPem",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1355,7 +1341,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "eddsaJwkToPem",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1398,7 +1384,7 @@
       "post": {
         "js_module": "endpoints/crypto.js",
         "js_function": "pubEddsaJwkToPem",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1441,7 +1427,7 @@
       "get": {
         "js_module": "endpoints/rpc.js",
         "js_function": "throwError",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {
@@ -1470,7 +1456,7 @@
       "put": {
         "js_module": "endpoints/auth.js",
         "js_function": "checkUserCOSESign1Auth",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cose_sign1"],
         "mode": "readwrite",
         "openapi": {
@@ -1488,6 +1474,138 @@
               "content": {
                 "application/json": {
                   "schema": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/multi_auth": {
+      "post": {
+        "js_module": "endpoints/auth.js",
+        "js_function": "checkMultiAuth",
+        "redirection_strategy": "none",
+        "authn_policies": [
+          {
+            "all_of": ["user_cert", "jwt", "user_cose_sign1"]
+          },
+          "user_cert",
+          "member_cert",
+          "any_cert",
+          "jwt",
+          "user_cose_sign1",
+          "no_auth"
+        ],
+        "mode": "readwrite",
+        "openapi": {
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/cose": {
+                "schema": {}
+              },
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "",
+              "content": {
+                "application/json": {
+                  "schema": {}
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/converters/set": {
+      "post": {
+        "js_module": "endpoints/converters.js",
+        "js_function": "testConvertersSet",
+        "redirection_strategy": "none",
+        "authn_policies": [],
+        "mode": "readwrite",
+        "openapi": {
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Success",
+              "content": {
+                "application/json": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/converters/get": {
+      "get": {
+        "js_module": "endpoints/converters.js",
+        "js_function": "testConvertersGet",
+        "redirection_strategy": "none",
+        "authn_policies": [],
+        "mode": "readonly",
+        "openapi": {
+          "requestBody": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Success",
+              "content": {
+                "application/json": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/spin": {
+      "post": {
+        "js_module": "endpoints/spin.js",
+        "js_function": "spin",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {
+          "requestBody": {
+            "required": true,
+            "content": {
+              "application/json": {
+                "schema": {
+                  "properties": {
+                    "iterations": {
+                      "type": "number"
+                    }
+                  },
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "responses": {
+            "200": {
+              "description": "Ok",
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "type": "boolean"
+                  }
                 }
               }
             }

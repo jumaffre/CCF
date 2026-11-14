@@ -4,13 +4,9 @@
 
 #############################################################################
 
-src:*/3rdparty/internal/sss/hazmat.c
 src:*/3rdparty/exported/quickjs/quickjs.c
 src:*/3rdparty/exported/quickjs/quickjs.h
 src:*/3rdparty/exported/quickjs/cutils.c
 src:*/3rdparty/exported/quickjs/cutils.h
-
-# https://github.com/laurencelundblade/QCBOR/issues/164
-fun:UsefulOutBuf_InsertUsefulBuf
 
 #############################################################################

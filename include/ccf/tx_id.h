@@ -18,7 +18,7 @@ namespace ccf
   /** Transactions occur within a fixed View. Each View generally spans a range
    * of transactions, though empty Views are also possible. The View is advanced
    * by the consensus protocol during election of a new leader, and a single
-   * leader is assigned in each View.  *View* and *Term* are synonymous.
+   * leader is assigned in each View.
    */
   using View = uint64_t;
 
@@ -42,17 +42,17 @@ namespace ccf
   // transaction executed by CCF.
   struct TxID
   {
-    View view;
-    SeqNo seqno;
+    View view = VIEW_UNKNOWN;
+    SeqNo seqno = SEQNO_UNKNOWN;
 
-    std::string to_str() const
+    [[nodiscard]] std::string to_str() const
     {
       return std::to_string(view) + "." + std::to_string(seqno);
     }
 
     static std::optional<TxID> from_str(const std::string_view& sv)
     {
-      const auto separator_idx = sv.find(".");
+      const auto separator_idx = sv.find('.');
       if (separator_idx == std::string_view::npos)
       {
         return std::nullopt;
@@ -64,7 +64,8 @@ namespace ccf
         const auto view_sv = sv.substr(0, separator_idx);
         const auto [p, ec] =
           std::from_chars(view_sv.begin(), view_sv.end(), tx_id.view);
-        if (ec != std::errc() || p != view_sv.end())
+        if (
+          ec != std::errc() || p != view_sv.end() || tx_id.view == VIEW_UNKNOWN)
         {
           return std::nullopt;
         }
@@ -74,7 +75,9 @@ namespace ccf
         const auto seqno_sv = sv.substr(separator_idx + 1);
         const auto [p, ec] =
           std::from_chars(seqno_sv.begin(), seqno_sv.end(), tx_id.seqno);
-        if (ec != std::errc() || p != seqno_sv.end())
+        if (
+          ec != std::errc() || p != seqno_sv.end() ||
+          tx_id.seqno == SEQNO_UNKNOWN)
         {
           return std::nullopt;
         }
@@ -100,25 +103,27 @@ namespace ccf
   {
     if (!j.is_string())
     {
-      throw JsonParseError(
+      throw ccf::JsonParseError(
         fmt::format("Cannot parse TxID: Expected string, got {}", j.dump()));
     }
 
     const auto opt = TxID::from_str(j.get<std::string>());
     if (!opt.has_value())
     {
-      throw JsonParseError(fmt::format("Cannot parse TxID: {}", j.dump()));
+      throw ccf::JsonParseError(fmt::format("Cannot parse TxID: {}", j.dump()));
     }
 
     tx_id = opt.value();
   }
 
-  inline std::string schema_name(const TxID*)
+  inline std::string schema_name(
+    [[maybe_unused]] const TxID* transaction_id_type)
   {
     return "TransactionId";
   }
 
-  inline void fill_json_schema(nlohmann::json& schema, const TxID*)
+  inline void fill_json_schema(
+    nlohmann::json& schema, [[maybe_unused]] const TxID* transaction_id_type)
   {
     schema["type"] = "string";
     schema["pattern"] = "^[0-9]+\\.[0-9]+$";

@@ -6,11 +6,11 @@
 #include "ccf/crypto/hkdf.h"
 #include "ccf/crypto/sha256.h"
 
-namespace crypto
+namespace ccf::crypto
 {
   void default_sha256(const std::span<const uint8_t>& data, uint8_t* h)
   {
-    return openssl_sha256(data, h);
+    openssl_sha256(data, h);
   }
 
   std::vector<uint8_t> sha256(const std::vector<uint8_t>& data)

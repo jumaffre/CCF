@@ -4,10 +4,8 @@
 #include "test_common.h"
 
 #define DOCTEST_CONFIG_NO_SHORT_MACRO_NAMES
+#include <algorithm>
 #include <doctest/doctest.h>
-
-using AllSigsStore = aft::LoggingStubStoreSig;
-using AllSigsAdaptor = aft::Adaptor<AllSigsStore>;
 
 void keep_messages_for_multiple(
   const std::set<ccf::NodeId>& targets,
@@ -19,7 +17,7 @@ void keep_messages_for_multiple(
   while (it != messages.end())
   {
     if (
-      std::find(targets.begin(), targets.end(), it->first) == targets.end() ||
+      !std::ranges::contains(targets, it->first) ||
       (max_to_keep.has_value() && kept[it->first] >= *max_to_keep))
     {
       it = messages.erase(it);
@@ -60,8 +58,8 @@ void keep_earliest_append_entries_for_each_target(
 
     const uint8_t* data = contents.data();
     auto size = contents.size();
-    auto msg_type = serialized::peek<aft::RaftMsgType>(data, size);
-    if (msg_type == aft::raft_append_entries)
+    auto msg_type = serialized::peek<aft::CftMsgType>(data, size);
+    if (msg_type == aft::append_entries)
     {
       const auto ae = *(aft::AppendEntries*)data;
 
@@ -85,10 +83,10 @@ void keep_earliest_append_entries_for_each_target(
 
 #define TEST_DECLARE_NODE(N) \
   ccf::NodeId node_id##N(#N); \
-  auto store##N = std::make_shared<AllSigsStore>(node_id##N); \
-  TRaft r##N( \
-    raft_settings, \
-    std::make_unique<AllSigsAdaptor>(store##N), \
+  auto store##N = std::make_shared<Store>(node_id##N); \
+  TCft r##N( \
+    cft_settings, \
+    std::make_unique<Adaptor>(store##N), \
     std::make_unique<aft::LedgerStubProxy>(node_id##N), \
     std::make_shared<aft::ChannelStubProxy>(), \
     std::make_shared<aft::State>(node_id##N), \
@@ -159,7 +157,7 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
   // Single configuration has all nodes, fully connected
   aft::Configuration::Nodes initial_config;
 
-  std::map<ccf::NodeId, TRaft*> nodes;
+  std::map<ccf::NodeId, TCft*> nodes;
 
   // Network contains 5 nodes
   TEST_DECLARE_NODE(A);
@@ -179,6 +177,15 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
   DOCTEST_INFO("Node A is the initial primary");
   {
     rA.periodic(election_timeout);
+
+    // Dispatch RequestPreVotes
+    DOCTEST_REQUIRE(4 == dispatch_all(nodes, node_idA, channelsA->messages));
+
+    // Dispatch responses
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idB, channelsB->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idC, channelsC->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idD, channelsD->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idE, channelsE->messages));
 
     // Dispatch RequestVotes
     DOCTEST_REQUIRE(4 == dispatch_all(nodes, node_idA, channelsA->messages));
@@ -208,7 +215,7 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
   DOCTEST_INFO("Entry at 1.1 is received by all nodes");
   {
     auto entry = make_ledger_entry(1, 1);
-    rA.replicate(kv::BatchVector{{1, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{1, entry, true, hooks}}, 1);
     DOCTEST_REQUIRE(rA.get_last_idx() == 1);
     DOCTEST_REQUIRE(rA.get_committed_seqno() == 0);
     // Size limit was reached, so periodic is not needed
@@ -238,21 +245,21 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
     "committed");
   {
     auto entry = make_ledger_entry(1, 2);
-    rA.replicate(kv::BatchVector{{2, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{2, entry, true, hooks}}, 1);
     DOCTEST_REQUIRE(rA.get_last_idx() == 2);
     DOCTEST_REQUIRE(rA.get_committed_seqno() == 1);
     // Size limit was reached, so periodic is not needed
     // rA.periodic(request_timeout);
 
     entry = make_ledger_entry(1, 3);
-    rA.replicate(kv::BatchVector{{3, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{3, entry, true, hooks}}, 1);
     DOCTEST_REQUIRE(rA.get_last_idx() == 3);
     DOCTEST_REQUIRE(rA.get_committed_seqno() == 1);
     // Size limit was reached, so periodic is not needed
     // rA.periodic(request_timeout);
 
     entry = make_ledger_entry(1, 4);
-    rA.replicate(kv::BatchVector{{4, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{4, entry, true, hooks}}, 1);
     DOCTEST_REQUIRE(rA.get_last_idx() == 4);
     DOCTEST_REQUIRE(rA.get_committed_seqno() == 1);
     // Size limit was reached, so periodic is not needed
@@ -286,7 +293,7 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
     "committed");
   {
     auto entry = make_ledger_entry(1, 5);
-    rA.replicate(kv::BatchVector{{5, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{5, entry, true, hooks}}, 1);
     DOCTEST_REQUIRE(rA.get_last_idx() == 5);
     // Size limit was reached, so periodic is not needed
     // rB.periodic(request_timeout);
@@ -338,6 +345,14 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
   {
     rB.periodic(election_timeout);
 
+    // Dispatch RequestPreVotes
+    DOCTEST_REQUIRE(4 == dispatch_all(nodes, node_idB, channelsB->messages));
+
+    // Dispatch responses
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idC, channelsC->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idD, channelsD->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idE, channelsE->messages));
+
     // Dispatch RequestVotes
     DOCTEST_REQUIRE(4 == dispatch_all(nodes, node_idB, channelsB->messages));
 
@@ -353,11 +368,11 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
   DOCTEST_INFO("Node B writes some entries, though they are lost");
   {
     auto entry = make_ledger_entry(2, 6);
-    rB.replicate(kv::BatchVector{{6, entry, true, hooks}}, 2);
+    rB.replicate(ccf::kv::BatchVector{{6, entry, true, hooks}}, 2);
     DOCTEST_REQUIRE(rB.get_last_idx() == 6);
 
     entry = make_ledger_entry(2, 7);
-    rB.replicate(kv::BatchVector{{7, entry, true, hooks}}, 2);
+    rB.replicate(ccf::kv::BatchVector{{7, entry, true, hooks}}, 2);
     DOCTEST_REQUIRE(rB.get_last_idx() == 7);
 
     // Size limit was reached, so periodic is not needed
@@ -376,6 +391,14 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
   DOCTEST_INFO("Node C wins an election");
   {
     rC.periodic(election_timeout);
+
+    // Dispatch RequestPreVotes
+    DOCTEST_REQUIRE(4 == dispatch_all(nodes, node_idC, channelsC->messages));
+
+    // Dispatch responses
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idB, channelsB->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idD, channelsD->messages));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idE, channelsE->messages));
 
     // Dispatch RequestVotes
     DOCTEST_REQUIRE(4 == dispatch_all(nodes, node_idC, channelsC->messages));
@@ -404,15 +427,15 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
   DOCTEST_REQUIRE("Node C produces 3.5, 3.6, and 3.7");
   {
     auto entry = make_ledger_entry(3, 5);
-    rC.replicate(kv::BatchVector{{5, entry, true, hooks}}, 3);
+    rC.replicate(ccf::kv::BatchVector{{5, entry, true, hooks}}, 3);
     DOCTEST_REQUIRE(rC.get_last_idx() == 5);
 
     entry = make_ledger_entry(3, 6);
-    rC.replicate(kv::BatchVector{{6, entry, true, hooks}}, 3);
+    rC.replicate(ccf::kv::BatchVector{{6, entry, true, hooks}}, 3);
     DOCTEST_REQUIRE(rC.get_last_idx() == 6);
 
     entry = make_ledger_entry(3, 7);
-    rC.replicate(kv::BatchVector{{7, entry, true, hooks}}, 3);
+    rC.replicate(ccf::kv::BatchVector{{7, entry, true, hooks}}, 3);
     DOCTEST_REQUIRE(rC.get_last_idx() == 7);
 
     // The early AppendEntries that describe this are lost
@@ -469,6 +492,7 @@ DOCTEST_TEST_CASE("Retention of dead leader's commit")
 
 struct WorstCase
 {};
+
 struct RandomCase
 {};
 
@@ -489,7 +513,7 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
   // Single configuration has all nodes, fully connected
   aft::Configuration::Nodes initial_config;
 
-  std::map<ccf::NodeId, TRaft*> nodes;
+  std::map<ccf::NodeId, TCft*> nodes;
 
   // Network contains 3 nodes
   TEST_DECLARE_NODE(A);
@@ -511,6 +535,10 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
     rA.periodic(election_timeout);
 
     // Initial election
+    DOCTEST_REQUIRE(2 == dispatch_all(nodes, node_idA));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idB));
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idC));
+
     DOCTEST_REQUIRE(2 == dispatch_all(nodes, node_idA));
     DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idB));
     DOCTEST_REQUIRE(1 == dispatch_all(nodes, node_idC));
@@ -581,6 +609,18 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
 
     primary.periodic(election_timeout);
 
+    // RequestPreVote is only sent to Node C
+    keep_messages_for(node_idC, channels_primary->messages);
+    DOCTEST_REQUIRE(1 == dispatch_all(nodes, primary_id));
+
+    // Node C pre-votes in favour
+    DOCTEST_REQUIRE(
+      1 ==
+      dispatch_all_and_DOCTEST_CHECK<aft::RequestPreVoteResponse>(
+        nodes, node_idC, [](const aft::RequestPreVoteResponse& rvr) {
+          DOCTEST_REQUIRE(rvr.vote_granted == true);
+        }));
+
     // RequestVote is only sent to Node C
     keep_messages_for(node_idC, channels_primary->messages);
     DOCTEST_REQUIRE(1 == dispatch_all(nodes, primary_id));
@@ -601,14 +641,14 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
     {
       auto entry = make_ledger_entry(primary.get_view(), idx);
       primary.replicate(
-        kv::BatchVector{{idx, entry, true, hooks}}, primary.get_view());
+        ccf::kv::BatchVector{{idx, entry, true, hooks}}, primary.get_view());
     }
 
     // All related AppendEntries are lost
     channels_primary->messages.clear();
   };
 
-  const auto num_terms = rand() % 30 + 5;
+  const size_t num_terms = rand() % 30 + 5;
   if constexpr (is_worst_case)
   {
     std::cout << fmt::format("Worst case construction with {} terms", num_terms)
@@ -630,9 +670,9 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
     // be committed
 
     auto entry = make_ledger_entry(1, 1);
-    rA.replicate(kv::BatchVector{{1, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{1, entry, true, hooks}}, 1);
     entry = make_ledger_entry(1, 2);
-    rA.replicate(kv::BatchVector{{2, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{2, entry, true, hooks}}, 1);
     DOCTEST_REQUIRE(rA.get_last_idx() == 2);
     DOCTEST_REQUIRE(rA.get_committed_seqno() == 0);
     // Size limit was reached, so periodic is not needed
@@ -665,18 +705,18 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
     // Node A produces 2 additional entries that A and B have, and 2 additional
     // entries that are only present on A
     entry = make_ledger_entry(1, 3);
-    rA.replicate(kv::BatchVector{{3, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{3, entry, true, hooks}}, 1);
 
     entry = make_ledger_entry(1, 4);
-    rA.replicate(kv::BatchVector{{4, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{4, entry, true, hooks}}, 1);
     keep_messages_for(node_idB, channelsA->messages);
     DOCTEST_REQUIRE(2 == dispatch_all(nodes, node_idA));
 
     entry = make_ledger_entry(1, 5);
-    rA.replicate(kv::BatchVector{{5, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{5, entry, true, hooks}}, 1);
 
     entry = make_ledger_entry(1, 6);
-    rA.replicate(kv::BatchVector{{6, entry, true, hooks}}, 1);
+    rA.replicate(ccf::kv::BatchVector{{6, entry, true, hooks}}, 1);
     channelsA->messages.clear();
     channelsB->messages.clear();
 
@@ -734,8 +774,11 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
       const auto history_on_B = rB.get_view_history(common_last_idx);
       DOCTEST_REQUIRE(history_on_A != history_on_B);
 
-      // In fact they diverge almost immediately
-      DOCTEST_REQUIRE(history_on_A[1] != history_on_B[1]);
+      // In fact they diverge almost immediately (if they are long enough)
+      if (history_on_A.size() > 1 && history_on_B.size() > 1)
+      {
+        DOCTEST_REQUIRE(history_on_A[1] != history_on_B[1]);
+      }
     }
   }
 
@@ -755,6 +798,10 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
       {
         channelsA->messages.clear();
         rA.periodic(election_timeout);
+
+        // Attempt pre-vote
+        dispatch_all(nodes, node_idA);
+        dispatch_all(nodes, node_idC);
       }
     }
     else
@@ -765,6 +812,10 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
       {
         channelsB->messages.clear();
         rB.periodic(election_timeout);
+
+        // Attempt pre-vote
+        dispatch_all(nodes, node_idB);
+        dispatch_all(nodes, node_idC);
       }
     }
 
@@ -772,8 +823,14 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
     const auto id_primary = aim_for_a_primary ? node_idA : node_idB;
     auto& channelsPrimary = aim_for_a_primary ? channelsA : channelsB;
 
+    // PreVote
     dispatch_all(nodes, id_primary);
     dispatch_all(nodes, node_idC);
+    // Election
+    dispatch_all(nodes, id_primary);
+    dispatch_all(nodes, node_idC);
+
+    DOCTEST_REQUIRE(rPrimary.is_primary());
 
     {
       DOCTEST_INFO("Catch node C up");
@@ -936,7 +993,7 @@ DOCTEST_TEST_CASE_TEMPLATE("Multi-term divergence", T, WorstCase, RandomCase)
         const auto seqno = rPrimary.get_last_idx() + 1;
         auto final_entry = make_ledger_entry(view, seqno);
         rPrimary.replicate(
-          kv::BatchVector{{seqno, final_entry, true, hooks}}, view);
+          ccf::kv::BatchVector{{seqno, final_entry, true, hooks}}, view);
 
         rPrimary.periodic(request_timeout);
         keep_earliest_append_entries_for_each_target(channelsPrimary->messages);

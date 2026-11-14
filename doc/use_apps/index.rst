@@ -3,39 +3,24 @@ Use Apps
 
 This section describes how :term:`Users` can issue transactions to CCF applications.
 
-.. panels::
+.. grid:: 1 2 2 2
+    :gutter: 3
 
-    :fa:`terminal` :doc:`issue_commands`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    .. grid-item-card:: :fas:`terminal` :doc:`issue_commands`
 
-    Issuing commands against a CCF network hosting an application.
+        Issue commands against a CCF network hosting an application.
 
-    ---
+    .. grid-item-card:: :fas:`check` :doc:`verify_tx`
 
-    :fa:`check` :doc:`verify_tx`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        Check the status of commands issued against a CCF network.
 
-    Checking the status of commands issued against a CCF network.
+    .. grid-item-card:: :fas:`terminal` :doc:`rpc_api`
 
-    ---
-
-    :fa:`search` :doc:`verify_quote`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-    Checking the quote of a CCF node to confirm it is part of a valid network and running in Enclave.
-
-    ---
-
-    :fa:`terminal` :doc:`rpc_api`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-    OpenAPI schema for user-facing API exposed by sample app, including common default endpoints.
-
+        Consult the sample application's user-facing API, including common default endpoints.
 
 .. toctree::
     :hidden:
 
     issue_commands
     verify_tx
-    verify_quote
     rpc_api

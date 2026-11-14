@@ -33,7 +33,7 @@ export const generateRsaKeyPair = ccf.crypto.generateRsaKeyPair;
 export const generateEcdsaKeyPair = ccf.crypto.generateEcdsaKeyPair;
 
 /**
- * @inheritDoc global!CCFCrypto.generateEcdsaKeyPair
+ * @inheritDoc global!CCFCrypto.generateEddsaKeyPair
  */
 export const generateEddsaKeyPair = ccf.crypto.generateEddsaKeyPair;
 
@@ -41,6 +41,11 @@ export const generateEddsaKeyPair = ccf.crypto.generateEddsaKeyPair;
  * @inheritDoc global!CCFCrypto.wrapKey
  */
 export const wrapKey = ccf.crypto.wrapKey;
+
+/**
+ * @inheritDoc global!CCFCrypto.unwrapKey
+ */
+export const unwrapKey = ccf.crypto.unwrapKey;
 
 /**
  * @inheritDoc global!CCFCrypto.sign
@@ -66,6 +71,11 @@ export const isValidX509CertBundle = ccf.crypto.isValidX509CertBundle;
  * @inheritDoc global!CCFCrypto.isValidX509CertChain
  */
 export const isValidX509CertChain = ccf.crypto.isValidX509CertChain;
+
+/**
+ * @inheritDoc global!CCFCrypto.isValidX509RootCACert
+ */
+export const isValidX509RootCACert = ccf.crypto.isValidX509RootCACert;
 
 /**
  * @inheritDoc global!CCFCrypto.pubPemToJwk
@@ -103,7 +113,7 @@ export const eddsaPemToJwk = ccf.crypto.eddsaPemToJwk;
 export const pubJwkToPem = ccf.crypto.pubJwkToPem;
 
 /**
- * @inheritDoc global!CCFCrypto.JwkToPem
+ * @inheritDoc global!CCFCrypto.jwkToPem
  */
 export const jwkToPem = ccf.crypto.jwkToPem;
 
@@ -127,7 +137,7 @@ export const pubEddsaJwkToPem = ccf.crypto.pubEddsaJwkToPem;
  */
 export const eddsaJwkToPem = ccf.crypto.eddsaJwkToPem;
 
-export {
+export type {
   WrapAlgoParams,
   AesKwpParams,
   RsaOaepParams,

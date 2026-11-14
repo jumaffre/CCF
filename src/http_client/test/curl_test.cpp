@@ -1,0 +1,1029 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+
+#include "ccf/ds/json.h"
+#include "curl/curl.h"
+#include "ds/internal_logger.h"
+#include "http_client/curl.h"
+#include "snapshots/fetch.h"
+
+#include <cstdlib>
+#include <curl/header.h>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <llhttp/llhttp.h>
+#include <memory>
+#include <nlohmann/json.hpp>
+#include <openssl/x509_vfy.h>
+#include <optional>
+#include <random>
+#include <span>
+#include <uv.h>
+
+#define DOCTEST_CONFIG_IMPLEMENT
+#include <doctest/doctest.h>
+
+static std::string server_address = "127.0.0.1:8080";
+
+struct Data
+{
+  std::string foo;
+  std::string bar;
+  uint8_t iter = 0;
+};
+
+DECLARE_JSON_TYPE(Data);
+DECLARE_JSON_REQUIRED_FIELDS(Data, foo, bar, iter);
+
+TEST_CASE("is_transient_transport_error classifies curl errors")
+{
+  // Transport/protocol-layer failures that a retry loop (e.g. the node join
+  // client) should retry rather than treat as fatal.
+  const std::vector<CURLcode> transient = {
+    CURLE_COULDNT_RESOLVE_PROXY,
+    CURLE_COULDNT_RESOLVE_HOST,
+    CURLE_COULDNT_CONNECT,
+    CURLE_OPERATION_TIMEDOUT,
+    CURLE_GOT_NOTHING,
+    CURLE_RECV_ERROR,
+    CURLE_SEND_ERROR,
+    CURLE_PARTIAL_FILE,
+    CURLE_WEIRD_SERVER_REPLY,
+    CURLE_HTTP2,
+    CURLE_HTTP2_STREAM,
+  };
+  for (const auto code : transient)
+  {
+    INFO("code = " << static_cast<int>(code));
+    CHECK(ccf::http_client::is_transient_transport_error(code));
+  }
+
+  // Errors that must be treated as fatal (never retried): explicit certificate
+  // or local TLS configuration failures, application-level errors, and our own
+  // response size-cap rejection (CURLE_WRITE_ERROR). CURLE_OK and
+  // CURLE_ABORTED_BY_CALLBACK are not transport errors either.
+  const std::vector<CURLcode> fatal = {
+    CURLE_OK,
+    CURLE_PEER_FAILED_VERIFICATION,
+    CURLE_SSL_CACERT_BADFILE,
+    CURLE_SSL_CONNECT_ERROR,
+    CURLE_SSL_CERTPROBLEM,
+    CURLE_USE_SSL_FAILED,
+    CURLE_WRITE_ERROR,
+    CURLE_TOO_MANY_REDIRECTS,
+    CURLE_UNSUPPORTED_PROTOCOL,
+    CURLE_ABORTED_BY_CALLBACK,
+  };
+  for (const auto code : fatal)
+  {
+    INFO("code = " << static_cast<int>(code));
+    CHECK_FALSE(ccf::http_client::is_transient_transport_error(code));
+  }
+}
+
+TEST_CASE("is_retryable_join_error narrows generic TLS handshake failures")
+{
+  CHECK_FALSE(
+    ccf::http_client::is_retryable_join_error(CURLE_SSL_CONNECT_ERROR, false));
+  CHECK(
+    ccf::http_client::is_retryable_join_error(CURLE_SSL_CONNECT_ERROR, true));
+
+  CHECK(
+    ccf::http_client::is_retryable_join_error(CURLE_COULDNT_CONNECT, false));
+  CHECK_FALSE(ccf::http_client::is_retryable_join_error(
+    CURLE_PEER_FAILED_VERIFICATION, true));
+  CHECK_FALSE(
+    ccf::http_client::is_retryable_join_error(CURLE_SSL_CACERT_BADFILE, true));
+  CHECK_FALSE(
+    ccf::http_client::is_retryable_join_error(CURLE_SSL_CERTPROBLEM, true));
+}
+
+TEST_CASE("RequestBody supports replay")
+{
+  const std::vector<uint8_t> expected = {1, 2, 3, 4};
+  const auto data = expected;
+  ccf::http_client::RequestBody body(data);
+
+  std::vector<char> partial(2);
+  REQUIRE(
+    ccf::http_client::RequestBody::send_data(
+      partial.data(), 1, partial.size(), &body) == partial.size());
+  REQUIRE(static_cast<uint8_t>(partial[0]) == expected[0]);
+  REQUIRE(static_cast<uint8_t>(partial[1]) == expected[1]);
+
+  REQUIRE(body.seek(-1, SEEK_CUR));
+  char current = 0;
+  REQUIRE(ccf::http_client::RequestBody::send_data(&current, 1, 1, &body) == 1);
+  REQUIRE(static_cast<uint8_t>(current) == expected[1]);
+
+  REQUIRE(body.seek(-1, SEEK_END));
+  char last = 0;
+  REQUIRE(ccf::http_client::RequestBody::send_data(&last, 1, 1, &body) == 1);
+  REQUIRE(static_cast<uint8_t>(last) == expected.back());
+
+  REQUIRE(body.seek(0, SEEK_SET));
+
+  std::vector<char> replayed(expected.size());
+  REQUIRE(
+    ccf::http_client::RequestBody::send_data(
+      replayed.data(), 1, replayed.size(), &body) == replayed.size());
+  REQUIRE(std::equal(
+    replayed.begin(), replayed.end(), expected.begin(), [](char lhs, auto rhs) {
+      return static_cast<uint8_t>(lhs) == rhs;
+    }));
+
+  REQUIRE(body.seek(2, SEEK_SET));
+  REQUIRE_FALSE(body.seek(std::numeric_limits<curl_off_t>::max(), SEEK_CUR));
+  char after_failed_seek = 0;
+  REQUIRE(
+    ccf::http_client::RequestBody::send_data(&after_failed_seek, 1, 1, &body) ==
+    1);
+  REQUIRE(static_cast<uint8_t>(after_failed_seek) == expected[2]);
+
+  REQUIRE_FALSE(body.seek(-1, SEEK_SET));
+  REQUIRE_FALSE(body.seek(expected.size() + 1, SEEK_SET));
+  REQUIRE(body.seek(0, SEEK_END));
+  REQUIRE_FALSE(body.seek(1, SEEK_CUR));
+  REQUIRE_FALSE(
+    body.seek(-static_cast<curl_off_t>(expected.size()) - 1, SEEK_END));
+
+  REQUIRE(
+    ccf::http_client::RequestBody::seek_data(&body, 0, SEEK_SET) ==
+    CURL_SEEKFUNC_OK);
+  REQUIRE(
+    ccf::http_client::RequestBody::seek_data(
+      &body, expected.size() + 1, SEEK_SET) == CURL_SEEKFUNC_CANTSEEK);
+  REQUIRE(
+    ccf::http_client::RequestBody::seek_data(nullptr, 0, SEEK_SET) ==
+    CURL_SEEKFUNC_FAIL);
+}
+
+TEST_CASE("RequestBody supports empty bodies")
+{
+  ccf::http_client::RequestBody body(std::vector<uint8_t>{});
+
+  REQUIRE(body.size() == 0);
+  REQUIRE(body.seek(0, SEEK_SET));
+  REQUIRE(body.seek(0, SEEK_CUR));
+  REQUIRE(body.seek(0, SEEK_END));
+
+  char unused = 0;
+  REQUIRE(ccf::http_client::RequestBody::send_data(&unused, 1, 1, &body) == 0);
+}
+
+TEST_CASE("ResponseHeaders rejects oversized headers")
+{
+  ccf::http_client::ResponseHeaders headers;
+  std::string status = "HTTP/1.1 200 OK\r\n";
+  REQUIRE(
+    ccf::http_client::ResponseHeaders::recv_header_line(
+      status.data(), 1, status.size(), &headers) == status.size());
+
+  std::string oversized_value(
+    ccf::http::default_max_header_size.count_bytes() + 1, 'x');
+  std::string header = fmt::format("X-Large: {}\r\n", oversized_value);
+  REQUIRE(
+    ccf::http_client::ResponseHeaders::recv_header_line(
+      header.data(), 1, header.size(), &headers) == 0);
+}
+
+TEST_CASE("ResponseHeaders rejects oversized header fields")
+{
+  ccf::http_client::ResponseHeaders headers;
+  std::string status = "HTTP/1.1 200 OK\r\n";
+  REQUIRE(
+    ccf::http_client::ResponseHeaders::recv_header_line(
+      status.data(), 1, status.size(), &headers) == status.size());
+
+  std::string oversized_field(
+    ccf::http::default_max_header_size.count_bytes() + 1, 'x');
+  std::string header = fmt::format("{}: value\r\n", oversized_field);
+  REQUIRE(
+    ccf::http_client::ResponseHeaders::recv_header_line(
+      header.data(), 1, header.size(), &headers) == 0);
+}
+
+TEST_CASE("ResponseHeaders rejects too many headers")
+{
+  ccf::http_client::ResponseHeaders headers;
+  std::string status = "HTTP/1.1 200 OK\r\n";
+  REQUIRE(
+    ccf::http_client::ResponseHeaders::recv_header_line(
+      status.data(), 1, status.size(), &headers) == status.size());
+
+  for (size_t i = 0; i < ccf::http::default_max_headers_count; ++i)
+  {
+    std::string header = fmt::format("X-Test-{}: value\r\n", i);
+    REQUIRE(
+      ccf::http_client::ResponseHeaders::recv_header_line(
+        header.data(), 1, header.size(), &headers) == header.size());
+  }
+
+  std::string header = "X-Too-Many: value\r\n";
+  REQUIRE(
+    ccf::http_client::ResponseHeaders::recv_header_line(
+      header.data(), 1, header.size(), &headers) == 0);
+}
+
+TEST_CASE("CurlmLibuvContext aborts queued requests on close")
+{
+  size_t response_count = 0;
+  CURLcode observed_curl_response = CURLE_OK;
+  long observed_status_code = -1;
+
+  {
+    ccf::http_client::CurlmLibuvContextSingleton singleton(uv_default_loop());
+
+    auto response_callback =
+      [&response_count, &observed_curl_response, &observed_status_code](
+        std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+        CURLcode curl_response,
+        long status_code) {
+        REQUIRE(request != nullptr);
+        response_count++;
+        observed_curl_response = curl_response;
+        observed_status_code = status_code;
+      };
+
+    auto request = std::make_unique<ccf::http_client::CurlRequest>(
+      ccf::http_client::UniqueCURL(),
+      HTTP_GET,
+      "http://127.0.0.1:1/pending",
+      ccf::http_client::UniqueSlist(),
+      nullptr,
+      std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+      std::move(response_callback));
+
+    ccf::http_client::CurlmLibuvContextSingleton::get_instance()
+      ->attach_request(std::move(request));
+  }
+
+  uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+
+  REQUIRE(response_count == 1);
+  REQUIRE(observed_curl_response == CURLE_ABORTED_BY_CALLBACK);
+  REQUIRE(observed_status_code == 0);
+}
+
+TEST_CASE("Synchronous")
+{
+  Data data = {.foo = "alpha", .bar = "beta"};
+  size_t response_count = 0;
+  constexpr size_t sync_number_requests = 10;
+  for (size_t i = 0; i < sync_number_requests; ++i)
+  {
+    data.iter = i;
+    std::string url = fmt::format("http://{}/{}", server_address, i);
+    auto body = std::make_unique<ccf::http_client::RequestBody>(data);
+
+    auto headers = ccf::http_client::UniqueSlist();
+    headers.append("Content-Type", "application/json");
+
+    auto curl_handle = ccf::http_client::UniqueCURL();
+
+    CURLcode curl_code = CURLE_OK;
+    long status_code = 0;
+
+    auto response =
+      [&curl_code, &status_code](
+        std::unique_ptr<ccf::http_client::CurlRequest>&& /*request*/,
+        CURLcode curl_response,
+        long status) {
+        curl_code = curl_response;
+        status_code = status;
+      };
+
+    auto request = std::make_unique<ccf::http_client::CurlRequest>(
+      std::move(curl_handle),
+      HTTP_PUT,
+      std::move(url),
+      std::move(headers),
+      std::move(body),
+      std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+      response);
+
+    ccf::http_client::CurlRequest::synchronous_perform(std::move(request));
+
+    constexpr size_t HTTP_SUCCESS = 200;
+    if (curl_code == CURLE_OK && status_code == HTTP_SUCCESS)
+    {
+      response_count++;
+    }
+  }
+  REQUIRE(response_count == sync_number_requests);
+}
+
+TEST_CASE("Synchronous POST echoes body")
+{
+  // Exercises POST-with-body support in the curl wrapper: the echo server
+  // reflects the request method and body, so we can assert that both were
+  // transmitted correctly.
+  const std::string sent_body = R"({"message":"join","iter":42})";
+  std::vector<uint8_t> body_bytes(sent_body.begin(), sent_body.end());
+  auto body =
+    std::make_unique<ccf::http_client::RequestBody>(std::move(body_bytes));
+
+  auto headers = ccf::http_client::UniqueSlist();
+  headers.append("Content-Type", "application/json");
+
+  auto curl_handle = ccf::http_client::UniqueCURL();
+  std::string url = fmt::format("http://{}/join", server_address);
+
+  CURLcode curl_code = CURLE_FAILED_INIT;
+  long status_code = 0;
+  std::string response_body;
+
+  auto response = [&curl_code, &status_code, &response_body](
+                    std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+                    CURLcode curl_response,
+                    long status) {
+    curl_code = curl_response;
+    status_code = status;
+    auto* rb = request->get_response_body();
+    response_body = std::string(rb->buffer.begin(), rb->buffer.end());
+  };
+
+  auto request = std::make_unique<ccf::http_client::CurlRequest>(
+    std::move(curl_handle),
+    HTTP_POST,
+    std::move(url),
+    std::move(headers),
+    std::move(body),
+    std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+    response);
+
+  ccf::http_client::CurlRequest::synchronous_perform(std::move(request));
+
+  constexpr long HTTP_SUCCESS = 200;
+  REQUIRE(curl_code == CURLE_OK);
+  REQUIRE(status_code == HTTP_SUCCESS);
+
+  const auto parsed = nlohmann::json::parse(response_body);
+  REQUIRE(parsed.at("metadata").at("method") == "POST");
+  REQUIRE(parsed.at("body") == sent_body);
+}
+
+TEST_CASE("Synchronous POST replays body after redirect")
+{
+  const std::string sent_body = R"({"message":"replay"})";
+  std::vector<uint8_t> body_bytes(sent_body.begin(), sent_body.end());
+  auto body =
+    std::make_unique<ccf::http_client::RequestBody>(std::move(body_bytes));
+
+  auto headers = ccf::http_client::UniqueSlist();
+  headers.append("Content-Type", "application/json");
+
+  auto curl_handle = ccf::http_client::UniqueCURL();
+  curl_handle.set_opt(CURLOPT_FOLLOWLOCATION, 1L);
+  std::string url = fmt::format("http://{}/redirect", server_address);
+
+  CURLcode curl_code = CURLE_FAILED_INIT;
+  long status_code = 0;
+  std::string response_body;
+
+  auto response = [&curl_code, &status_code, &response_body](
+                    std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+                    CURLcode curl_response,
+                    long status) {
+    curl_code = curl_response;
+    status_code = status;
+    auto* rb = request->get_response_body();
+    response_body = std::string(rb->buffer.begin(), rb->buffer.end());
+  };
+
+  auto request = std::make_unique<ccf::http_client::CurlRequest>(
+    std::move(curl_handle),
+    HTTP_POST,
+    std::move(url),
+    std::move(headers),
+    std::move(body),
+    std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+    response);
+
+  ccf::http_client::CurlRequest::synchronous_perform(std::move(request));
+
+  constexpr long HTTP_SUCCESS = 200;
+  REQUIRE(curl_code == CURLE_OK);
+  REQUIRE(status_code == HTTP_SUCCESS);
+
+  const auto parsed = nlohmann::json::parse(response_body);
+  REQUIRE(parsed.at("metadata").at("method") == "POST");
+  REQUIRE(parsed.at("metadata").at("path") == "/redirected");
+  REQUIRE(parsed.at("body") == sent_body);
+}
+
+TEST_CASE("VERIFYHOST rejects a certificate SAN mismatch")
+{
+  // Guards the TLS hostname-verification hardening the node join client relies
+  // on: with the same pinned CA and the same connection,
+  // CURLOPT_SSL_VERIFYHOST == 2 must reject a certificate whose SAN does not
+  // cover the dialed host, and accept one that does. Requires the HTTPS test
+  // server started by e2e_curl.py (self-signed cert with a single dNSName SAN,
+  // served on the loopback IP).
+  const char* tls_addr_env = std::getenv("TLS_SERVER_ADDR");
+  const char* tls_san_env = std::getenv("TLS_SERVER_SAN");
+  const char* tls_ca_env = std::getenv("TLS_SERVER_CA");
+  if (
+    tls_addr_env == nullptr || tls_san_env == nullptr || tls_ca_env == nullptr)
+  {
+    MESSAGE("Skipping: TLS_SERVER_* env not set (run via e2e_curl.py)");
+    return;
+  }
+
+  const std::string tls_addr = tls_addr_env;
+  const std::string tls_san = tls_san_env;
+
+  std::string ca_pem;
+  {
+    std::ifstream ca_file(tls_ca_env, std::ios::binary);
+    REQUIRE(ca_file.good());
+    ca_pem.assign(
+      std::istreambuf_iterator<char>(ca_file),
+      std::istreambuf_iterator<char>());
+  }
+  REQUIRE(!ca_pem.empty());
+
+  // TLS_SERVER_ADDR is "<host>:<port>".
+  const auto colon = tls_addr.rfind(':');
+  REQUIRE(colon != std::string::npos);
+  const std::string tls_host = tls_addr.substr(0, colon);
+  const std::string tls_port = tls_addr.substr(colon + 1);
+
+  auto perform_get = [&](
+                       const std::string& url,
+                       long verifyhost,
+                       const std::optional<std::string>& resolve_entry) {
+    auto curl_handle = ccf::http_client::UniqueCURL();
+    curl_handle.set_opt(CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_handle.set_opt(CURLOPT_SSL_VERIFYHOST, verifyhost);
+    curl_handle.set_opt(CURLOPT_PROTOCOLS_STR, "https");
+    curl_handle.set_blob_opt(
+      CURLOPT_CAINFO_BLOB,
+      reinterpret_cast<const uint8_t*>(ca_pem.data()),
+      ca_pem.size());
+    curl_handle.set_opt(CURLOPT_CAPATH, nullptr);
+    curl_handle.set_opt(CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_handle.set_opt(CURLOPT_TIMEOUT, 10L);
+
+    auto resolve = ccf::http_client::UniqueSlist();
+    if (resolve_entry.has_value())
+    {
+      resolve.append(resolve_entry->c_str());
+      curl_handle.set_opt(CURLOPT_RESOLVE, resolve.get());
+    }
+
+    CURLcode result = CURLE_FAILED_INIT;
+    auto callback =
+      [&result](
+        std::unique_ptr<ccf::http_client::CurlRequest>&& /*request*/,
+        CURLcode curl_response,
+        long /*status*/) { result = curl_response; };
+
+    ccf::http_client::CurlRequest::synchronous_perform(
+      std::make_unique<ccf::http_client::CurlRequest>(
+        std::move(curl_handle),
+        HTTP_GET,
+        url,
+        ccf::http_client::UniqueSlist(),
+        nullptr,
+        std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+        callback));
+    return result;
+  };
+
+  SUBCASE("VERIFYHOST=2 rejects a host absent from the certificate SAN")
+  {
+    // The certificate's only SAN is a dNSName, so dialing the loopback IP
+    // directly must fail hostname verification.
+    const auto result =
+      perform_get(fmt::format("https://{}/", tls_addr), 2L, std::nullopt);
+    REQUIRE(result == CURLE_PEER_FAILED_VERIFICATION);
+  }
+
+  SUBCASE("VERIFYHOST=2 accepts the certificate SAN host")
+  {
+    // Dial the SAN name, resolved to the server's loopback address.
+    const auto result = perform_get(
+      fmt::format("https://{}:{}/", tls_san, tls_port),
+      2L,
+      fmt::format("{}:{}:{}", tls_san, tls_port, tls_host));
+    REQUIRE(result == CURLE_OK);
+  }
+
+  SUBCASE("VERIFYHOST=0 accepts the mismatched host (control)")
+  {
+    // With hostname verification disabled the same mismatched connection
+    // succeeds, proving the CA/cert/connection are otherwise valid and that
+    // the hostname check is the sole discriminator.
+    const auto result =
+      perform_get(fmt::format("https://{}/", tls_addr), 0L, std::nullopt);
+    REQUIRE(result == CURLE_OK);
+  }
+}
+
+static std::unique_ptr<ccf::http_client::CurlRequest> snapshot_test_request(
+  ccf::RESTVerb method,
+  const std::string& path,
+  const nlohmann::json& body = nullptr,
+  long expected_status = HTTP_STATUS_OK)
+{
+  CURLcode result = CURLE_FAILED_INIT;
+  long status = 0;
+  std::unique_ptr<ccf::http_client::CurlRequest> request;
+  auto callback = [&](
+                    std::unique_ptr<ccf::http_client::CurlRequest>&& received,
+                    CURLcode received_result,
+                    long received_status) {
+    request = std::move(received);
+    result = received_result;
+    status = received_status;
+  };
+  ccf::http_client::CurlRequest::synchronous_perform(
+    std::make_unique<ccf::http_client::CurlRequest>(
+      ccf::http_client::UniqueCURL(),
+      method,
+      fmt::format("http://{}{}", server_address, path),
+      ccf::http_client::UniqueSlist(),
+      body.is_null() ? nullptr :
+                       std::make_unique<ccf::http_client::RequestBody>(body),
+      std::make_unique<ccf::http_client::ResponseBody>(64 * 1024),
+      callback));
+  REQUIRE(result == CURLE_OK);
+  REQUIRE(status == expected_status);
+  REQUIRE(request != nullptr);
+  return request;
+}
+
+TEST_CASE("Snapshot Content-Range headers")
+{
+  for (const auto* mode : {"inclusive", "exclusive"})
+  {
+    INFO(mode);
+    const auto request = snapshot_test_request(
+      HTTP_GET,
+      fmt::format("/snapshot-test/headers/{}", mode),
+      nullptr,
+      HTTP_STATUS_PARTIAL_CONTENT);
+    const auto range = ccf::snapshots::parse_content_range_header(*request);
+    CHECK(range.range_start == 2);
+    CHECK(range.inclusive_range_end == 4);
+    CHECK(range.total_size == 10);
+  }
+
+  const std::vector<std::pair<std::string, std::string>> invalid_headers = {
+    {"missing_range", "missing expected content-range header"},
+    {"unit", "Unexpected content-range unit"},
+    {"missing_start", "Unsupported content-range header format"},
+    {"missing_end", "Unsupported content-range header format"},
+    {"missing_total", "Unsupported content-range header format"},
+    {"invalid_start", "Could not parse range start"},
+    {"invalid_end", "Could not parse range end"},
+    {"invalid_total", "Could not parse total size"},
+    {"overflow_start", "Could not parse range start"},
+    {"overflow_end", "Could not parse range end"},
+    {"overflow_total", "Could not parse total size"},
+    {"length_mismatch", "headers do not agree"},
+    {"missing_length", "missing expected content-length header"},
+  };
+  for (const auto& [mode, error] : invalid_headers)
+  {
+    INFO(mode);
+    const auto request = snapshot_test_request(
+      HTTP_GET,
+      fmt::format("/snapshot-test/headers/{}", mode),
+      nullptr,
+      HTTP_STATUS_PARTIAL_CONTENT);
+    CHECK_THROWS_WITH_AS(
+      ccf::snapshots::parse_content_range_header(*request),
+      doctest::Contains(error),
+      std::runtime_error);
+  }
+}
+
+TEST_CASE("Snapshot fetching over multiple HTTPS byte ranges")
+{
+  const auto* peer_address = std::getenv("SNAPSHOT_SERVER_ADDR");
+  const auto* ca_path = std::getenv("SNAPSHOT_SERVER_CA");
+  REQUIRE(peer_address != nullptr);
+  REQUIRE(ca_path != nullptr);
+  std::ifstream ca_file(ca_path, std::ios::binary);
+  REQUIRE(ca_file.good());
+  const std::vector<uint8_t> peer_ca{
+    std::istreambuf_iterator<char>(ca_file), std::istreambuf_iterator<char>()};
+  REQUIRE_FALSE(peer_ca.empty());
+
+  constexpr size_t CHUNK_SIZE = 4 * 1024 * 1024;
+  constexpr size_t DATA_SIZE = 2 * CHUNK_SIZE + 17;
+  std::vector<uint8_t> expected_data(DATA_SIZE);
+  for (size_t i = 0; i < expected_data.size(); ++i)
+  {
+    expected_data[i] = i % 251;
+  }
+  const std::string snapshot_path = "/node/snapshot/snapshot-test.committed";
+  const auto initial_range = fmt::format("bytes=0-{}", CHUNK_SIZE - 1);
+
+  auto configure = [](const std::string& mode) {
+    snapshot_test_request(
+      HTTP_POST, "/snapshot-test/configure", {{"mode", mode}});
+  };
+  auto get_requests = []() {
+    const auto request =
+      snapshot_test_request(HTTP_GET, "/snapshot-test/requests");
+    return nlohmann::json::parse(request->get_response_body()->buffer);
+  };
+  auto check_snapshot =
+    [&](const std::optional<ccf::snapshots::SnapshotResponse>& response) {
+      REQUIRE(response.has_value());
+      CHECK(response->snapshot_name == "snapshot-test.committed");
+      REQUIRE(response->snapshot_data.size() == DATA_SIZE);
+      CHECK(std::equal(
+        expected_data.begin(),
+        expected_data.end(),
+        response->snapshot_data.begin()));
+    };
+  auto expected_requests = [&](std::optional<size_t> since) {
+    const auto discovery_path = since.has_value() ?
+      fmt::format("/node/snapshot?since={}", *since) :
+      "/node/snapshot";
+    return nlohmann::json::array({
+      {{"path", discovery_path}, {"range", initial_range}},
+      {{"path", "/node/snapshot/redirect"}, {"range", initial_range}},
+      {{"path", snapshot_path}, {"range", initial_range}},
+      {{"path", snapshot_path},
+       {"range", fmt::format("bytes={}-{}", CHUNK_SIZE, 2 * CHUNK_SIZE - 1)}},
+      {{"path", snapshot_path},
+       {"range",
+        fmt::format("bytes={}-{}", 2 * CHUNK_SIZE, 3 * CHUNK_SIZE - 1)}},
+    });
+  };
+
+  for (const auto* mode : {"inclusive", "exclusive"})
+  {
+    INFO(mode);
+    configure(mode);
+    check_snapshot(ccf::snapshots::try_fetch_from_peer(
+      peer_address, peer_ca, DATA_SIZE, 42));
+    CHECK(get_requests() == expected_requests(42));
+  }
+
+  configure("retry");
+  check_snapshot(ccf::snapshots::fetch_from_peer(
+    peer_address, peer_ca, 2, 1, DATA_SIZE, 42));
+  auto retry_requests = expected_requests(42);
+  const auto discovery_request = retry_requests.front();
+  retry_requests.insert(retry_requests.begin(), discovery_request);
+  CHECK(get_requests() == retry_requests);
+
+  // redirect_loop: 20 discovery redirects, then one range request that fails
+  // on its unexpected 308 status
+  const std::vector<std::pair<std::string, size_t>> failures = {
+    {"discovery_error", 1},
+    {"unexpected_status", 1},
+    {"no_location", 1},
+    {"redirect_loop", 21},
+    {"wrong_start", 3},
+    {"wrong_end", 3},
+    {"chunk_error", 4},
+  };
+  for (const auto& [mode, request_count] : failures)
+  {
+    INFO(mode);
+    configure(mode);
+    CHECK_FALSE(
+      ccf::snapshots::try_fetch_from_peer(peer_address, peer_ca, DATA_SIZE)
+        .has_value());
+    const auto requests = get_requests();
+    REQUIRE_FALSE(requests.empty());
+    CHECK(requests.size() == request_count);
+    CHECK(requests.front().at("path") == "/node/snapshot");
+    CHECK(requests.front().at("range") == initial_range);
+  }
+
+  for (const size_t max_size : {CHUNK_SIZE - 1, CHUNK_SIZE + 16})
+  {
+    INFO(max_size);
+    configure("inclusive");
+    CHECK_FALSE(
+      ccf::snapshots::try_fetch_from_peer(peer_address, peer_ca, max_size)
+        .has_value());
+    const auto requests = get_requests();
+    CHECK(requests.size() == (max_size < CHUNK_SIZE ? 3 : 4));
+    CHECK(
+      requests.back().at("range") ==
+      (max_size < CHUNK_SIZE ?
+         initial_range :
+         fmt::format("bytes={}-{}", CHUNK_SIZE, 2 * CHUNK_SIZE - 1)));
+  }
+
+  configure("not_found");
+  CHECK_FALSE(
+    ccf::snapshots::fetch_from_peer(peer_address, peer_ca, 3, 1, DATA_SIZE, 42)
+      .has_value());
+  const auto requests = get_requests();
+  REQUIRE(requests.size() == 3);
+  for (const auto& request : requests)
+  {
+    CHECK(request == discovery_request);
+  }
+}
+
+TEST_CASE("CurlmLibuvContext")
+{
+  size_t response_count = 0;
+  constexpr size_t number_requests = 1000;
+  auto load_generator = [](uv_work_t* req) {
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
+    constexpr size_t max_delay_ms = 10;
+    thread_local std::uniform_int_distribution<> uniform_dist(1, max_delay_ms);
+    auto* response_count_ptr = reinterpret_cast<size_t*>(req->data);
+    Data data = {.foo = "alpha", .bar = "beta"};
+    for (size_t i = 0; i < number_requests; ++i)
+    {
+      auto delay = uniform_dist(gen);
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+
+      data.iter = i;
+      std::string url = fmt::format("http://{}/{}", server_address, i);
+      auto body = std::make_unique<ccf::http_client::RequestBody>(data);
+
+      auto headers = ccf::http_client::UniqueSlist();
+      headers.append("Content-Type", "application/json");
+
+      auto curl_handle = ccf::http_client::UniqueCURL();
+      curl_handle.set_opt(CURLOPT_FORBID_REUSE, 1L);
+
+      auto response_callback =
+        [response_count_ptr](
+          std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+          CURLcode curl_response,
+          long status_code) {
+          (void)request;
+          constexpr size_t HTTP_SUCCESS = 200;
+          if (curl_response == CURLE_OK && status_code == HTTP_SUCCESS)
+          {
+            (*response_count_ptr)++;
+          }
+        };
+
+      auto request = std::make_unique<ccf::http_client::CurlRequest>(
+        std::move(curl_handle),
+        HTTP_PUT,
+        std::move(url),
+        std::move(headers),
+        std::move(body),
+        std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+        std::move(response_callback));
+
+      ccf::http_client::CurlmLibuvContextSingleton::get_instance()
+        ->attach_request(std::move(request));
+    }
+  };
+
+  {
+    ccf::http_client::CurlmLibuvContextSingleton singleton(uv_default_loop());
+
+    uv_work_t work_req;
+    work_req.data = &response_count;
+    uv_queue_work(uv_default_loop(), &work_req, load_generator, nullptr);
+    uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+  }
+  REQUIRE(response_count == number_requests);
+}
+
+TEST_CASE("CurlmLibuvContext slow")
+{
+  size_t response_count = 0;
+  constexpr size_t slow_number_requests = 10;
+  auto load_generator = [](uv_work_t* req) {
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
+    constexpr size_t max_delay_ms = 2000;
+    thread_local std::uniform_int_distribution<> uniform_dist(1, max_delay_ms);
+    auto* response_count_ptr = reinterpret_cast<size_t*>(req->data);
+    (void)req;
+    Data data = {.foo = "alpha", .bar = "beta"};
+    for (size_t i = 0; i < slow_number_requests; ++i)
+    {
+      auto delay = uniform_dist(gen);
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+
+      data.iter = i;
+      std::string url = fmt::format("http://{}/{}", server_address, i);
+      auto body = std::make_unique<ccf::http_client::RequestBody>(data);
+
+      auto headers = ccf::http_client::UniqueSlist();
+      headers.append("Content-Type", "application/json");
+
+      auto curl_handle = ccf::http_client::UniqueCURL();
+      curl_handle.set_opt(CURLOPT_FORBID_REUSE, 1L);
+
+      auto response_callback =
+        [response_count_ptr](
+          std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+          CURLcode curl_response,
+          long status_code) {
+          (void)request;
+          constexpr size_t HTTP_SUCCESS = 200;
+          if (curl_response == CURLE_OK && status_code == HTTP_SUCCESS)
+          {
+            (*response_count_ptr)++;
+          }
+        };
+
+      auto request = std::make_unique<ccf::http_client::CurlRequest>(
+        std::move(curl_handle),
+        HTTP_PUT,
+        std::move(url),
+        std::move(headers),
+        std::move(body),
+        std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+        std::move(response_callback));
+
+      ccf::http_client::CurlmLibuvContextSingleton::get_instance()
+        ->attach_request(std::move(request));
+    }
+  };
+
+  {
+    ccf::http_client::CurlmLibuvContextSingleton singleton(uv_default_loop());
+
+    uv_work_t work_req;
+    work_req.data = &response_count;
+    uv_queue_work(uv_default_loop(), &work_req, load_generator, nullptr);
+    uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+  }
+  REQUIRE(response_count == slow_number_requests);
+}
+
+TEST_CASE("CurlmLibuvContext timeouts")
+{
+  size_t response_count = 0;
+  constexpr size_t number_requests = 1000;
+
+  auto load_generator = [](uv_work_t* req) {
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
+    constexpr size_t max_delay_ms = 40;
+    thread_local std::uniform_int_distribution<> uniform_dist(1, max_delay_ms);
+    auto* response_count_ptr = reinterpret_cast<size_t*>(req->data);
+    (void)req;
+
+    Data data = {.foo = "alpha", .bar = "beta"};
+    for (size_t i = 0; i < number_requests; ++i)
+    {
+      auto delay = uniform_dist(gen);
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+
+      data.iter = i;
+
+      // 192.0.2.0/24 (TEST-NET-1) is reserved (RFC 5737) and should be
+      // unroutable.
+      const std::string unreachable_base = "http://192.0.2.1:65535";
+      std::string url = fmt::format("{}/{}", unreachable_base, i);
+      auto body = std::make_unique<ccf::http_client::RequestBody>(data);
+
+      auto headers = ccf::http_client::UniqueSlist();
+      headers.append("Content-Type", "application/json");
+
+      auto curl_handle = ccf::http_client::UniqueCURL();
+      curl_handle.set_opt(CURLOPT_TIMEOUT_MS, max_delay_ms);
+      curl_handle.set_opt(CURLOPT_FORBID_REUSE, 1L);
+
+      auto response_callback =
+        [response_count_ptr](
+          std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+          CURLcode curl_response,
+          long status_code) {
+          (void)request;
+          // We expect all to fail to connect; count only unexpected successes.
+          constexpr size_t HTTP_SUCCESS = 200;
+          if (curl_response == CURLE_OK && status_code == HTTP_SUCCESS)
+          {
+            (*response_count_ptr)++;
+          }
+        };
+
+      auto request = std::make_unique<ccf::http_client::CurlRequest>(
+        std::move(curl_handle),
+        HTTP_PUT,
+        std::move(url),
+        std::move(headers),
+        std::move(body),
+        std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+        std::move(response_callback));
+
+      ccf::http_client::CurlmLibuvContextSingleton::get_instance()
+        ->attach_request(std::move(request));
+    }
+  };
+
+  {
+    ccf::http_client::CurlmLibuvContextSingleton singleton(uv_default_loop());
+
+    uv_work_t work_req;
+    work_req.data = &response_count;
+    uv_queue_work(uv_default_loop(), &work_req, load_generator, nullptr);
+    uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+  }
+  // All should fail to reach the unreachable host.
+  REQUIRE(response_count == 0);
+}
+
+TEST_CASE("CurlmLibuvContext multiple init")
+{
+  size_t response_count = 0;
+  constexpr size_t number_iterations = 10;
+  constexpr size_t number_requests = 10;
+
+  auto load_generator = [](uv_work_t* req) {
+    thread_local std::random_device rd;
+    thread_local std::mt19937 gen(rd());
+    constexpr size_t max_delay_ms = 40;
+    thread_local std::uniform_int_distribution<> uniform_dist(1, max_delay_ms);
+    auto* response_count_ptr = reinterpret_cast<size_t*>(req->data);
+    (void)req;
+
+    Data data = {.foo = "alpha", .bar = "beta"};
+    for (size_t i = 0; i < number_requests; ++i)
+    {
+      auto delay = uniform_dist(gen);
+      std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+
+      data.iter = i;
+
+      std::string url = fmt::format("http://{}/{}", server_address, i);
+      auto body = std::make_unique<ccf::http_client::RequestBody>(data);
+
+      auto headers = ccf::http_client::UniqueSlist();
+      headers.append("Content-Type", "application/json");
+
+      auto curl_handle = ccf::http_client::UniqueCURL();
+      curl_handle.set_opt(CURLOPT_TIMEOUT_MS, max_delay_ms);
+      curl_handle.set_opt(CURLOPT_FORBID_REUSE, 1L);
+
+      auto response_callback =
+        [response_count_ptr](
+          std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+          CURLcode curl_response,
+          long status_code) {
+          //(void)request;
+          LOG_INFO_FMT(
+            "Request to {} completed: {} ({}) {}",
+            request->get_url(),
+            curl_easy_strerror(curl_response),
+            curl_response,
+            status_code);
+
+          // We expect all to fail to connect; count only unexpected successes.
+          constexpr size_t HTTP_SUCCESS = 200;
+          if (curl_response == CURLE_OK && status_code == HTTP_SUCCESS)
+          {
+            (*response_count_ptr)++;
+          }
+        };
+
+      auto request = std::make_unique<ccf::http_client::CurlRequest>(
+        std::move(curl_handle),
+        HTTP_PUT,
+        std::move(url),
+        std::move(headers),
+        std::move(body),
+        std::make_unique<ccf::http_client::ResponseBody>(SIZE_MAX),
+        std::move(response_callback));
+
+      ccf::http_client::CurlmLibuvContextSingleton::get_instance()
+        ->attach_request(std::move(request));
+    }
+  };
+
+  for (size_t i = 0; i < number_iterations; ++i)
+  {
+    ccf::http_client::CurlmLibuvContextSingleton singleton(uv_default_loop());
+
+    uv_work_t work_req;
+    work_req.data = &response_count;
+    uv_queue_work(uv_default_loop(), &work_req, load_generator, nullptr);
+    uv_run(uv_default_loop(), UV_RUN_DEFAULT);
+  }
+  // All should fail to reach the unreachable host.
+  REQUIRE(response_count == number_iterations * number_requests);
+}
+
+int main(int argc, char** argv)
+{
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  auto* addr_ptr = std::getenv("ECHO_SERVER_ADDR");
+  if (addr_ptr != nullptr)
+  {
+    server_address = std::string(addr_ptr);
+  }
+  ccf::logger::config::default_init();
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  doctest::Context context;
+  context.applyCommandLine(argc, argv);
+  int res = context.run();
+  curl_global_cleanup();
+  return res;
+}

@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include <cstddef>
 #include <list>
 #include <map>
 
@@ -48,7 +49,7 @@ private:
 public:
   LRU(size_t max_size) : max_size(max_size) {}
 
-  size_t size() const
+  [[nodiscard]] size_t size() const
   {
     return iter_map.size();
   }
@@ -59,27 +60,27 @@ public:
     cull();
   }
 
-  size_t get_max_size() const
+  [[nodiscard]] size_t get_max_size() const
   {
     return max_size;
   }
 
-  Iterator begin()
+  [[nodiscard]] Iterator begin()
   {
     return entries_list.begin();
   }
 
-  Iterator end()
+  [[nodiscard]] Iterator end()
   {
     return entries_list.end();
   }
 
-  ConstIterator begin() const
+  [[nodiscard]] ConstIterator begin() const
   {
     return entries_list.begin();
   }
 
-  ConstIterator end() const
+  [[nodiscard]] ConstIterator end() const
   {
     return entries_list.end();
   }
@@ -95,7 +96,7 @@ public:
     return entries_list.end();
   }
 
-  bool contains(const K& k) const
+  [[nodiscard]] bool contains(const K& k) const
   {
     const auto it = iter_map.find(k);
     return it != iter_map.end();
@@ -137,5 +138,15 @@ public:
   {
     entries_list.clear();
     iter_map.clear();
+  }
+
+  void erase(const K& key)
+  {
+    const auto it = iter_map.find(key);
+    if (it != iter_map.end())
+    {
+      entries_list.erase(it->second);
+      iter_map.erase(it);
+    }
   }
 };

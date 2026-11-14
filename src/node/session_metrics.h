@@ -16,6 +16,7 @@ namespace ccf
       size_t parsing;
       size_t request_payload_too_large;
       size_t request_header_too_large;
+      size_t request_target_too_long;
     };
 
     struct PerInterface
@@ -27,21 +28,22 @@ namespace ccf
       Errors errors;
     };
 
-    size_t active;
-    size_t peak;
+    size_t active = 0;
+    size_t peak = 0;
     std::map<std::string, PerInterface> interfaces;
   };
 
-  DECLARE_JSON_TYPE(SessionMetrics::Errors)
+  DECLARE_JSON_TYPE(SessionMetrics::Errors);
   DECLARE_JSON_REQUIRED_FIELDS(
     SessionMetrics::Errors,
     parsing,
     request_payload_too_large,
-    request_header_too_large)
+    request_header_too_large,
+    request_target_too_long);
 
-  DECLARE_JSON_TYPE(SessionMetrics::PerInterface)
+  DECLARE_JSON_TYPE(SessionMetrics::PerInterface);
   DECLARE_JSON_REQUIRED_FIELDS(
-    SessionMetrics::PerInterface, active, peak, soft_cap, hard_cap, errors)
-  DECLARE_JSON_TYPE(SessionMetrics)
-  DECLARE_JSON_REQUIRED_FIELDS(SessionMetrics, active, peak, interfaces)
+    SessionMetrics::PerInterface, active, peak, soft_cap, hard_cap, errors);
+  DECLARE_JSON_TYPE(SessionMetrics);
+  DECLARE_JSON_REQUIRED_FIELDS(SessionMetrics, active, peak, interfaces);
 }

@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/crypto/key_pair.h"
+#include "ccf/crypto/ec_key_pair.h"
 #include "ccf/crypto/sha256_hash.h"
 #include "ccf/crypto/verifier.h"
 #include "ccf/entity_id.h"
@@ -18,7 +18,7 @@ namespace ccf
 {
   using Nodes = ServiceMap<NodeId, NodeInfo>;
   using NodeEndorsedCertificates =
-    kv::RawCopySerialisedMap<NodeId, crypto::Pem>;
+    ccf::kv::RawCopySerialisedMap<NodeId, ccf::crypto::Pem>;
 
   namespace Tables
   {
@@ -30,17 +30,18 @@ namespace ccf
   inline NodeId compute_node_id_from_pubk_der(
     const std::vector<uint8_t>& node_pubk_der)
   {
-    return crypto::Sha256Hash(node_pubk_der).hex_str();
+    return ccf::crypto::Sha256Hash(node_pubk_der).hex_str();
   }
 
   inline NodeId compute_node_id_from_cert_der(
     const std::vector<uint8_t>& node_cert_der)
   {
     return compute_node_id_from_pubk_der(
-      crypto::public_key_der_from_cert(node_cert_der));
+      ccf::crypto::public_key_der_from_cert(node_cert_der));
   }
 
-  inline NodeId compute_node_id_from_kp(const crypto::KeyPairPtr& node_sign_kp)
+  inline NodeId compute_node_id_from_kp(
+    const ccf::crypto::ECKeyPairPtr& node_sign_kp)
   {
     return compute_node_id_from_pubk_der(node_sign_kp->public_key_der());
   }

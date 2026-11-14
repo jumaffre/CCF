@@ -5,32 +5,17 @@ unset(CCF_VERSION)
 unset(CCF_RELEASE_VERSION)
 unset(CCF_VERSION_SUFFIX)
 
-option(
-  UNSAFE_VERSION
-  "Append unsafe suffix to project and targets. Should be used on platforms where log level is determined at build-time, to distinguish builds which are unsafely verbose."
-  OFF
-)
+set(CCF_PROJECT "ccf")
 
-set(CCF_PROJECT "ccf_${COMPILE_TARGET}")
-if(UNSAFE_VERSION)
-  if(NOT ${COMPILE_TARGET} STREQUAL "sgx")
-    message(
-      FATAL_ERROR
-        "UNSAFE_VERSION can only be set for sgx compile target (-DCOMPILE_TARGET=sgx)"
-    )
-  endif()
-  set(CCF_PROJECT "${CCF_PROJECT}_unsafe")
-  add_compile_definitions(UNSAFE_VERSION ENABLE_HISTORICAL_VERBOSE_LOGGING)
-  file(WRITE ${CMAKE_BINARY_DIR}/UNSAFE "UNSAFE")
-  install(FILES ${CMAKE_BINARY_DIR}/UNSAFE DESTINATION share)
-endif()
-
-# If possible, deduce project version from git environment
+# If possible, deduce project version from git environment.
+# Ignore zero-version tags used for pipeline testing.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
   find_package(Git)
 
   execute_process(
-    COMMAND "bash" "-c" "${GIT_EXECUTABLE} describe --tags --match=\"ccf-*\""
+    COMMAND
+      "bash" "-c"
+      "${GIT_EXECUTABLE} describe --tags --match=\"ccf-*\" --exclude=\"ccf-0.0.0*\""
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     OUTPUT_VARIABLE "CCF_VERSION"
     OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -48,7 +33,7 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/.git)
   if(NOT FIRST STREQUAL "ccf")
     message(
       FATAL_ERROR
-        "Git repository does not appear to contain any tag starting with ccf- (the repository should be cloned with sufficient depth to access the latest \"ccf-*\" tag)"
+      "Git repository does not appear to contain any tag starting with ccf- (the repository should be cloned with sufficient depth to access the latest \"ccf-*\" tag)"
     )
   endif()
 else()
@@ -70,7 +55,8 @@ else()
   endif()
 
   message(
-    STATUS "Extracting CCF version from sources directory: ${CCF_VERSION}"
+    STATUS
+    "Extracting CCF version from sources directory: ${CCF_VERSION}"
   )
 endif()
 
@@ -91,15 +77,16 @@ endif()
 
 # Check that release version is semver
 execute_process(
-  COMMAND "bash" "-c"
-          "[[ ${CCF_RELEASE_VERSION} =~ ^([[:digit:]])+(\.([[:digit:]])+)*$ ]]"
+  COMMAND
+    "bash" "-c"
+    "[[ ${CCF_RELEASE_VERSION} =~ ^([[:digit:]])+(\.([[:digit:]])+)*$ ]]"
   RESULT_VARIABLE "VERSION_IS_SEMVER"
 )
 
 if(NOT ${VERSION_IS_SEMVER} STREQUAL "0")
   message(
     WARNING
-      "Release version \"${CCF_RELEASE_VERSION}\" does not follow semver. Defaulting to project version 0.0.0"
+    "Release version \"${CCF_RELEASE_VERSION}\" does not follow semver. Defaulting to project version 0.0.0"
   )
   set(CCF_RELEASE_VERSION "0.0.0")
 endif()

@@ -50,6 +50,23 @@ export interface KvMap {
 }
 
 /**
+ * A set in the Key Value Store.
+ *
+ * `KVSet` is modelled after JavaScript's `Set` object,
+ * except that keys must be of type `ArrayBuffer`
+ * and no guarantees on iteration order are provided.
+ */
+export interface KvSet {
+  has(key: ArrayBuffer): boolean;
+  getVersionOfPreviousWrite(key: ArrayBuffer): number | undefined;
+  add(key: ArrayBuffer): KvSet;
+  delete(key: ArrayBuffer): void;
+  clear(): void;
+  forEach(callback: (value: ArrayBuffer, kvset: KvSet) => void): void;
+  size: number;
+}
+
+/**
  * @inheritDoc CCF.kv
  */
 export type KvMaps = { [key: string]: KvMap };
@@ -137,7 +154,7 @@ export interface HistoricalState {
   /**
    * An object that provides access to the maps of the Key-Value Store
    * associated with the historic transaction.
-   * Fields are map names and values are {@linkcode KvMap} objects.
+   * Fields are map names and values are {@linkcode KvMap}  objects.
    */
   kv: KvMaps;
 }
@@ -214,7 +231,7 @@ export interface CryptoKeyPair {
   publicKey: string;
 }
 
-export type AlgorithmName = "RSASSA-PKCS1-v1_5" | "ECDSA" | "EdDSA" | "HMAC";
+export type AlgorithmName = "RSA-PSS" | "ECDSA" | "EdDSA" | "HMAC";
 
 export type DigestAlgorithm = "SHA-256" | "SHA-384" | "SHA-512";
 
@@ -222,9 +239,14 @@ export interface SigningAlgorithm {
   name: AlgorithmName;
 
   /**
-   * Digest algorithm. It's necessary for "RSASSA-PKCS1-v1_5", "ECDSA", and "HMAC"
+   * Digest algorithm. It's necessary for "RSA-PSS", "ECDSA", and "HMAC"
    */
   hash?: DigestAlgorithm;
+
+  /**
+   * Salt length, necessary for "RSA-PSS".
+   */
+  saltLength?: number;
 }
 
 /**
@@ -364,14 +386,15 @@ export interface CCFCrypto {
   /**
    * Generate an ECDSA key pair.
    *
-   * @param curve The name of the curve, one of "secp256r1", "secp256k1", "secp384r1".
+   * @param curve The name of the curve, one of "secp256r1", "secp384r1",
+   * "secp521r1".
    */
   generateEcdsaKeyPair(curve: string): CryptoKeyPair;
 
   /**
    * Generate an EdDSA key pair.
    *
-   * @param curve The name of the curve. Currently only "curve25519" is supported.
+   * @param curve The name of the curve. Only "curve25519" and "x25519" are supported.
    */
   generateEddsaKeyPair(curve: string): CryptoKeyPair;
 
@@ -382,6 +405,18 @@ export interface CCFCrypto {
    * on the wrapping algorithm that is used (`wrapAlgo`).
    */
   wrapKey(
+    key: ArrayBuffer,
+    wrappingKey: ArrayBuffer,
+    wrapAlgo: WrapAlgoParams,
+  ): ArrayBuffer;
+
+  /**
+   * Unwraps a key using a wrapping key.
+   *
+   * Constraints on the `key` and `wrappingKey` parameters depend
+   * on the wrapping algorithm that is used (`wrapAlgo`).
+   */
+  unwrapKey(
     key: ArrayBuffer,
     wrappingKey: ArrayBuffer,
     wrapAlgo: WrapAlgoParams,
@@ -406,6 +441,12 @@ export interface CCFCrypto {
    * The chain and trusted certificates are PEM-encoded bundles of X.509 certificates.
    */
   isValidX509CertChain(chain: string, trusted: string): boolean;
+
+  /**
+   * Returns whether a single PEM-encoded X.509 certificate is a self-signed (root) CA.
+   * Returns false for intermediate CA certificates, non-CA certificates, and malformed PEM.
+   */
+  isValidX509RootCACert(pem: string): boolean;
 
   /**
    * Converts an elliptic curve public key as PEM to JSON Web Key (JWK) object.
@@ -441,7 +482,7 @@ export interface CCFCrypto {
 
   /**
    * Converts an EdDSA public key as PEM to JSON Web Key (JWK) object.
-   * Currently only Curve25519 is supported.
+   * Only Curve25519 and X25519 are supported.
    *
    * @param pem EdDSA public key as PEM
    * @param kid Key identifier (optional)
@@ -450,7 +491,7 @@ export interface CCFCrypto {
 
   /**
    * Converts an EdDSA private key as PEM to JSON Web Key (JWK) object.
-   * Currently only Curve25519 is supported.
+   * Only Curve25519 and X25519 are supported.
    *
    * @param pem EdDSA private key as PEM
    * @param kid Key identifier (optional)
@@ -467,21 +508,21 @@ export interface CCFCrypto {
   /**
    * Converts an elliptic curve private key as JSON Web Key (JWK) object to PEM.
    *
-   * @param pem Elliptic curve private key as JWK
+   * @param jwk Elliptic curve private key as JWK
    */
   jwkToPem(jwk: JsonWebKeyECPrivate): string;
 
   /**
    * Converts an RSA public key as JSON Web Key (JWK) object to PEM.
    *
-   * @param pem RSA public key as JWK
+   * @param jwk RSA public key as JWK
    */
   pubRsaJwkToPem(jwk: JsonWebKeyRSAPublic): string;
 
   /**
    * Converts an RSA private key as JSON Web Key (JWK) object to PEM.
    *
-   * @param pem RSA private key as JWK
+   * @param jwk RSA private key as JWK
    */
   rsaJwkToPem(jwk: JsonWebKeyRSAPrivate): string;
 
@@ -489,7 +530,7 @@ export interface CCFCrypto {
    * Converts an EdDSA public key as JSON Web Key (JWK) object to PEM.
    * Currently only Curve25519 is supported.
    *
-   * @param pem EdDSA public key as JWK
+   * @param jwk EdDSA public key as JWK
    */
   pubEddsaJwkToPem(jwk: JsonWebKeyEdDSAPublic): string;
 
@@ -497,7 +538,7 @@ export interface CCFCrypto {
    * Converts an EdDSA private key as JSON Web Key (JWK) object to PEM.
    * Currently only Curve25519 is supported.
    *
-   * @param pem EdDSA private key as JWK
+   * @param jwk EdDSA private key as JWK
    */
   eddsaJwkToPem(jwk: JsonWebKeyEdDSAPrivate): string;
 }
@@ -690,13 +731,11 @@ export interface CCF {
   historical: CCFHistorical;
 
   /**
-   * Toggles implementation of Date global API between using untrusted host time
-   * (when enabled)and returning 0 (when disabled). By default this is disabled.
+   * @deprecated This function has no effect and will be removed in a future release.
    *
-   * Returns the previous value, allowing a global default to be maintained.
+   * Returns `enable` for compatibility.
    *
-   * @param enable If true, then subsequent calls to Date.now() will return untrusted
-   * host time
+   * @param enable The value returned by this function
    */
   enableUntrustedDateTime(enable: boolean): boolean;
 
@@ -712,32 +751,6 @@ export interface CCF {
    * this execution
    */
   enableMetricsLogging(enable: boolean): boolean;
-}
-
-export const openenclave: OpenEnclave = (<any>globalThis).openenclave;
-
-export interface EvidenceClaims {
-  claims: { [name: string]: ArrayBuffer };
-  customClaims: { [name: string]: ArrayBuffer };
-}
-
-export interface OpenEnclave {
-  /**
-   * Verifies Open Enclave evidence and returns the claims of the evidence.
-   *
-   * @param format The optional format id of the evidence to be verified as
-   *  a UUID of the form "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
-   *  If this parameter is `undefined`, the evidence and endorsement
-   *  must either contain data with an attestation header holding a valid
-   *  format id, or be an Open Enclave report generated by the legacy API function
-   *  `oe_get_report()`. Otherwise, this parameter must be a valid format id, and
-   *  the evidence and endorsements data must not be wrapped with an attestation header.
-   */
-  verifyOpenEnclaveEvidence(
-    format: string | undefined,
-    evidence: ArrayBuffer,
-    endorsements?: ArrayBuffer,
-  ): EvidenceClaims;
 }
 
 export interface TcbVersion {
@@ -781,6 +794,9 @@ export interface SnpAttestationResult {
     report_id: ArrayBuffer;
     report_id_ma: ArrayBuffer;
     reported_tcb: TcbVersion;
+    cpuid_fam_id: number;
+    cpuid_mod_id: number;
+    cpuid_step: number;
     chip_id: ArrayBuffer;
     committed_tcb: TcbVersion;
     current_minor: number;
@@ -806,6 +822,14 @@ export const snp_attestation: SnpAttestation = (<any>globalThis)
   .snp_attestation;
 
 export interface SnpAttestation {
+  /**
+   * Verify SNP Attestation
+   *
+   * @param evidence Raw SNP attestation evidence
+   * @param endorsements SNP attestation endorsements
+   * @param uvm_endorsements UVM endorsements, optional
+   * @param endorsed_tcb Endorsed TCB version, optional
+   */
   verifySnpAttestation(
     evidence: ArrayBuffer,
     endorsements: ArrayBuffer,

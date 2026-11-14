@@ -1,0 +1,924 @@
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the Apache 2.0 License.
+import http
+import json
+import os
+import time
+
+import ccf.cose
+import infra.checker
+import infra.clients
+import infra.e2e_args
+import infra.jwt_issuer
+import infra.network
+import infra.proc
+import jwt_test
+import npm_tests
+from governance_js import action, ballot_yes, proposal
+from infra.runner import ConcurrentRunner
+from loguru import logger as LOG
+
+TESTJS = """
+import { foo } from "./bar/baz.js";
+
+export function content(request) {
+    return {
+        statusCode: 200,
+        body: {
+            payload: foo(),
+        },
+    };
+}
+"""
+
+FOOJS = """
+export function foo() {
+    return "Test content";
+}
+"""
+
+TESTJS_ROLE = """
+export function content(request) {
+  console.log(`my_constant is: ${my_object.my_constant}`);
+  
+  const endpoint_name = request.url.split("/")[2];
+  const action_name = `/${endpoint_name}/read`;
+  const permitted = my_object.hasRole(request.caller.id, action_name);
+  if (permitted)
+  {
+    return {
+        statusCode: 200,
+        body: {
+            payload: "Test content",
+        },
+    };
+  }
+
+  return {
+    statusCode: 403
+  };
+}
+"""
+
+
+def endpoint_properties(
+    js_module,
+    js_function,
+    redirection_strategy="none",
+    mode="readonly",
+):
+    return {
+        "js_module": js_module,
+        "js_function": js_function,
+        "redirection_strategy": redirection_strategy,
+        "authn_policies": ["no_auth"],
+        "mode": mode,
+        "openapi": {"responses": {"200": {"description": "Test content"}}},
+    }
+
+
+def sign_payload(identity, msg_type, json_payload):
+    serialised_payload = json.dumps(json_payload).encode()
+    with open(identity.key) as key_file:
+        key = key_file.read()
+    with open(identity.cert) as cert_file:
+        cert = cert_file.read()
+    phdr = {
+        "app.msg.type": msg_type,
+        "app.msg.created_at": int(infra.clients.get_clock().moment().timestamp()),
+    }
+
+    return ccf.cose.create_cose_sign1(serialised_payload, key, cert, phdr)
+
+
+def test_custom_endpoints(network, args):
+    primary, _ = network.find_primary()
+    user = network.users[0]
+
+    content_endpoint_def = {
+        "get": endpoint_properties(js_module="test.js", js_function="content")
+    }
+
+    modules = [
+        {"name": "test.js", "module": TESTJS},
+        {"name": "bar/baz.js", "module": FOOJS},
+    ]
+
+    bundle_with_content = {
+        "metadata": {"endpoints": {"/content": content_endpoint_def}},
+        "modules": modules,
+    }
+
+    bundle_with_other_content = {
+        "metadata": {"endpoints": {"/other_content": content_endpoint_def}},
+        "modules": modules,
+    }
+
+    def upper_cased_keys(obj):
+        return {
+            k.upper(): {
+                **v,
+                "forwarding_required": v.get(
+                    "forwarding_required",
+                    (
+                        "always"
+                        if v.get("redirection_strategy", "to_primary") == "to_primary"
+                        else "never"
+                    ),
+                ),
+            }
+            for k, v in obj.items()
+        }
+
+    def prefixed_module_name(module_def):
+        if module_def["name"].startswith("/"):
+            return module_def
+        else:
+            return {**module_def, "name": f"/{module_def['name']}"}
+
+    def same_modulo_normalisation(expected, actual):
+        # Normalise expected (in the same way that CCF will) so we can do direct comparison
+        expected["metadata"]["endpoints"] = {
+            path: upper_cased_keys(op)
+            for path, op in expected["metadata"]["endpoints"].items()
+        }
+        expected["modules"] = [
+            prefixed_module_name(module_def) for module_def in expected["modules"]
+        ]
+        return expected == actual
+
+    def test_getters(c, expected_body):
+        r = c.get("/app/custom_endpoints")
+        assert r.status_code == http.HTTPStatus.OK, r
+        assert same_modulo_normalisation(
+            expected_body, r.body.json()
+        ), f"Expected:\n{expected_body}\n\n\nActual:\n{r.body.json()}"
+
+        for module_def in modules:
+            r = c.get(f"/app/custom_endpoints/modules?module_name={module_def['name']}")
+            assert r.status_code == http.HTTPStatus.OK, r
+            assert (
+                r.body.text() == module_def["module"]
+            ), f"Expected:\n{module_def['module']}\n\n\nActual:\n{r.body.text()}"
+
+    signed_bundle = sign_payload(
+        network.identity(user.local_id), "custom_endpoints", bundle_with_content
+    )
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+        test_getters(c, bundle_with_content)
+
+    # Install also works with cert authentication, at the expense of potential offline
+    # auditability, since the ledger will not contain a signature
+    with primary.client(user.local_id, None, None) as c:
+        r = c.put("/app/custom_endpoints", body=bundle_with_content)
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+    with primary.client() as c:
+        r = c.get("/app/not_content")
+        assert r.status_code == http.HTTPStatus.NOT_FOUND.value, r.status_code
+
+        r = c.get("/app/content")
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        assert r.body.json()["payload"] == "Test content", r.body.json()
+
+    signed_bundle = sign_payload(
+        network.identity(user.local_id), "custom_endpoints", bundle_with_other_content
+    )
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+        test_getters(c, bundle_with_other_content)
+
+    with primary.client() as c:
+        r = c.get("/app/other_content")
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        assert r.body.json()["payload"] == "Test content", r.body.json()
+
+        r = c.get("/app/content")
+        assert r.status_code == http.HTTPStatus.NOT_FOUND.value, r.status_code
+
+    return network
+
+
+def test_custom_endpoints_circular_includes(network, args):
+    primary, _ = network.find_primary()
+    user = network.users[0]
+
+    MODULE_A_NAME = "a.js"
+    MODULE_B_NAME = "b.js"
+    modules = [
+        {
+            "name": MODULE_A_NAME,
+            "module": """
+import "b.js";
+
+export function do_op(request) {
+    return {
+        statusCode: 204
+    };
+}
+""",
+        },
+        {
+            "name": MODULE_B_NAME,
+            "module": """import "a.js";""",
+        },
+    ]
+
+    recursive_bundle = {
+        "metadata": {
+            "endpoints": {
+                "/do_op": {
+                    "get": endpoint_properties(
+                        js_module=MODULE_A_NAME, js_function="do_op"
+                    )
+                }
+            }
+        },
+        "modules": modules,
+    }
+
+    signed_bundle = sign_payload(
+        network.identity(user.local_id), "custom_endpoints", recursive_bundle
+    )
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+    with primary.client() as c:
+        r = c.get("/app/do_op")
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+    return network
+
+
+def test_custom_endpoints_kv_restrictions(network, args):
+    primary, _ = network.find_primary()
+    user = network.users[0]
+
+    module_name = "restrictions.js"
+
+    endpoints = {
+        "/try_read": {
+            "post": endpoint_properties(
+                js_module=module_name,
+                js_function="try_read",
+            )
+        },
+        "/try_write": {
+            "post": endpoint_properties(
+                js_module=module_name,
+                js_function="try_write",
+                mode="readwrite",
+            )
+        },
+        "/try_read_retargeted": {
+            "post": endpoint_properties(
+                js_module=module_name,
+                js_function="try_read_retargeted",
+            )
+        },
+        "/try_read_historical": {
+            "post": endpoint_properties(
+                js_module=module_name,
+                js_function="try_read_historical",
+            )
+        },
+        "/try_read_current_via_historical_handle": {
+            "post": endpoint_properties(
+                js_module=module_name,
+                js_function="try_read_current_via_historical_handle",
+            )
+        },
+    }
+
+    with open(
+        os.path.join(os.path.dirname(__file__), "programmability", "restrictions.js")
+    ) as module_file:
+        module = module_file.read()
+
+    modules = [
+        {
+            "name": module_name,
+            "module": module,
+        }
+    ]
+
+    bundle_with_content = {
+        "metadata": {"endpoints": endpoints},
+        "modules": modules,
+    }
+
+    signed_bundle = sign_payload(
+        network.identity(user.local_id), "custom_endpoints", bundle_with_content
+    )
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+    with primary.client() as c:
+        LOG.info("Custom table names can be read to and written from")
+        r = c.post("/app/try_read", {"table": "my_js_table"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        r = c.post("/app/try_write", {"table": "my_js_table"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+
+        r = c.post("/app/try_read", {"table": "public:my_js_table"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        r = c.post("/app/try_write", {"table": "public:my_js_table"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+
+        LOG.info("'programmability.records' is a read-only table")
+        r = c.post("/app/try_read", {"table": "programmability.records"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        r = c.post("/app/try_write", {"table": "programmability.records"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        LOG.info("'programmability.' is a forbidden namespace")
+        r = c.post("/app/try_read", {"table": "programmability.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+        r = c.post("/app/try_write", {"table": "programmability.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        r = c.post("/app/try_read", {"table": "public:programmability.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+        r = c.post("/app/try_write", {"table": "public:programmability.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        LOG.info("The JS registry's entire table namespace is read-only")
+        for suffix in [
+            "modules",
+            "modules_quickjs_bytecode",
+            "modules_quickjs_version",
+            "metadata",
+            "interpreter_flush",
+            "runtime_options",
+            "recent_actions",
+            "audit.input",
+            "audit.info",
+            "my_table",
+            "nested.table",
+            "",
+        ]:
+            table = f"public:custom_endpoints.{suffix}"
+            r = c.post("/app/try_read", {"table": table})
+            assert r.status_code == http.HTTPStatus.OK.value, (table, r.status_code)
+            r = c.post("/app/try_write", {"table": table})
+            assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, (
+                table,
+                r.status_code,
+            )
+            assert "managed by the endpoint registry" in r.body.text(), r.body.text()
+
+        LOG.info("Tables outside the registry's namespace remain writable")
+        for table in [
+            "public:custom_endpoints",
+            "public:custom_endpoints_other.my_table",
+            "custom_endpoints.my_table",
+        ]:
+            r = c.post("/app/try_write", {"table": table})
+            assert r.status_code == http.HTTPStatus.OK.value, (table, r.status_code)
+
+        LOG.info("Cannot grant access to gov/internal tables")
+        r = c.post("/app/try_read", {"table": "public:ccf.gov.foo"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        r = c.post("/app/try_write", {"table": "public:ccf.gov.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        r = c.post("/app/try_read", {"table": "public:ccf.internal.foo"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        r = c.post("/app/try_write", {"table": "public:ccf.internal.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        LOG.info("Cannot grant access to (hypothetical) private gov/internal tables")
+        r = c.post("/app/try_read", {"table": "ccf.gov.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+        r = c.post("/app/try_write", {"table": "ccf.gov.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        r = c.post("/app/try_read", {"table": "ccf.internal.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+        r = c.post("/app/try_write", {"table": "ccf.internal.foo"})
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        LOG.info("Restrictions cannot be bypassed by re-targeting a method")
+        # Reading via a handle the endpoint _is_ permitted to use must not
+        # grant access to a table it is not
+        r = c.post(
+            "/app/try_read_retargeted",
+            {"table": "my_js_table", "via": "my_js_table"},
+        )
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+        r = c.post(
+            "/app/try_read_retargeted",
+            {"table": "programmability.foo", "via": "my_js_table"},
+        )
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+        r = c.post(
+            "/app/try_read_retargeted",
+            {"table": "ccf.gov.foo", "via": "my_js_table"},
+        )
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+    # Obtain a seqno for the historical queries.
+    with primary.client(user.local_id) as c:
+        r = c.post("/app/try_write", {"table": "my_js_table"})
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        c.wait_for_commit(r)
+        seqno = r.headers[infra.clients.CCF_TX_ID_HEADER].split(".")[1]
+
+    def post_until_available(client, path, body):
+        r = client.post(path, body)
+        end_time = time.time() + 10
+        while (
+            r.status_code == http.HTTPStatus.ACCEPTED.value and time.time() < end_time
+        ):
+            time.sleep(0.5)
+            r = client.post(path, body)
+        return r
+
+    with primary.client() as c:
+        LOG.info("Restrictions confine the historical KV too")
+        r = post_until_available(
+            c, "/app/try_read_historical", {"table": "my_js_table", "seqno": seqno}
+        )
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+
+        for table in ("programmability.foo", "public:programmability.foo"):
+            r = post_until_available(
+                c, "/app/try_read_historical", {"table": table, "seqno": seqno}
+            )
+            assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+        LOG.info("A historical handle cannot be used against the current KV")
+        r = post_until_available(
+            c,
+            "/app/try_read_current_via_historical_handle",
+            {"table": "my_js_table", "seqno": seqno},
+        )
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST.value, r.status_code
+
+    return network
+
+
+def test_custom_endpoints_resizable_body(network, args):
+    """Regression test for a heap over-read in the JS response-body copy path
+    when returning a length-tracking typed array over a resizable ArrayBuffer
+    that was shrunk after the view was constructed. The copy must be clamped
+    against the backing buffer's real current size, not the typed array's
+    stale construction-time byteLength.
+    """
+    primary, _ = network.find_primary()
+    user = network.users[0]
+
+    module_name = "resizable_body.js"
+
+    endpoints = {
+        "/shrunk_body": {
+            "get": endpoint_properties(
+                js_module=module_name,
+                js_function="shrunk_body",
+            )
+        },
+    }
+
+    with open(
+        os.path.join(os.path.dirname(__file__), "programmability", module_name)
+    ) as module_file:
+        module = module_file.read()
+
+    bundle_with_content = {
+        "metadata": {"endpoints": endpoints},
+        "modules": [{"name": module_name, "module": module}],
+    }
+
+    signed_bundle = sign_payload(
+        network.identity(user.local_id), "custom_endpoints", bundle_with_content
+    )
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+    with primary.client() as c:
+        LOG.info("Shrunk resizable buffer: response body clamped to new size")
+        for shrunk in (1, 3, 128):
+            r = c.get(f"/app/shrunk_body?n={shrunk}")
+            assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+            assert len(r.body.data()) == shrunk, (
+                len(r.body.data()),
+                shrunk,
+            )
+            assert all(b == 0xAB for b in r.body.data()), r.body.data()
+
+    return network
+
+
+def test_custom_endpoints_js_options(network, args):
+    primary, _ = network.find_primary()
+
+    # Make user0 admin, so it can install custom endpoints
+    user = network.users[0]
+    network.consortium.set_user_data(
+        primary, user.service_id, user_data={"isAdmin": True}
+    )
+
+    def test_options_patch(c, **kwargs):
+        signed_bundle = sign_payload(
+            network.identity(user.local_id), "runtime_options", {**kwargs}
+        )
+
+        r = c.patch(
+            "/app/custom_endpoints/runtime_options",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+        new_options = r.body.json()
+
+        # Check get returns same updated options
+        get_r = c.get("/app/custom_endpoints/runtime_options")
+        assert get_r.status_code == http.HTTPStatus.OK.value, get_r.status_code
+        get_options = get_r.body.json()
+
+        assert new_options == get_options, f"{new_options} != {get_options}"
+        return new_options
+
+    with primary.client(None, None) as c:
+        r = c.get("/app/custom_endpoints/runtime_options")
+        assert r.status_code == http.HTTPStatus.OK.value, r.status_code
+
+        defaults = r.body.json()
+
+        same = test_options_patch(c)
+        assert same == defaults
+
+        reduced_heap = test_options_patch(c, max_heap_bytes=42)
+        assert reduced_heap == {**defaults, "max_heap_bytes": 42}
+
+        multiple_changes = test_options_patch(
+            c, max_execution_time_ms=5000, max_cached_interpreters=15
+        )
+        assert multiple_changes == {
+            **defaults,
+            "max_heap_bytes": 42,
+            "max_execution_time_ms": 5000,
+            "max_cached_interpreters": 15,
+        }
+
+        assign_and_reset = test_options_patch(
+            c, return_exception_details=True, max_execution_time_ms=None
+        )
+        assert assign_and_reset == {
+            **defaults,
+            "max_heap_bytes": 42,
+            "max_cached_interpreters": 15,
+            "return_exception_details": True,
+        }
+
+        reset_all = test_options_patch(
+            c,
+            max_cached_interpreters=None,
+            return_exception_details=None,
+            max_heap_bytes=None,
+        )
+        assert reset_all == defaults
+
+    return network
+
+
+def test_custom_role_definitions(network, args):
+    primary, _ = network.find_primary()
+    member = network.consortium.get_any_active_member()
+
+    # Assign a role to user0
+    user = network.users[0]
+    network.consortium.set_user_data(
+        primary,
+        user.service_id,
+        user_data={"isAdmin": True, "roles": ["ContentGetter"]},
+    )
+
+    content_endpoint_def = {
+        "get": {
+            "js_module": "test.js",
+            "js_function": "content",
+            "redirection_strategy": "none",
+            "authn_policies": ["user_cert"],
+            "mode": "readonly",
+            "openapi": {},
+        }
+    }
+
+    bundle_with_auth = {
+        "metadata": {"endpoints": {"/content": content_endpoint_def}},
+        "modules": [{"name": "test.js", "module": TESTJS_ROLE}],
+    }
+
+    signed_bundle = sign_payload(
+        network.identity(user.local_id), "custom_endpoints", bundle_with_auth
+    )
+    # Install app with auth/role support
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+    # Add role definition
+    prop = member.propose(
+        primary,
+        proposal(
+            action(
+                "set_role_definition", role="ContentGetter", actions=["/content/read"]
+            )
+        ),
+    )
+    member.vote(primary, prop, ballot_yes)
+
+    # user0 has "ContentGetter" role, which has "/content/read" should be able to access "/content"
+    with primary.client("user0") as c:
+        r = c.get("/app/content")
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        assert r.body.json()["payload"] == "Test content", r.body.json()
+
+    # But user1 does not
+    with primary.client("user1") as c:
+        r = c.get("/app/content")
+        assert r.status_code == http.HTTPStatus.FORBIDDEN, r.status_code
+
+    # And unauthenticated users definitely don't
+    with primary.client() as c:
+        r = c.get("/app/content")
+        assert r.status_code == http.HTTPStatus.UNAUTHORIZED, r.status_code
+
+    # Delete role definition
+    prop = member.propose(
+        primary,
+        proposal(action("set_role_definition", role="ContentGetter", actions=[])),
+    )
+    member.vote(primary, prop, ballot_yes)
+
+    # Now user0 can't access /content anymore
+    with primary.client("user0") as c:
+        r = c.get("/app/content")
+        assert r.status_code == http.HTTPStatus.FORBIDDEN, r.status_code
+
+    # Multiple definitions
+    prop = member.propose(
+        primary,
+        proposal(
+            action(
+                "set_role_definition", role="ContentGetter", actions=["/content/read"]
+            ),
+            action(
+                "set_role_definition",
+                role="AllContentGetter",
+                actions=["/content/read", "/other_content/read"],
+            ),
+        ),
+    )
+    member.vote(primary, prop, ballot_yes)
+
+    bundle_with_auth_both = {
+        "metadata": {
+            "endpoints": {
+                "/content": content_endpoint_def,
+                "/other_content": content_endpoint_def,
+            }
+        },
+        "modules": [{"name": "test.js", "module": TESTJS_ROLE}],
+    }
+
+    signed_bundle = sign_payload(
+        network.identity(user.local_id), "custom_endpoints", bundle_with_auth_both
+    )
+    # Install two endpoints with role auth
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+
+    # Assign the new role to user0
+    user = network.users[0]
+    network.consortium.set_user_data(
+        primary,
+        user.service_id,
+        user_data={"isAdmin": True, "roles": ["ContentGetter", "AllContentGetter"]},
+    )
+
+    # user0 has access both now
+    with primary.client("user0") as c:
+        r = c.get("/app/content")
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        assert r.body.json()["payload"] == "Test content", r.body.json()
+        r = c.get("/app/other_content")
+        assert r.status_code == http.HTTPStatus.OK, r.status_code
+        assert r.body.json()["payload"] == "Test content", r.body.json()
+
+    return network
+
+
+def deploy_npm_app_custom(network, args):
+    primary, _ = network.find_nodes()
+    user = network.users[0]
+
+    app_dir = os.path.join(npm_tests.THIS_DIR, "npm-app")
+
+    LOG.info("Deploying npm app")
+    bundle_path = os.path.join(
+        app_dir, "dist", "bundle.json"
+    )  # Produced by build_npm_app
+
+    with open(bundle_path) as bundle_file:
+        signed_bundle = sign_payload(
+            network.identity(user.local_id),
+            "custom_endpoints",
+            json.load(bundle_file),
+        )
+    with primary.client() as c:
+        r = c.put(
+            "/app/custom_endpoints",
+            body=signed_bundle,
+            headers={"Content-Type": "application/cose"},
+        )
+        assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r.status_code
+        c.wait_for_commit(r)
+
+    return network
+
+
+def run_governance_registry(args):
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        network.start_and_open(args)
+        primary, _ = network.find_primary()
+        module_name = "restrictions.js"
+        with open(
+            os.path.join(os.path.dirname(__file__), "programmability", module_name)
+        ) as module_file:
+            module = module_file.read()
+        bundle = {
+            "metadata": {
+                "endpoints": {
+                    f"/{operation}": {
+                        "post": endpoint_properties(
+                            module_name, operation, mode="readwrite"
+                        )
+                    }
+                    for operation in ("try_read", "try_write")
+                }
+            },
+            "modules": [{"name": module_name, "module": module}],
+        }
+        network.consortium.set_js_app_from_bundle(primary, bundle)
+
+        with primary.client() as c:
+            LOG.info("The governance registry does not reserve application namespaces")
+            for table in (
+                "public:custom_endpoints.modules",
+                "public:custom_endpoints.my_table",
+                "public:custom_endpoints.nested.table",
+                "public:custom_endpoints.",
+                "custom_endpoints.my_table",
+            ):
+                for operation in ("try_read", "try_write"):
+                    r = c.post(f"/app/{operation}", {"table": table})
+                    assert r.status_code == http.HTTPStatus.OK, (
+                        table,
+                        operation,
+                        r.status_code,
+                        r.body.text(),
+                    )
+
+            LOG.info("The governance registry's reassigned tables remain read-only")
+            for table in (
+                "public:ccf.gov.modules",
+                "public:ccf.gov.endpoints",
+                "public:ccf.gov.interpreter.flush",
+                "public:ccf.gov.modules_quickjs_version",
+                "public:ccf.gov.modules_quickjs_bytecode",
+                "public:ccf.gov.js_runtime_options",
+            ):
+                r = c.post("/app/try_read", {"table": table})
+                assert r.status_code == http.HTTPStatus.OK, (table, r.body.text())
+                r = c.post("/app/try_write", {"table": table})
+                assert r.status_code == http.HTTPStatus.BAD_REQUEST, (
+                    table,
+                    r.body.text(),
+                )
+
+
+def run(args):
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        network.start_and_open(args)
+
+        # Make user0 admin, so it can install custom endpoints
+        primary, _ = network.find_nodes()
+        user = network.users[0]
+        network.consortium.set_user_data(
+            primary, user.service_id, user_data={"isAdmin": True}
+        )
+
+        network = test_custom_endpoints(network, args)
+        network = test_custom_endpoints_circular_includes(network, args)
+        network = test_custom_endpoints_kv_restrictions(network, args)
+        network = test_custom_endpoints_resizable_body(network, args)
+        network = test_custom_role_definitions(network, args)
+        network = test_custom_endpoints_js_options(network, args)
+
+        network = npm_tests.build_npm_app(network, args)
+        network = deploy_npm_app_custom(network, args)
+        network = npm_tests.test_npm_app(network, args)
+
+
+if __name__ == "__main__":
+    cr = ConcurrentRunner()
+    jwt_forwarding_timeout_ms = 10000
+
+    cr.add(
+        "programmability",
+        run,
+        package="samples/apps/programmability/programmability",
+        js_app_bundle=None,
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),
+        initial_user_count=2,
+        initial_member_count=1,
+    )
+
+    cr.add(
+        "governance_registry",
+        run_governance_registry,
+        package="js_generic",
+        js_app_bundle=None,
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),
+        initial_user_count=0,
+        initial_member_count=1,
+    )
+
+    cr.add(
+        "auto",
+        jwt_test.run_auto,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        jwt_key_refresh_interval_s=1,
+        issuer_port=12345,
+        forwarding_timeout_ms=jwt_forwarding_timeout_ms,
+    )
+
+    cr.add(
+        "manual",
+        jwt_test.run_manual,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        jwt_key_refresh_interval_s=100000,
+        jwt_key_refresh_max_response_size="4KB",
+        issuer_port=12346,
+        forwarding_timeout_ms=jwt_forwarding_timeout_ms,
+    )
+
+    cr.add(
+        "ca_cert",
+        jwt_test.run_ca_cert,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.max_nodes(cr.args, f=0),
+        forwarding_timeout_ms=jwt_forwarding_timeout_ms,
+    )
+
+    cr.run()

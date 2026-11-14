@@ -7,15 +7,12 @@
 
 namespace ccf
 {
-  namespace
+  inline std::optional<OpenAPISecuritySchema> get_cert_based_security_schema()
   {
-    std::optional<OpenAPISecuritySchema> get_cert_based_security_schema()
-    {
-      // There is currently no OpenAPI-compliant way to describe cert-based TLS
-      // auth, so this policy is not documented. This should change in
-      // OpenAPI3.1: https://github.com/OAI/OpenAPI-Specification/pull/1764
-      return std::nullopt;
-    }
+    // There is currently no OpenAPI-compliant way to describe cert-based TLS
+    // auth, so this policy is not documented. This should change in
+    // OpenAPI3.1: https://github.com/OAI/OpenAPI-Specification/pull/1764
+    return std::nullopt;
   }
 
   struct UserCertAuthnIdentity : public AuthnIdentity
@@ -35,18 +32,23 @@ namespace ccf
     static constexpr auto SECURITY_SCHEME_NAME = "user_cert";
 
     UserCertAuthnPolicy();
-    virtual ~UserCertAuthnPolicy();
+    ~UserCertAuthnPolicy() override;
 
     std::unique_ptr<AuthnIdentity> authenticate(
-      kv::ReadOnlyTx& tx,
+      ccf::kv::ReadOnlyTx& tx,
       const std::shared_ptr<ccf::RpcContext>& ctx,
       std::string& error_reason) override;
 
-    std::optional<OpenAPISecuritySchema> get_openapi_security_schema()
-      const override
+    [[nodiscard]] std::optional<OpenAPISecuritySchema>
+    get_openapi_security_schema() const override
     {
       return get_cert_based_security_schema();
     }
+
+    std::string get_security_scheme_name() override
+    {
+      return SECURITY_SCHEME_NAME;
+    };
   };
 
   struct MemberCertAuthnIdentity : public AuthnIdentity
@@ -64,18 +66,23 @@ namespace ccf
     static constexpr auto SECURITY_SCHEME_NAME = "member_cert";
 
     MemberCertAuthnPolicy();
-    virtual ~MemberCertAuthnPolicy();
+    ~MemberCertAuthnPolicy() override;
 
     std::unique_ptr<AuthnIdentity> authenticate(
-      kv::ReadOnlyTx& tx,
+      ccf::kv::ReadOnlyTx& tx,
       const std::shared_ptr<ccf::RpcContext>& ctx,
       std::string& error_reason) override;
 
-    std::optional<OpenAPISecuritySchema> get_openapi_security_schema()
-      const override
+    [[nodiscard]] std::optional<OpenAPISecuritySchema>
+    get_openapi_security_schema() const override
     {
       return get_cert_based_security_schema();
     }
+
+    std::string get_security_scheme_name() override
+    {
+      return SECURITY_SCHEME_NAME;
+    };
   };
 
   struct NodeCertAuthnIdentity : public AuthnIdentity
@@ -86,15 +93,56 @@ namespace ccf
   class NodeCertAuthnPolicy : public AuthnPolicy
   {
   public:
+    static constexpr auto SECURITY_SCHEME_NAME = "node_cert";
+
     std::unique_ptr<AuthnIdentity> authenticate(
-      kv::ReadOnlyTx& tx,
+      ccf::kv::ReadOnlyTx& tx,
       const std::shared_ptr<ccf::RpcContext>& ctx,
       std::string& error_reason) override;
 
-    std::optional<OpenAPISecuritySchema> get_openapi_security_schema()
-      const override
+    [[nodiscard]] std::optional<OpenAPISecuritySchema>
+    get_openapi_security_schema() const override
     {
       return get_cert_based_security_schema();
     }
+
+    std::string get_security_scheme_name() override
+    {
+      return SECURITY_SCHEME_NAME;
+    };
+  };
+
+  struct AnyCertAuthnIdentity : public AuthnIdentity
+  {
+    // Certificate as a vector of DER-encoded bytes
+    std::vector<uint8_t> cert;
+  };
+
+  class AnyCertAuthnPolicy : public AuthnPolicy
+  {
+  protected:
+    std::unique_ptr<ValidityPeriodsCache> validity_periods;
+
+  public:
+    static constexpr auto SECURITY_SCHEME_NAME = "any_cert";
+
+    AnyCertAuthnPolicy();
+    ~AnyCertAuthnPolicy() override;
+
+    std::unique_ptr<AuthnIdentity> authenticate(
+      ccf::kv::ReadOnlyTx& tx,
+      const std::shared_ptr<ccf::RpcContext>& ctx,
+      std::string& error_reason) override;
+
+    [[nodiscard]] std::optional<OpenAPISecuritySchema>
+    get_openapi_security_schema() const override
+    {
+      return get_cert_based_security_schema();
+    }
+
+    std::string get_security_scheme_name() override
+    {
+      return SECURITY_SCHEME_NAME;
+    };
   };
 }

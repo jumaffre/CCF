@@ -89,6 +89,7 @@ namespace loggingapp
       std::optional<std::string> next_link;
     };
   };
+
   DECLARE_JSON_TYPE(LoggingGetHistoricalRange::Entry);
   DECLARE_JSON_REQUIRED_FIELDS(
     LoggingGetHistoricalRange::Entry, seqno, id, msg);
@@ -97,6 +98,28 @@ namespace loggingapp
   DECLARE_JSON_REQUIRED_FIELDS(LoggingGetHistoricalRange::Out, entries);
   DECLARE_JSON_OPTIONAL_FIELDS_WITH_RENAMES(
     LoggingGetHistoricalRange::Out, next_link, "@nextLink");
+
+  struct LoggingGetCoseEndorsements
+  {
+    struct Out
+    {
+      std::optional<ccf::SerialisedCoseEndorsements> endorsements;
+    };
+  };
+
+  DECLARE_JSON_TYPE(LoggingGetCoseEndorsements::Out);
+  DECLARE_JSON_REQUIRED_FIELDS(LoggingGetCoseEndorsements::Out, endorsements);
+
+  struct LoggingGetCoseSignature
+  {
+    struct Out
+    {
+      ccf::SerialisedCoseSignature cose_signature;
+    };
+  };
+
+  DECLARE_JSON_TYPE(LoggingGetCoseSignature::Out);
+  DECLARE_JSON_REQUIRED_FIELDS(LoggingGetCoseSignature::Out, cose_signature);
 
   // Public record/get
   // Manual schemas, verified then parsed in handler

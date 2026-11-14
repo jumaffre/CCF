@@ -2,14 +2,13 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ccf_deprecated.h"
 #include "ccf/endpoint_context.h"
 #include "ccf/historical_queries_interface.h"
 #include "ccf/node_context.h"
 #include "ccf/tx_id.h"
 #include "ccf/tx_status.h"
 
-namespace kv
+namespace ccf::kv
 {
   class Consensus;
 }
@@ -39,7 +38,31 @@ namespace ccf::historical
   std::optional<ccf::TxID> txid_from_header(
     endpoints::CommandEndpointContext& args);
 
-  enum class HistoricalTxStatus
+  enum class HistoricalQueryErrorCode : uint8_t
+  {
+    InternalError,
+    TransactionPending,
+    TransactionInvalid,
+    TransactionIdMissing,
+    TransactionPartiallyReady,
+  };
+
+  using ErrorHandler = std::function<void(
+    HistoricalQueryErrorCode err,
+    std::string reason,
+    endpoints::EndpointContext& args)>;
+
+  using ReadOnlyErrorHandler = std::function<void(
+    HistoricalQueryErrorCode err,
+    std::string reason,
+    endpoints::ReadOnlyEndpointContext& args)>;
+
+  void default_error_handler(
+    HistoricalQueryErrorCode err,
+    std::string reason,
+    endpoints::CommandEndpointContext& args);
+
+  enum class HistoricalTxStatus : uint8_t
   {
     Error,
     PendingOrUnknown,
@@ -51,43 +74,22 @@ namespace ccf::historical
     ccf::View view, ccf::SeqNo seqno, std::string& error_reason)>;
 
   HistoricalTxStatus is_tx_committed_v2(
-    kv::Consensus* consensus,
+    ccf::kv::Consensus* consensus,
     ccf::View view,
     ccf::SeqNo seqno,
     std::string& error_reason);
 
-  ccf::endpoints::EndpointFunction adapter_v3(
-    const HandleHistoricalQuery& f,
-    ccfapp::AbstractNodeContext& node_context,
-    const CheckHistoricalTxStatus& available,
-    const TxIDExtractor& extractor = txid_from_header);
-
-  ccf::endpoints::ReadOnlyEndpointFunction read_only_adapter_v3(
+  ccf::endpoints::ReadOnlyEndpointFunction read_only_adapter_v4(
     const HandleReadOnlyHistoricalQuery& f,
-    ccfapp::AbstractNodeContext& node_context,
+    ccf::AbstractNodeContext& node_context,
     const CheckHistoricalTxStatus& available,
-    const ReadOnlyTxIDExtractor& extractor = txid_from_header);
+    const ReadOnlyTxIDExtractor& extractor = txid_from_header,
+    const ReadOnlyErrorHandler& ehandler = default_error_handler);
 
-  ccf::endpoints::EndpointFunction read_write_adapter_v3(
+  ccf::endpoints::EndpointFunction read_write_adapter_v4(
     const HandleReadWriteHistoricalQuery& f,
-    ccfapp::AbstractNodeContext& node_context,
+    ccf::AbstractNodeContext& node_context,
     const CheckHistoricalTxStatus& available,
-    const TxIDExtractor& extractor = txid_from_header);
-
-  /// @cond
-  // Doxygen cannot parse these declarations; some combination of a macro,
-  // attribute syntax, and namespaced types results in the following warning
-  // (treated as error):
-  //   Found ';' while parsing initializer list! (doxygen could be confused by a
-  //   macro call without semicolon)
-  // Use label-less cond to unconditionally exclude this block from parsing
-  // until the declarations are removed are removed.
-  CCF_DEPRECATED(
-    "Will be removed in 3.0, switch to ccf::historical::adapter_v3")
-  ccf::endpoints::EndpointFunction adapter_v2(
-    const HandleHistoricalQuery& f,
-    ccfapp::AbstractNodeContext& node_context,
-    const CheckHistoricalTxStatus& available,
-    const TxIDExtractor& extractor = txid_from_header);
-  /// @endcond
+    const TxIDExtractor& extractor = txid_from_header,
+    const ErrorHandler& ehandler = default_error_handler);
 }

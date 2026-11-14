@@ -4,3 +4,11 @@
 #pragma once
 
 #include "kv/raw_serialise.h"
+
+namespace ccf::kv
+{
+  using RawKvStoreSerialiser = GenericSerialiseWrapper<RawWriter>;
+  using SizeKvStoreSerialiser = GenericSerialiseWrapper<SizeWriter>;
+  using SpanKvStoreSerialiser = GenericSerialiseWrapper<SpanWriter>;
+  using RawKvStoreDeserialiser = GenericDeserialiseWrapper<RawReader>;
+}

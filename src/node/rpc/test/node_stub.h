@@ -3,11 +3,13 @@
 #pragma once
 
 #include "ccf/historical_queries_interface.h"
-#include "ccf/node/host_processes_interface.h"
 #include "kv/test/stub_consensus.h"
+#include "node/recovery_decision_protocol.h"
 #include "node/rpc/gov_effects_interface.h"
 #include "node/rpc/node_interface.h"
 #include "node/rpc/node_operation_interface.h"
+
+#include <stdexcept>
 
 namespace ccf
 {
@@ -15,6 +17,8 @@ namespace ccf
   {
   public:
     bool is_public = false;
+    bool can_replicate_result = true;
+    ccf::COSESignaturesConfig cose_signatures_config = {};
 
     ExtendedState state() override
     {
@@ -63,12 +67,17 @@ namespace ccf
 
     bool can_replicate() override
     {
-      return true;
+      return can_replicate_result;
     }
 
-    kv::Version get_last_recovered_signed_idx() override
+    std::optional<ccf::NodeId> get_primary() override
     {
-      return kv::NoVersion;
+      return ccf::kv::test::PrimaryNodeId;
+    }
+
+    ccf::kv::Version get_last_recovered_signed_idx() override
+    {
+      return ccf::kv::NoVersion;
     }
 
     SessionMetrics get_session_metrics() override
@@ -76,79 +85,77 @@ namespace ccf
       return {};
     }
 
-    size_t get_jwt_attempts() override
-    {
-      return 0;
-    }
-
     QuoteVerificationResult verify_quote(
-      kv::ReadOnlyTx& tx,
+      ccf::kv::ReadOnlyTx& tx,
       const QuoteInfo& quote_info,
       const std::vector<uint8_t>& expected_node_public_key_der,
-      pal::PlatformAttestationMeasurement& measurement) override
+      pal::PlatformAttestationMeasurement& measurement,
+      const std::optional<std::vector<uint8_t>>& code_transparent_statement,
+      std::shared_ptr<NetworkIdentitySubsystemInterface>
+        network_identity_subsystem) override
     {
       return QuoteVerificationResult::Verified;
     }
 
-    kv::Version get_startup_snapshot_seqno() override
+    ccf::kv::Version get_startup_snapshot_seqno() override
     {
       return 0;
     }
 
-    void initiate_private_recovery(kv::Tx& tx) override
+    void initiate_private_recovery(ccf::kv::Tx& tx) override
     {
       throw std::logic_error("Unimplemented");
     }
 
-    crypto::Pem get_self_signed_node_certificate() override
+    void trigger_snapshot(ccf::kv::Tx& /*tx*/) override {}
+
+    ccf::crypto::Pem get_self_signed_node_certificate() override
     {
       return {};
     }
+
+    const ccf::COSESignaturesConfig& get_cose_signatures_config() override
+    {
+      return cose_signatures_config;
+    }
+
+    RecoveryDecisionProtocolSubsystem& recovery_decision_protocol() override
+    {
+      throw std::logic_error("Unimplemented");
+    }
+
+    void shuffle_sealed_shares(ccf::kv::Tx& /*tx*/) override {}
   };
 
   class StubGovernanceEffects : public ccf::AbstractGovernanceEffects
   {
   public:
-    void transition_service_to_open(kv::Tx& tx, ServiceIdentities) override
+    void transition_service_to_open(ccf::kv::Tx& tx, ServiceIdentities) override
     {
       return;
     }
 
-    bool rekey_ledger(kv::Tx& tx) override
+    bool rekey_ledger(ccf::kv::Tx& tx) override
     {
       return true;
     }
 
-    void trigger_recovery_shares_refresh(kv::Tx& tx) override
+    void trigger_recovery_shares_refresh(ccf::kv::Tx& tx) override
     {
       return;
     }
 
-    void trigger_ledger_chunk(kv::Tx& tx) override
+    void trigger_ledger_chunk(ccf::kv::Tx& tx) override
     {
       return;
     }
 
-    void trigger_snapshot(kv::Tx& tx) override
+    void trigger_snapshot(ccf::kv::Tx& tx) override
     {
       return;
     }
 
-    void trigger_acme_refresh(
-      kv::Tx& tx,
-      const std::optional<std::vector<std::string>>& interfaces =
-        std::nullopt) override
-    {
-      return;
-    }
-  };
-
-  class StubHostProcesses : public ccf::AbstractHostProcesses
-  {
-  public:
-    void trigger_host_process_launch(
-      const std::vector<std::string>& args,
-      const std::vector<uint8_t>& input) override
+    void shuffle_sealed_shares(ccf::kv::Tx& /*tx*/) override
     {
       return;
     }
@@ -161,9 +168,11 @@ namespace ccf
       historical::ExpiryDuration seconds_until_expiry)
     {}
 
+    void set_soft_cache_limit(historical::CacheSize cache_limit) {}
+
     void track_deletes_on_missing_keys(bool track) {}
 
-    kv::ReadOnlyStorePtr get_store_at(
+    ccf::kv::ReadOnlyStorePtr get_store_at(
       historical::RequestHandle handle,
       ccf::SeqNo seqno,
       historical::ExpiryDuration seconds_until_expiry)
@@ -171,7 +180,7 @@ namespace ccf
       return nullptr;
     }
 
-    kv::ReadOnlyStorePtr get_store_at(
+    ccf::kv::ReadOnlyStorePtr get_store_at(
       historical::RequestHandle handle, ccf::SeqNo seqno)
     {
       return nullptr;
@@ -191,7 +200,7 @@ namespace ccf
       return nullptr;
     }
 
-    std::vector<kv::ReadOnlyStorePtr> get_store_range(
+    std::vector<ccf::kv::ReadOnlyStorePtr> get_store_range(
       historical::RequestHandle handle,
       ccf::SeqNo start_seqno,
       ccf::SeqNo end_seqno,
@@ -200,7 +209,7 @@ namespace ccf
       return {};
     }
 
-    std::vector<kv::ReadOnlyStorePtr> get_store_range(
+    std::vector<ccf::kv::ReadOnlyStorePtr> get_store_range(
       historical::RequestHandle handle,
       ccf::SeqNo start_seqno,
       ccf::SeqNo end_seqno)
@@ -225,7 +234,7 @@ namespace ccf
       return {};
     }
 
-    std::vector<kv::ReadOnlyStorePtr> get_stores_for(
+    std::vector<ccf::kv::ReadOnlyStorePtr> get_stores_for(
       historical::RequestHandle handle,
       const SeqNoCollection& seqnos,
       historical::ExpiryDuration seconds_until_expiry)
@@ -233,7 +242,7 @@ namespace ccf
       return {};
     }
 
-    std::vector<kv::ReadOnlyStorePtr> get_stores_for(
+    std::vector<ccf::kv::ReadOnlyStorePtr> get_stores_for(
       historical::RequestHandle handle, const SeqNoCollection& seqnos)
     {
       return {};
@@ -257,14 +266,19 @@ namespace ccf
     {
       return true;
     }
+
+    size_t get_estimated_store_cache_size()
+    {
+      return 0;
+    }
   };
 
-  struct StubNodeContext : public ccfapp::AbstractNodeContext
+  struct StubNodeContext : public ccf::AbstractNodeContext
   {
   public:
+    ccf::NodeId node_id = ccf::kv::test::PrimaryNodeId;
     std::shared_ptr<StubNodeOperation> node_operation = nullptr;
     std::shared_ptr<StubGovernanceEffects> gov_effects = nullptr;
-    std::shared_ptr<StubHostProcesses> host_processes = nullptr;
     std::shared_ptr<StubNodeStateCache> cache = nullptr;
 
     StubNodeContext()
@@ -275,16 +289,13 @@ namespace ccf
       gov_effects = std::make_shared<StubGovernanceEffects>();
       install_subsystem(gov_effects);
 
-      host_processes = std::make_shared<StubHostProcesses>();
-      install_subsystem(host_processes);
-
       cache = std::make_shared<StubNodeStateCache>();
       install_subsystem(cache);
     }
 
     ccf::NodeId get_node_id() const override
     {
-      return kv::test::PrimaryNodeId;
+      return node_id;
     }
   };
 }

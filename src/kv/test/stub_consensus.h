@@ -5,11 +5,12 @@
 #include "ccf/crypto/symmetric_key.h"
 #include "consensus/aft/impl/state.h"
 #include "kv/kv_types.h"
+#include "kv/store.h"
 
 #include <algorithm>
 #include <iostream>
 
-namespace kv::test
+namespace ccf::kv::test
 {
   static NodeId PrimaryNodeId = std::string("PrimaryNodeId");
   static NodeId FirstBackupNodeId = std::string("FirstBackupNodeId");
@@ -59,7 +60,7 @@ namespace kv::test
       return state == Primary;
     }
 
-    virtual bool is_at_max_capacity() override
+    virtual bool should_apply_backpressure() override
     {
       return false;
     }
@@ -166,14 +167,6 @@ namespace kv::test
       return {committed_txid.view, committed_txid.seqno};
     }
 
-    ccf::SeqNo get_previous_committable_seqno() override
-    {
-      // Since we commit instantly in this stub, we do not distinguish
-      // committable from committed. The last committable thing we saw was
-      // immediately committed, and we store it in committed_txid.
-      return committed_txid.seqno;
-    }
-
     ccf::SeqNo get_committed_seqno() override
     {
       return committed_txid.seqno;
@@ -205,14 +198,13 @@ namespace kv::test
     }
 
     void recv_message(
-      const NodeId& from, const uint8_t* data, size_t size) override
+      const NodeId& from,
+      std::span<const uint8_t> message,
+      std::span<const uint8_t> payload = {}) override
     {}
 
     void add_configuration(
-      ccf::SeqNo seqno,
-      const Configuration::Nodes& conf,
-      const std::unordered_set<NodeId>& learners = {},
-      const std::unordered_set<NodeId>& retired_nodes = {}) override
+      ccf::SeqNo seqno, const Configuration::Nodes& conf) override
     {}
 
     Configuration::Nodes get_latest_configuration_unsafe() const override
@@ -229,6 +221,10 @@ namespace kv::test
     {
       return ConsensusDetails{{}, {}, MembershipState::Active};
     }
+
+    void trace_retired_committed_tx(
+      ccf::SeqNo seqno, const std::vector<NodeId>& node_ids) override
+    {}
 
     void set_last_signature_at(ccf::SeqNo seqno)
     {

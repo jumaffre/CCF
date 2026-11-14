@@ -1,12 +1,13 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.network
-from ccf.ledger import NodeStatus
 import http
 import random
+
+import infra.interfaces
+import infra.net
+import infra.network
 import suite.test_requirements as reqs
-
-
+from ccf.ledger import NodeStatus
 from loguru import logger as LOG
 
 
@@ -17,26 +18,80 @@ def test_primary(network, args):
     with primary.client() as c:
         r = c.head("/node/primary")
         assert r.status_code == http.HTTPStatus.OK.value
+        r = c.get("/node/primary")
+        assert r.status_code == http.HTTPStatus.OK.value
+        r = c.get("/node/backup")
+        assert r.status_code == http.HTTPStatus.NOT_FOUND.value
+        assert r.body.json()["error"]["code"] == "ResourceNotFound"
+        assert r.body.json()["error"]["message"] == "Node is not backup"
 
-    backup = network.find_any_backup()
-    for interface_name in backup.host.rpc_interfaces.keys():
-        with backup.client(interface_name=interface_name) as c:
+    interface_name = "only_exists_on_this_node"
+    extra_interface = infra.interfaces.RPCInterface()
+    extra_interface.parse_from_str("local://localhost")
+
+    host_spec = infra.interfaces.HostSpec()
+    host_spec.rpc_interfaces[interface_name] = extra_interface
+    host_spec.with_args(args)
+
+    new_backup = network.create_node(host_spec)
+    network.join_node(new_backup, args.package, args, from_snapshot=False)
+    network.trust_node(new_backup, args)
+
+    primary_interfaces = primary.host.rpc_interfaces
+    for interface_name in new_backup.host.rpc_interfaces:
+        LOG.info(f"Testing interface {interface_name}")
+        with new_backup.client(interface_name=interface_name) as c:
             r = c.head("/node/primary", allow_redirects=False)
-            assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value
-            primary_interface = primary.host.rpc_interfaces[interface_name]
-            assert (
-                r.headers["location"]
-                == f"https://{primary_interface.public_host}:{primary_interface.public_port}/node/primary"
-            )
-            LOG.info(
-                f'Successfully redirected to {r.headers["location"]} on primary {primary.local_node_id}'
-            )
+
+            if interface_name in primary_interfaces:
+                assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value
+                primary_interface = primary_interfaces[interface_name]
+                assert (
+                    r.headers["location"]
+                    == f"https://{infra.interfaces.make_address(primary_interface.public_host, primary_interface.public_port)}/node/primary"
+                )
+                LOG.info(
+                    f'Successfully redirected to {r.headers["location"]} on primary {primary.local_node_id}'
+                )
+            else:
+                # If there is no matching interface name on the primary, then we cannot redirect and return an error
+                assert r.status_code == http.HTTPStatus.INTERNAL_SERVER_ERROR.value
+
+            r = c.get("/node/primary", allow_redirects=False)
+            assert r.status_code == http.HTTPStatus.NOT_FOUND.value, r
+            assert r.body.json()["error"]["code"] == "ResourceNotFound"
+            assert r.body.json()["error"]["message"] == "Node is not primary"
+
+            r = c.get("/node/backup", allow_redirects=False)
+            assert r.status_code == http.HTTPStatus.OK.value, r
+
+    network.retire_node(primary, new_backup)
+    new_backup.stop()
+
     return network
 
 
 @reqs.description("Network node info")
 @reqs.at_least_n_nodes(2)
 def test_network_node_info(network, args):
+    def check_interfaces(host, interfaces):
+        expected_interfaces = infra.interfaces.HostSpec.to_json(host)
+        actual_interfaces = {
+            name: dict(interface) for name, interface in interfaces.items()
+        }
+        for interface in actual_interfaces.values():
+            if "redirections" in interface:
+                # C++ serialization omits resolvers equal to their defaults.
+                interface["redirections"] = infra.interfaces.RedirectionConfig.to_json(
+                    infra.interfaces.RedirectionConfig.from_json(
+                        interface["redirections"]
+                    )
+                )
+        assert expected_interfaces == actual_interfaces, (
+            expected_interfaces,
+            actual_interfaces,
+        )
+
     primary, backups = network.find_nodes()
 
     all_nodes = [primary, *backups]
@@ -48,7 +103,7 @@ def test_network_node_info(network, args):
         nodes_by_id = {node["node_id"]: node for node in nodes}
         for n in all_nodes:
             node = nodes_by_id[n.node_id]
-            assert infra.interfaces.HostSpec.to_json(n.host) == node["rpc_interfaces"]
+            check_interfaces(n.host, node["rpc_interfaces"])
             del nodes_by_id[n.node_id]
 
         assert nodes_by_id == {}
@@ -56,23 +111,20 @@ def test_network_node_info(network, args):
     # Populate node_infos by calling self
     node_infos = {}
     for node in all_nodes:
-        for interface_name in node.host.rpc_interfaces.keys():
+        for interface_name in node.host.rpc_interfaces:
             primary_interface = primary.host.rpc_interfaces[interface_name]
             with node.client(interface_name=interface_name) as c:
                 r = c.get("/node/network/nodes/self", allow_redirects=False)
                 assert r.status_code == http.HTTPStatus.OK.value
                 body = r.body.json()
                 assert body["node_id"] == node.node_id
-                assert (
-                    infra.interfaces.HostSpec.to_json(node.host)
-                    == body["rpc_interfaces"]
-                )
+                check_interfaces(node.host, body["rpc_interfaces"])
                 assert body["primary"] == (node == primary)
 
                 node_infos[node.node_id] = body
 
     for node in all_nodes:
-        for interface_name in node.host.rpc_interfaces.keys():
+        for interface_name in node.host.rpc_interfaces:
             primary_interface = primary.host.rpc_interfaces[interface_name]
             with node.client(interface_name=interface_name) as c:
                 # HEAD /node/primary is a 200 on the primary, and a redirect (to a 200) elsewhere
@@ -81,7 +133,7 @@ def test_network_node_info(network, args):
                     assert r.status_code == http.HTTPStatus.PERMANENT_REDIRECT.value
                     assert (
                         r.headers["location"]
-                        == f"https://{primary_interface.public_host}:{primary_interface.public_port}/node/primary"
+                        == f"https://{infra.interfaces.make_address(primary_interface.public_host, primary_interface.public_port)}/node/primary"
                     ), r.headers["location"]
                     r = c.head("/node/primary", allow_redirects=True)
                 assert r.status_code == http.HTTPStatus.OK.value
@@ -101,38 +153,35 @@ def test_network_node_info(network, args):
                     body = r.body.json()
                     assert body == node_infos[target_node.node_id]
 
-    # Create a PENDING node and check that /node/network/nodes/self
-    # returns the correct information from configuration
+    # A PENDING node serves transactionless commands, but does not admit
+    # KV-backed requests before its startup state is coherent.
     operator_rpc_interface = "operator_rpc_interface"
-    host = infra.net.expand_localhost()
-    new_node = network.create_node(
-        infra.interfaces.HostSpec(
-            rpc_interfaces={
-                infra.interfaces.PRIMARY_RPC_INTERFACE: infra.interfaces.RPCInterface(
-                    host=host, app_protocol="HTTP2" if args.http2 else "HTTP1"
-                ),
-                operator_rpc_interface: infra.interfaces.RPCInterface(
-                    host=host,
-                    app_protocol="HTTP2" if args.http2 else "HTTP1",
-                    endorsement=infra.interfaces.Endorsement(
-                        authority=infra.interfaces.EndorsementAuthority.Node
-                    ),
-                ),
-            }
-        )
-    )
-    network.join_node(new_node, args.package, args)
+
+    extra_interface = infra.interfaces.RPCInterface()
+    extra_interface.endorsement.authority = infra.interfaces.EndorsementAuthority.Node
+    extra_interface.accepted_endpoints = ["/node/version"]
+
+    host_spec = infra.interfaces.HostSpec()
+    host_spec.rpc_interfaces[operator_rpc_interface] = extra_interface
+    host_spec.with_args(args)
+
+    new_node = network.create_node(host_spec)
+    network.join_node(new_node, args.package, args, from_snapshot=False)
 
     with new_node.client(interface_name=operator_rpc_interface) as c:
-        r = c.get("/node/network/nodes/self", allow_redirects=False)
+        r = c.get("/node/version", allow_redirects=False)
         assert r.status_code == http.HTTPStatus.OK.value
-        body = r.body.json()
-        assert body["node_id"] == new_node.node_id
-        assert (
-            infra.interfaces.HostSpec.to_json(new_node.host) == body["rpc_interfaces"]
+
+        r = c.get("/node/metrics", allow_redirects=False, validate_openapi=False)
+        assert r.status_code == http.HTTPStatus.SERVICE_UNAVAILABLE.value
+
+        r = c.get(
+            "/node/network/nodes/self",
+            allow_redirects=False,
+            validate_openapi=False,
         )
-        assert body["status"] == NodeStatus.PENDING.value
-        assert body["primary"] is False
+        assert r.status_code == http.HTTPStatus.SERVICE_UNAVAILABLE.value
+        assert r.body.json()["error"]["code"] == "FrontendNotOpen"
     new_node.stop()
 
     return network
@@ -142,7 +191,7 @@ def test_network_node_info(network, args):
 def test_node_ids(network, args):
     nodes = network.get_joined_nodes()
     for node in nodes:
-        for _, interface in node.host.rpc_interfaces.items():
+        for interface in node.host.rpc_interfaces.values():
             with node.client() as c:
                 r = c.get(
                     f"/node/network/nodes?host={interface.public_host}&port={interface.public_port}"
@@ -154,23 +203,6 @@ def test_node_ids(network, args):
                 assert info[0]["node_id"] == node.node_id
                 assert info[0]["status"] == NodeStatus.TRUSTED.value
                 assert len(info[0]["rpc_interfaces"]) == len(node.host.rpc_interfaces)
-    return network
-
-
-@reqs.description("Memory usage")
-def test_memory(network, args):
-    primary, _ = network.find_primary()
-    with primary.client() as c:
-        r = c.get("/node/memory")
-        assert r.status_code == http.HTTPStatus.OK.value
-        assert (
-            r.body.json()["peak_allocated_heap_size"]
-            <= r.body.json()["max_total_heap_size"]
-        )
-        assert (
-            r.body.json()["current_allocated_heap_size"]
-            <= r.body.json()["peak_allocated_heap_size"]
-        )
     return network
 
 
@@ -203,14 +235,15 @@ def test_large_messages(network, args):
         metrics_name,
         length,
         *args,
+        path="/node/commit",
         **kwargs,
     ):
         with primary.client("user0") as client:
-            before_errors_count = get_main_interface_errors()[metrics_name]
+            before_errors = get_main_interface_errors()
             # Note: endpoint does not matter as request parsing is done before dispatch
             try:
                 r = client.get(
-                    "/node/commit",
+                    path,
                     *args,
                     **kwargs,
                 )
@@ -218,22 +251,17 @@ def test_large_messages(network, args):
                 # In some cases, the client ends up writing to the now-closed socket first
                 # before reading the server error, resulting in a connection error
                 assert length > threshold
-                assert (
-                    get_main_interface_errors()[metrics_name] == before_errors_count + 1
-                )
             else:
                 if length > threshold:
                     assert r.status_code == expected_status.value
                     assert r.body.json()["error"]["code"] == expected_code
-                    assert (
-                        get_main_interface_errors()[metrics_name]
-                        == before_errors_count + 1
-                    )
                 else:
                     assert r.status_code == http.HTTPStatus.OK.value
-                    assert (
-                        get_main_interface_errors()[metrics_name] == before_errors_count
-                    )
+
+            expected_errors = before_errors.copy()
+            if length > threshold:
+                expected_errors[metrics_name] += 1
+            assert get_main_interface_errors() == expected_errors
 
     def get_sizes(n, http2):
         ns = [n // 2, n - 10, n - 1, n, n + 1, n + 10, n * 2]
@@ -279,6 +307,31 @@ def test_large_messages(network, args):
             headers={long_header: "some header value"},
         )
 
+    if not args.http2:
+        for size in (
+            args.max_http_request_target_size - 1,
+            args.max_http_request_target_size,
+            args.max_http_request_target_size + 1,
+        ):
+            prefix = "/node/commit?padding="
+            if size < len(prefix):
+                LOG.warning(
+                    f"Skipping {size} byte request target: the test endpoint "
+                    f"requires at least {len(prefix)} bytes"
+                )
+                continue
+            target = prefix + "a" * (size - len(prefix))
+            assert len(target) == size
+            LOG.info(f"Verifying cap on request target, sending a {size} byte target")
+            run_large_message_test(
+                args.max_http_request_target_size,
+                http.HTTPStatus.REQUEST_URI_TOO_LONG,
+                "RequestTargetTooLong",
+                "request_target_too_long",
+                len(target),
+                path=target,
+            )
+
     # Note: infra generally inserts extra headers (eg, content type and length, user-agent, accept)
     extra_headers_count = infra.clients.CCFClient.default_impl_type.extra_headers_count(
         args.http2
@@ -300,13 +353,40 @@ def test_large_messages(network, args):
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
         test_primary(network, args)
         test_network_node_info(network, args)
         test_node_ids(network, args)
-        test_memory(network, args)
         test_large_messages(network, args)
         test_readiness(network, args)
+
+
+def run_ipv6(args):
+    assert infra.net.ipv6_loopback_available(), (
+        "IPv6 loopback (::1) is not available; CI enables IPv6 via the "
+        "container --sysctl net.ipv6.conf.*.disable_ipv6=0 (see .github/workflows)"
+    )
+
+    with infra.network.network(
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb, ipv6=True
+    ) as network:
+        network.start_and_open(args)
+
+        primary, _ = network.find_primary()
+        primary_interface = primary.host.rpc_interfaces[
+            infra.interfaces.PRIMARY_RPC_INTERFACE
+        ]
+        assert (
+            ":" in primary_interface.host
+        ), f"Expected IPv6 address, got {primary_interface.host}"
+        LOG.info(f"Confirmed primary is using IPv6 address: {primary_interface.host}")
+
+        _, backups = network.find_nodes()
+        with backups[0].client() as c:
+            r = c.head("/node/primary", allow_redirects=True)
+            assert r.status_code == http.HTTPStatus.OK.value
+
+        test_primary(network, args)

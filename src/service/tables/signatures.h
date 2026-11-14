@@ -3,8 +3,11 @@
 #pragma once
 
 #include "ccf/service/map.h"
+#include "kv/internal_table_names.h"
 #include "node_signature.h"
+#include "service/tables/identity_types.h"
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -20,49 +23,67 @@ namespace ccf
     ccf::SeqNo commit_seqno = 0;
     ccf::View commit_view = 0;
     /// Root of the Merkle Tree as of seqno - 1
-    crypto::Sha256Hash root;
+    ccf::crypto::Sha256Hash root;
     /// Service-endorsed certificate of the node which produced the signature
-    crypto::Pem cert;
+    ccf::crypto::Pem cert;
 
-    PrimarySignature() {}
+    PrimarySignature() = default;
 
-    PrimarySignature(const ccf::NodeId& node_, ccf::SeqNo seqno_) :
-      NodeSignature(node_),
+    PrimarySignature(ccf::NodeId node_, ccf::SeqNo seqno_) :
+      NodeSignature(std::move(node_)),
       seqno(seqno_)
     {}
 
-    PrimarySignature(const crypto::Sha256Hash& root_) : root(root_) {}
+    PrimarySignature(ccf::crypto::Sha256Hash root_) : root(std::move(root_)) {}
 
     PrimarySignature(
       const ccf::NodeId& node_,
       ccf::SeqNo seqno_,
       ccf::View view_,
-      const crypto::Sha256Hash root_,
+      const ccf::crypto::Sha256Hash root_,
       Nonce hashed_nonce_,
       const std::vector<uint8_t>& sig_,
-      const crypto::Pem& cert_) :
+      ccf::crypto::Pem cert_) :
       NodeSignature(sig_, node_, hashed_nonce_),
       seqno(seqno_),
       view(view_),
       root(root_),
-      cert(cert_)
+      cert(std::move(cert_))
     {}
   };
+
   DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(
-    PrimarySignature, NodeSignature)
+    PrimarySignature, NodeSignature);
   DECLARE_JSON_REQUIRED_FIELDS(
-    PrimarySignature, seqno, view, commit_seqno, commit_view, root)
+    PrimarySignature, seqno, view, commit_seqno, commit_view, root);
   DECLARE_JSON_OPTIONAL_FIELDS(PrimarySignature, cert);
 
   // Most recent signature is a single Value in the KV
   using Signatures = ServiceValue<PrimarySignature>;
 
   // Serialised Merkle tree at most recent signature is a single Value in the KV
-  using SerialisedMerkleTree = kv::RawCopySerialisedValue<std::vector<uint8_t>>;
+  using SerialisedMerkleTree =
+    ccf::kv::RawCopySerialisedValue<std::vector<uint8_t>>;
 
-  namespace Tables
+  using CoseSignature = std::vector<uint8_t>;
+  using CoseSignatureMap = std::map<IdentityType, CoseSignature>;
+
+  // One COSE signature per service signing identity. CLASSICAL is 0, so its
+  // key serialises to the same 8 zero bytes as the single-value table which
+  // preceded multiple signing identities.
+  using CoseSignatures = ServiceMap<IdentityType, CoseSignature>;
+
+  inline CoseSignatureMap extract_cose_signatures(
+    const CoseSignatures::Write& writes)
   {
-    static constexpr auto SIGNATURES = "public:ccf.internal.signatures";
-    static constexpr auto SERIALISED_MERKLE_TREE = "public:ccf.internal.tree";
+    CoseSignatureMap signatures;
+    for (const auto& [identity_type, signature] : writes)
+    {
+      if (signature.has_value())
+      {
+        signatures.emplace(identity_type, signature.value());
+      }
+    }
+    return signatures;
   }
 }

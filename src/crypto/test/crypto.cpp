@@ -1,35 +1,55 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 
+#include "ccf/crypto/openssl/openssl_wrappers.h"
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "ccf/crypto/base64.h"
+#include "ccf/crypto/cose_key.h"
+#include "ccf/crypto/ec_key_pair.h"
+#include "ccf/crypto/ecdsa.h"
 #include "ccf/crypto/eddsa_key_pair.h"
 #include "ccf/crypto/entropy.h"
 #include "ccf/crypto/hmac.h"
 #include "ccf/crypto/jwk.h"
-#include "ccf/crypto/key_pair.h"
 #include "ccf/crypto/key_wrap.h"
 #include "ccf/crypto/rsa_key_pair.h"
+#include "ccf/crypto/sha256.h"
 #include "ccf/crypto/symmetric_key.h"
 #include "ccf/crypto/verifier.h"
+#include "ccf/ds/x509_time_fmt.h"
+#include "crypto/cbor_tags.h"
 #include "crypto/certs.h"
+#include "crypto/cose.h"
 #include "crypto/csr.h"
-#include "crypto/openssl/key_pair.h"
+#include "crypto/openssl/cose_verifier.h"
+#include "crypto/openssl/ec_key_pair.h"
+#include "crypto/openssl/ec_public_key.h"
+#include "crypto/openssl/eddsa_public_key.h"
 #include "crypto/openssl/rsa_key_pair.h"
 #include "crypto/openssl/symmetric_key.h"
 #include "crypto/openssl/verifier.h"
 #include "crypto/openssl/x509_time.h"
-#include "ds/x509_time_fmt.h"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <ctime>
 #include <doctest/doctest.h>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
+#include <sys/mman.h>
+#include <tav/cbor.hpp>
+#include <thread>
+#include <utility>
 
 using namespace std;
-using namespace crypto;
+using namespace ccf::crypto;
 
 static const string contents_ =
   "Lorem ipsum dolor sit amet, consectetur adipiscing "
@@ -44,6 +64,127 @@ static const string contents_ =
 
 vector<uint8_t> contents(contents_.begin(), contents_.end());
 
+static const string nested_cert =
+  "MIIV1zCCFL+"
+  "gAwIBAgIBATANBgkqhkiG9w0BAQsFADAzMTEwLwYDVQQDDChodHRwczovL3NoYXJlZGV1czIuZXV"
+  "zMi5hdHRlc3QuYXp1cmUubmV0MCIYDzIwMTkwNTAxMDAwMDAwWhgPMjA1MDEyMzEyMzU5NTlaMDM"
+  "xMTAvBgNVBAMMKGh0dHBzOi8vc2hhcmVkZXVzMi5ldXMyLmF0dGVzdC5henVyZS5uZXQwggEiMA0"
+  "GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDY0GsRB3BdTNXLan5JnuwGPFtV3iJMY0RAm78638L"
+  "Q0LNcgNPoMwQB5VktKhZZxbqhdDzWH7JBa3D6MVb9I+"
+  "AbgUZIvVSdU7xlqTzS2Gi9CTR1tkOj72Wyg6c59d89QvRP0CAe2omlSve0J/"
+  "JFEt0LQyAXW0DKNlsyPxsd7ZmYn0YtMlPm/0TSLmXdLhZljna8zNlpWl/"
+  "HD7T+zm1HNyg8aoisw6df/uS/mPuyKypko2rp8/7gwe8tv+1fIcKRboXNfyZSXDJE3ME/"
+  "dHjFpcG/KTMkxoCIJb9iv9PHJx2ebCxNHuF7VDvyrXYqdiou9RWOD+/f39FYZJsWdo/"
+  "VhfkfAgMBAAGjghLwMIIS7DAJBgNVHRMEAjAAMB0GA1UdDgQWBBRLSJIoQYE9YTEPZ30bgjdlv/"
+  "RNDzAfBgNVHSMEGDAWgBRLSJIoQYE9YTEPZ30bgjdlv/"
+  "RNDzCCEp0GCSsGAQQBgjdpAQSCEo4BAAAAAgAAAH4SAAAAAAAAAwACAAAAAAAKAA8Ak5pyM/"
+  "ecTKmUCg2zlX8GBz6f+cAQUwPfmJD+H0OHgqMAAAAADg4QD///"
+  "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQAAAAAAAAAHAAAAAAAA"
+  "AMG+d2W08VnHBjXWJzQgwpztMaXmeuK7Kha4P/"
+  "IN14L3AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB0ul+"
+  "6IIVxz5nh9xWOZTagW7ts54B+749ql/"
+  "ZKevZLgwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAQAAAAAAAAAAAA"
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAnSkA919"
+  "dcepZaKaCsfznfAwh2Hn98t7XPq5Jdg9cJrQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  "AAyhAAABbJ695qIni/27w8wj0BRxIueJMn4SZTntdR7/"
+  "e+s5ajJc+jMXwish9akKmwKqeRdyX3cDnkAjPvY0AjYi/"
+  "39FZtwI3hoTxkyWE3Vpk8IdKJU+oomqS8snlNp+oT+"
+  "ClCyILcP78X1k0xk5vi2OO44ktNBTyHIVWAKSSdxNj39TBxDg4QD///"
+  "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFQAAAAAAAADnAAAAAAAA"
+  "AB7AKOTzYYZbiudS8D7kBDlbIscxEdPw8/"
+  "tDnGuibpX2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACMT1d115ZQPpYTf3fGioKaAF"
+  "asje1wFAsIGwlEkMV7/"
+  "wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEACgAAAAAAAAAAAAAAAAAAA"
+  "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABvByKZT5Gm6A9i+"
+  "eXoH22RqqvB4tf80tEosVAMAK0h0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaWdf+"
+  "dceUZCkBvD8ZTZQDgzklLWu5NJKI+"
+  "QZb3tC4f7ORUBfklfihcUZXLT3Uc4L8jaXnpDYbMplAIsUMueifCAAAAECAwQFBgcICQoLDA0ODx"
+  "AREhMUFRYXGBkaGxwdHh8FAGIOAAAtLS0tLUJFR0lOIENFUlRJRklDQVRFLS0tLS0KTUlJRTlEQ0"
+  "NCSm1nQXdJQkFnSVZBTkxaR05BSUVTOVN3QVA4ZGFocnlTN0daamVqTUFvR0NDcUdTTTQ5QkFNQw"
+  "pNSEF4SWpBZ0JnTlZCQU1NR1VsdWRHVnNJRk5IV0NCUVEwc2dVR3hoZEdadmNtMGdRMEV4R2pBWU"
+  "JnTlZCQW9NCkVVbHVkR1ZzSUVOdmNuQnZjbUYwYVc5dU1SUXdFZ1lEVlFRSERBdFRZVzUwWVNCRG"
+  "JHRnlZVEVMTUFrR0ExVUUKQ0F3Q1EwRXhDekFKQmdOVkJBWVRBbFZUTUI0WERUSTBNRFF3TmpFMU"
+  "5EZzFNVm9YRFRNeE1EUXdOakUxTkRnMQpNVm93Y0RFaU1DQUdBMVVFQXd3WlNXNTBaV3dnVTBkWU"
+  "lGQkRTeUJEWlhKMGFXWnBZMkYwWlRFYU1CZ0dBMVVFCkNnd1JTVzUwWld3Z1EyOXljRzl5WVhScG"
+  "IyNHhGREFTQmdOVkJBY01DMU5oYm5SaElFTnNZWEpoTVFzd0NRWUQKVlFRSURBSkRRVEVMTUFrR0"
+  "ExVUVCaE1DVlZNd1dUQVRCZ2NxaGtqT1BRSUJCZ2dxaGtqT1BRTUJCd05DQUFRQQpjR2ZYVWpWME"
+  "RJUDJMajNUY0pXaHJCMmhTbmlVYkRoWVVOSWozL1pLelRMcGcwUXBzS1NHbkd5amlYRFo5cEg1Cm"
+  "IzbE1yMndJMFpBbFBRcCsyVVV0bzRJRERqQ0NBd293SHdZRFZSMGpCQmd3Rm9BVWxXOWR6YjBiNG"
+  "VsQVNjblUKOURQT0FWY0wzbFF3YXdZRFZSMGZCR1F3WWpCZ29GNmdYSVphYUhSMGNITTZMeTloY0"
+  "drdWRISjFjM1JsWkhObApjblpwWTJWekxtbHVkR1ZzTG1OdmJTOXpaM2d2WTJWeWRHbG1hV05oZE"
+  "dsdmJpOTJNeTl3WTJ0amNtdy9ZMkU5CmNHeGhkR1p2Y20wbVpXNWpiMlJwYm1jOVpHVnlNQjBHQT"
+  "FVZERnUVdCQlRlWjU1cXR4OEpVMmI4WkFkaTh4aysKQkhReXlUQU9CZ05WSFE4QkFmOEVCQU1DQn"
+  "NBd0RBWURWUjBUQVFIL0JBSXdBRENDQWpzR0NTcUdTSWI0VFFFTgpBUVNDQWl3d2dnSW9NQjRHQ2"
+  "lxR1NJYjRUUUVOQVFFRUVQVndZZHdoWU1HbHB4Z2dOK0xnaDBFd2dnRmxCZ29xCmhraUcrRTBCRF"
+  "FFQ01JSUJWVEFRQmdzcWhraUcrRTBCRFFFQ0FRSUJEakFRQmdzcWhraUcrRTBCRFFFQ0FnSUIKRG"
+  "pBUUJnc3Foa2lHK0UwQkRRRUNBd0lCQXpBUUJnc3Foa2lHK0UwQkRRRUNCQUlCQXpBUkJnc3Foa2"
+  "lHK0UwQgpEUUVDQlFJQ0FQOHdFUVlMS29aSWh2aE5BUTBCQWdZQ0FnRC9NQkFHQ3lxR1NJYjRUUU"
+  "VOQVFJSEFnRUJNQkFHCkN5cUdTSWI0VFFFTkFRSUlBZ0VBTUJBR0N5cUdTSWI0VFFFTkFRSUpBZ0"
+  "VBTUJBR0N5cUdTSWI0VFFFTkFRSUsKQWdFQU1CQUdDeXFHU0liNFRRRU5BUUlMQWdFQU1CQUdDeX"
+  "FHU0liNFRRRU5BUUlNQWdFQU1CQUdDeXFHU0liNApUUUVOQVFJTkFnRUFNQkFHQ3lxR1NJYjRUUU"
+  "VOQVFJT0FnRUFNQkFHQ3lxR1NJYjRUUUVOQVFJUEFnRUFNQkFHCkN5cUdTSWI0VFFFTkFRSVFBZ0"
+  "VBTUJBR0N5cUdTSWI0VFFFTkFRSVJBZ0VOTUI4R0N5cUdTSWI0VFFFTkFRSVMKQkJBT0RnTUQvLz"
+  "hCQUFBQUFBQUFBQUFBTUJBR0NpcUdTSWI0VFFFTkFRTUVBZ0FBTUJRR0NpcUdTSWI0VFFFTgpBUV"
+  "FFQmdCZ2FnQUFBREFQQmdvcWhraUcrRTBCRFFFRkNnRUJNQjRHQ2lxR1NJYjRUUUVOQVFZRUVDVU"
+  "JVNGp5CmZ0cnVoMmNvdGVnQXlOSXdSQVlLS29aSWh2aE5BUTBCQnpBMk1CQUdDeXFHU0liNFRRRU"
+  "5BUWNCQVFIL01CQUcKQ3lxR1NJYjRUUUVOQVFjQ0FRRUFNQkFHQ3lxR1NJYjRUUUVOQVFjREFRRU"
+  "FNQW9HQ0NxR1NNNDlCQU1DQTBrQQpNRVlDSVFDeW9USFpyR3BoSVBnMHczNWJucjJTR3kyMk16T1"
+  "ZGODRONUhTR3JPL3B2d0loQVA4WmxOYW9aV2hBCmhibVIyUzNVSHg1SjFSS216bzIwKzZJWmpuM3"
+  "lScjhaCi0tLS0tRU5EIENFUlRJRklDQVRFLS0tLS0KLS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS"
+  "0tCk1JSUNsakNDQWoyZ0F3SUJBZ0lWQUpWdlhjMjlHK0hwUUVuSjFQUXp6Z0ZYQzk1VU1Bb0dDQ3"
+  "FHU000OUJBTUMKTUdneEdqQVlCZ05WQkFNTUVVbHVkR1ZzSUZOSFdDQlNiMjkwSUVOQk1Sb3dHQV"
+  "lEVlFRS0RCRkpiblJsYkNCRApiM0p3YjNKaGRHbHZiakVVTUJJR0ExVUVCd3dMVTJGdWRHRWdRMn"
+  "hoY21FeEN6QUpCZ05WQkFnTUFrTkJNUXN3CkNRWURWUVFHRXdKVlV6QWVGdzB4T0RBMU1qRXhNRF"
+  "V3TVRCYUZ3MHpNekExTWpFeE1EVXdNVEJhTUhBeElqQWcKQmdOVkJBTU1HVWx1ZEdWc0lGTkhXQ0"
+  "JRUTBzZ1VHeGhkR1p2Y20wZ1EwRXhHakFZQmdOVkJBb01FVWx1ZEdWcwpJRU52Y25CdmNtRjBhVz"
+  "l1TVJRd0VnWURWUVFIREF0VFlXNTBZU0JEYkdGeVlURUxNQWtHQTFVRUNBd0NRMEV4CkN6QUpCZ0"
+  "5WQkFZVEFsVlRNRmt3RXdZSEtvWkl6ajBDQVFZSUtvWkl6ajBEQVFjRFFnQUVOU0IvN3QyMWxYU0"
+  "8KMkN1enB4dzc0ZUpCNzJFeURHZ1c1clhDdHgydFZUTHE2aEtrNnorVWlSWkNucVI3cHNPdmdxRm"
+  "VTeGxtVGxKbAplVG1pMldZejNxT0J1ekNCdURBZkJnTlZIU01FR0RBV2dCUWlaUXpXV3AwMGlmT0"
+  "R0SlZTdjFBYk9TY0dyREJTCkJnTlZIUjhFU3pCSk1FZWdSYUJEaGtGb2RIUndjem92TDJObGNuUn"
+  "BabWxqWVhSbGN5NTBjblZ6ZEdWa2MyVnkKZG1salpYTXVhVzUwWld3dVkyOXRMMGx1ZEdWc1UwZF"
+  "lVbTl2ZEVOQkxtUmxjakFkQmdOVkhRNEVGZ1FVbFc5ZAp6YjBiNGVsQVNjblU5RFBPQVZjTDNsUX"
+  "dEZ1lEVlIwUEFRSC9CQVFEQWdFR01CSUdBMVVkRXdFQi93UUlNQVlCCkFmOENBUUF3Q2dZSUtvWk"
+  "l6ajBFQXdJRFJ3QXdSQUlnWHNWa2kwdytpNlZZR1czVUYvMjJ1YVhlMFlKRGoxVWUKbkErVGpEMW"
+  "FpNWNDSUNZYjFTQW1ENXhrZlRWcHZvNFVveWlTWXhyRFdMbVVSNENJOU5LeWZQTisKLS0tLS1FTk"
+  "QgQ0VSVElGSUNBVEUtLS0tLQotLS0tLUJFR0lOIENFUlRJRklDQVRFLS0tLS0KTUlJQ2p6Q0NBal"
+  "NnQXdJQkFnSVVJbVVNMWxxZE5JbnpnN1NWVXI5UUd6a25CcXd3Q2dZSUtvWkl6ajBFQXdJdwphRE"
+  "VhTUJnR0ExVUVBd3dSU1c1MFpXd2dVMGRZSUZKdmIzUWdRMEV4R2pBWUJnTlZCQW9NRVVsdWRHVn"
+  "NJRU52CmNuQnZjbUYwYVc5dU1SUXdFZ1lEVlFRSERBdFRZVzUwWVNCRGJHRnlZVEVMTUFrR0ExVU"
+  "VDQXdDUTBFeEN6QUoKQmdOVkJBWVRBbFZUTUI0WERURTRNRFV5TVRFd05EVXhNRm9YRFRRNU1USX"
+  "pNVEl6TlRrMU9Wb3dhREVhTUJnRwpBMVVFQXd3UlNXNTBaV3dnVTBkWUlGSnZiM1FnUTBFeEdqQV"
+  "lCZ05WQkFvTUVVbHVkR1ZzSUVOdmNuQnZjbUYwCmFXOXVNUlF3RWdZRFZRUUhEQXRUWVc1MFlTQk"
+  "RiR0Z5WVRFTE1Ba0dBMVVFQ0F3Q1EwRXhDekFKQmdOVkJBWVQKQWxWVE1Ga3dFd1lIS29aSXpqME"
+  "NBUVlJS29aSXpqMERBUWNEUWdBRUM2bkV3TURJWVpPai9pUFdzQ3phRUtpNwoxT2lPU0xSRmhXR2"
+  "pibkJWSmZWbmtZNHUzSWprRFlZTDBNeE80bXFzeVlqbEJhbFRWWXhGUDJzSkJLNXpsS09CCnV6Q0"
+  "J1REFmQmdOVkhTTUVHREFXZ0JRaVpReldXcDAwaWZPRHRKVlN2MUFiT1NjR3JEQlNCZ05WSFI4RV"
+  "N6QkoKTUVlZ1JhQkRoa0ZvZEhSd2N6b3ZMMk5sY25ScFptbGpZWFJsY3k1MGNuVnpkR1ZrYzJWeW"
+  "RtbGpaWE11YVc1MApaV3d1WTI5dEwwbHVkR1ZzVTBkWVVtOXZkRU5CTG1SbGNqQWRCZ05WSFE0RU"
+  "ZnUVVJbVVNMWxxZE5JbnpnN1NWClVyOVFHemtuQnF3d0RnWURWUjBQQVFIL0JBUURBZ0VHTUJJR0"
+  "ExVWRFd0VCL3dRSU1BWUJBZjhDQVFFd0NnWUkKS29aSXpqMEVBd0lEU1FBd1JnSWhBT1cvNVFrUi"
+  "tTOUNpU0RjTm9vd0x1UFJMc1dHZi9ZaTdHU1g5NEJnd1R3ZwpBaUVBNEowbHJIb01zK1hvNW8vc1"
+  "g2TzlRV3hIUkF2WlVHT2RSUTdjdnFSWGFxST0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQoAMA"
+  "0GCSqGSIb3DQEBCwUAA4IBAQAWPfe1yj4TfaxWipdcjCX+"
+  "NBJQtQOvhu6TbkzwWczIkvcCQ8O6dzsnMDFkxVkZ2ZlcsufSaB74VS//3BzOh/PLWpSX/"
+  "TaQHxFKhcK5RxlEq0O/oINnJ7fMhKlrd/hyoD/"
+  "P2bSLej5zdh63JciGxNGXkanchgQ8qNxXhs9oRUJINYYinFfRsD3OzX6dsHLPVshkdOZFpM9DgP2"
+  "QozqQJ1GC4tAKwbktxU0Ai3BecoPFzYVIygGLY1BAGd112C6cktj7YZTWE/"
+  "tCSD+uXWyQieBu5zUN7H/PcxY9VBT/fOkBfaaL+JcpG4/tGrbTTbZUUclzKVQ/5XP6bOa1t6r/"
+  "zN/W";
+
+static const string pem_key_for_nested_cert =
+  "-----BEGIN PUBLIC KEY-----\n"
+  "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2NBrEQdwXUzVy2p+SZ7s\n"
+  "BjxbVd4iTGNEQJu/Ot/C0NCzXIDT6DMEAeVZLSoWWcW6oXQ81h+yQWtw+jFW/SPg\n"
+  "G4FGSL1UnVO8Zak80thovQk0dbZDo+9lsoOnOfXfPUL0T9AgHtqJpUr3tCfyRRLd\n"
+  "C0MgF1tAyjZbMj8bHe2ZmJ9GLTJT5v9E0i5l3S4WZY52vMzZaVpfxw+0/s5tRzco\n"
+  "PGqIrMOnX/7kv5j7sisqZKNq6fP+4MHvLb/tXyHCkW6FzX8mUlwyRNzBP3R4xaXB\n"
+  "vykzJMaAiCW/Yr/TxycdnmwsTR7he1Q78q12KnYqLvUVjg/v39/RWGSbFnaP1YX5\n"
+  "HwIDAQAB\n"
+  "-----END PUBLIC KEY-----\n";
+
 template <typename T>
 void corrupt(T& buf)
 {
@@ -53,58 +194,535 @@ void corrupt(T& buf)
 }
 
 static constexpr CurveID supported_curves[] = {
-  CurveID::SECP384R1, CurveID::SECP256R1, CurveID::SECP256K1};
+  CurveID::SECP384R1, CurveID::SECP256R1};
 
-static constexpr char const* labels[] = {"secp384r1", "secp256r1", "secp256k1"};
+static constexpr char const* labels[] = {"secp384r1", "secp256r1"};
 
-crypto::Pem generate_self_signed_cert(
-  const KeyPairPtr& kp, const std::string& name)
+ccf::crypto::Pem generate_self_signed_cert(
+  const ECKeyPairPtr& kp, const std::string& name)
 {
   constexpr size_t certificate_validity_period_days = 365;
   using namespace std::literals;
   auto valid_from =
-    ds::to_x509_time_string(std::chrono::system_clock::now() - 24h);
+    ccf::ds::to_x509_time_string(ccf::nonstd::SystemClock::now() - 24h);
 
-  return crypto::create_self_signed_cert(
+  return ccf::crypto::create_self_signed_cert(
     kp, name, {}, valid_from, certificate_validity_period_days);
 }
 
-TEST_CASE("Sign, verify, with KeyPair")
+static Pem pem_from_der(
+  const std::string& label, const std::vector<uint8_t>& der)
+{
+  return Pem(fmt::format(
+    "-----BEGIN {0}-----\n{1}\n-----END {0}-----\n", label, b64_from_raw(der)));
+}
+
+TEST_CASE("Check verifier handles nested certs for both PEM and DER inputs")
+{
+  auto cert_der = ccf::crypto::raw_from_b64(nested_cert);
+  auto cert_pem = fmt::format(
+    "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----", nested_cert);
+  auto der_verifier = make_verifier(cert_der);
+  auto pem_verifier = make_verifier(cert_pem);
+  auto pem_key_from_der = der_verifier->public_key_pem();
+  auto pem_key_from_pem = pem_verifier->public_key_pem();
+  CHECK(pem_key_from_der.str() == pem_key_from_pem.str());
+  CHECK(pem_key_from_der.str() == pem_key_for_nested_cert);
+}
+
+TEST_CASE("Verifier rejects unloadable public key")
+{
+  // A certificate can be structurally valid X.509, and so be accepted by
+  // d2i_X509/PEM_read_bio_X509, while the key in its SubjectPublicKeyInfo
+  // cannot be loaded. X509_get_pubkey() then returns nullptr, which must be
+  // reported rather than dereferenced.
+  const auto kp = make_ec_key_pair();
+  auto cert_der = cert_pem_to_der(generate_self_signed_cert(kp, "CN=name"));
+  const auto public_key = kp->public_key_der();
+
+  // The certificate embeds the subject public key verbatim, so it can be
+  // found and modified in the encoded certificate.
+  auto key_in_cert = std::search(
+    cert_der.begin(), cert_der.end(), public_key.begin(), public_key.end());
+  REQUIRE(key_in_cert != cert_der.end());
+  // Invert the last byte of the encoded key, which is the end of the EC
+  // point's y coordinate, so that the point no longer satisfies the curve
+  // equation. The surrounding ASN.1 is untouched, so the certificate still
+  // parses.
+  *(key_in_cert + public_key.size() - 1) ^= 0xff;
+
+  const auto expected_error =
+    doctest::Contains("OpenSSL error loading certificate public key:");
+  CHECK_THROWS_WITH_AS(
+    make_verifier(cert_der), expected_error, std::invalid_argument);
+  CHECK_THROWS_WITH_AS(
+    make_verifier(fmt::format(
+      "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----",
+      b64_from_raw(cert_der))),
+    expected_error,
+    std::invalid_argument);
+}
+
+TEST_CASE("Verifier rejects unsupported public key type")
+{
+  const auto issuer = make_ec_key_pair();
+  const auto issuer_cert = generate_self_signed_cert(issuer, "CN=issuer");
+  const auto [valid_from, valid_to] =
+    make_verifier(issuer_cert)->validity_period();
+  const auto subject = make_eddsa_key_pair(CurveID::CURVE25519);
+  const auto cert_pem = create_endorsed_cert(
+    subject->public_key_pem(),
+    "CN=unsupported key type",
+    {},
+    valid_from,
+    valid_to,
+    issuer->private_key_pem(),
+    issuer_cert);
+
+  CHECK_THROWS_WITH_AS(
+    make_verifier(cert_pem), "unsupported public key type", std::logic_error);
+}
+
+TEST_CASE("Certificate conversions accept any public key type")
+{
+  // cert_der_to_pem() and cert_pem_to_der() only re-encode the certificate,
+  // so unlike make_verifier() they also accept certificates with Ed25519
+  // keys, which the COSE verifiers accept.
+  const auto issuer = make_ec_key_pair();
+  const auto issuer_cert = generate_self_signed_cert(issuer, "CN=issuer");
+  const auto [valid_from, valid_to] =
+    make_verifier(issuer_cert)->validity_period();
+  const auto subject = make_eddsa_key_pair(CurveID::CURVE25519);
+  const auto cert_pem = create_endorsed_cert(
+    subject->public_key_pem(),
+    "CN=Ed25519 subject",
+    {},
+    valid_from,
+    valid_to,
+    issuer->private_key_pem(),
+    issuer_cert);
+  CHECK_THROWS_AS(make_verifier(cert_pem), std::logic_error);
+
+  const auto cert_der = cert_pem_to_der(cert_pem);
+  CHECK(cert_der_to_pem(cert_der).str() == cert_pem.str());
+  CHECK(cert_pem_to_der(cert_der_to_pem(cert_der)) == cert_der);
+  CHECK_THROWS_AS(cert_der_to_pem(cert_pem.raw()), std::invalid_argument);
+  // Pem only checks for a marker, so DER with that marker can reach the helper.
+  auto der_with_pem_marker = cert_der;
+  const std::string pem_marker = "-----BEGIN";
+  der_with_pem_marker.insert(
+    der_with_pem_marker.end(), pem_marker.begin(), pem_marker.end());
+  CHECK_THROWS_AS(
+    cert_pem_to_der(Pem(der_with_pem_marker)), std::invalid_argument);
+  CHECK(COSEKey::from_der_cert(cert_der).kty() == COSEKeyType::OKP);
+
+  // Anything that is not a certificate is still rejected
+  const std::vector<uint8_t> not_a_cert = {'n', 'o', 'p', 'e'};
+  CHECK_THROWS_AS(cert_der_to_pem(not_a_cert), std::invalid_argument);
+  CHECK_THROWS_AS(
+    cert_pem_to_der(Pem(
+      "-----BEGIN CERTIFICATE-----\nbm9wZQ==\n-----END CERTIFICATE-----\n")),
+    std::invalid_argument);
+}
+
+TEST_CASE("Verifier reports certificate properties")
+{
+  const auto issuer = make_ec_key_pair();
+  const auto issuer_cert = generate_self_signed_cert(issuer, "CN=issuer");
+  const auto [valid_from, valid_to] =
+    make_verifier(issuer_cert)->validity_period();
+  const auto endorsed_cert = create_endorsed_cert(
+    make_ec_key_pair()->public_key_pem(),
+    "CN=subject,O=org",
+    {},
+    valid_from,
+    valid_to,
+    issuer->private_key_pem(),
+    issuer_cert);
+
+  // PEM and DER inputs describe the same certificate
+  for (const auto& cert : {issuer_cert, endorsed_cert})
+  {
+    const auto der = cert_pem_to_der(cert);
+    const auto from_pem = make_verifier(cert);
+    const auto from_der = make_unique_verifier(der);
+    CHECK(from_pem->cert_pem() == cert);
+    CHECK(from_der->cert_pem() == cert);
+    CHECK(from_pem->cert_der() == der);
+    CHECK(from_der->cert_der() == der);
+    CHECK(from_pem->subject() == from_der->subject());
+    CHECK(from_pem->serial_number() == from_der->serial_number());
+    CHECK(from_pem->is_self_signed() == from_der->is_self_signed());
+  }
+
+  const auto issuer_verifier = make_verifier(issuer_cert);
+  const auto endorsed_verifier = make_verifier(endorsed_cert);
+  CHECK(issuer_verifier->is_self_signed());
+  CHECK_FALSE(endorsed_verifier->is_self_signed());
+
+  // RDNs are separated by ", "
+  CHECK(issuer_verifier->subject() == "CN=issuer");
+  CHECK(get_subject_name(issuer_cert) == "CN=issuer");
+  CHECK(endorsed_verifier->subject() == "CN=subject, O=org");
+
+  // Serial numbers are random 16-byte integers, printed as upper-case hex
+  for (const auto& serial :
+       {issuer_verifier->serial_number(), endorsed_verifier->serial_number()})
+  {
+    CHECK_FALSE(serial.empty());
+    CHECK(serial.size() <= 32);
+    CHECK(serial.find_first_not_of("0123456789ABCDEF") == std::string::npos);
+  }
+  CHECK(issuer_verifier->serial_number() != endorsed_verifier->serial_number());
+
+  // Fixed certificate, so the exact values are known
+  const auto nested_verifier = make_verifier(raw_from_b64(nested_cert));
+  CHECK(nested_verifier->is_self_signed());
+  CHECK(nested_verifier->serial_number() == "01");
+  // Forward slashes in attribute values are escaped
+  CHECK(
+    nested_verifier->subject() ==
+    "CN=https:\\/\\/sharedeus2.eus2.attest.azure.net");
+}
+
+TEST_CASE("Certificate subject names are copied exactly from DER")
+{
+  using namespace ccf::crypto::OpenSSL;
+
+  // Out of order, repeated type, separator and escaped characters in values
+  const std::vector<std::pair<std::string, std::string>> rdns = {
+    {"O", "Org"},
+    {"CN", "Surname, Name"},
+    {"OU", "https://a.b"},
+    {"OU", "x+y"}};
+  std::vector<uint8_t> subject_der;
+  {
+    Unique_SSL_OBJECT<X509_NAME, X509_NAME_new, X509_NAME_free> name;
+    for (const auto& [type, value] : rdns)
+    {
+      CHECK1(X509_NAME_add_entry_by_txt(
+        name,
+        type.c_str(),
+        MBSTRING_ASC,
+        reinterpret_cast<const unsigned char*>(value.data()),
+        value.size(),
+        -1,
+        0));
+    }
+    const unsigned char* der = nullptr;
+    size_t der_size = 0;
+    CHECK1(X509_NAME_get0_der(name, &der, &der_size));
+    subject_der.assign(der, der + der_size);
+  }
+  const std::string printed =
+    "O=Org, CN=Surname, Name, OU=https:\\/\\/a.b, OU=x\\+y";
+
+  const auto kp = make_ec_key_pair();
+  CHECK_THROWS((void)kp->create_csr(printed, {}));
+
+  constexpr size_t validity_period_days = 365;
+  using namespace std::literals;
+  const auto valid_from =
+    ccf::ds::to_x509_time_string(ccf::nonstd::SystemClock::now() - 24h);
+  const auto self_signed = create_self_signed_cert(
+    kp, subject_der, {}, valid_from, validity_period_days);
+  const auto renewed = create_self_signed_cert(
+    kp,
+    make_verifier(self_signed)->subject_der(),
+    {},
+    valid_from,
+    validity_period_days);
+  const auto issuer = make_ec_key_pair();
+  const auto issuer_cert = generate_self_signed_cert(issuer, "CN=issuer");
+  const auto endorsed = create_endorsed_cert(
+    kp->public_key_pem(),
+    subject_der,
+    {},
+    make_verifier(issuer_cert)->validity_period(),
+    issuer->private_key_pem(),
+    issuer_cert);
+
+  for (const auto& cert : {self_signed, renewed, endorsed})
+  {
+    const auto verifier = make_verifier(cert);
+    CHECK(verifier->subject_der() == subject_der);
+    CHECK(verifier->subject() == printed);
+  }
+  CHECK(make_verifier(endorsed)->verify_certificate({&issuer_cert}));
+
+  // Exactly one DER-encoded Name is accepted
+  const std::vector<uint8_t> not_a_name = {'n', 'o', 'p', 'e'};
+  CHECK_THROWS_AS((void)kp->create_csr(not_a_name, {}), std::invalid_argument);
+  CHECK_THROWS_AS(
+    (void)kp->create_csr(std::vector<uint8_t>{}, {}), std::invalid_argument);
+  auto trailing_byte = subject_der;
+  trailing_byte.push_back(0);
+  CHECK_THROWS_AS(
+    (void)kp->create_csr(trailing_byte, {}), std::invalid_argument);
+}
+
+TEST_CASE("Private PEM imports enforce key family")
+{
+  const auto ec = make_ec_key_pair();
+  const auto rsa = make_rsa_key_pair();
+  const auto ec_pem = ec->private_key_pem();
+  const auto rsa_pem = rsa->private_key_pem();
+  const auto eddsa_pem = make_eddsa_key_pair()->private_key_pem();
+
+  CHECK(make_ec_key_pair(ec_pem)->public_key_der() == ec->public_key_der());
+  CHECK(make_rsa_key_pair(rsa_pem)->public_key_der() == rsa->public_key_der());
+  CHECK(
+    make_ec_key_pair(pem_from_der("EC PRIVATE KEY", ec->private_key_der()))
+      ->public_key_der() == ec->public_key_der());
+  CHECK(
+    make_rsa_key_pair(pem_from_der("RSA PRIVATE KEY", rsa->private_key_der()))
+      ->public_key_der() == rsa->public_key_der());
+  for (const auto& pem : {rsa_pem, eddsa_pem})
+  {
+    CHECK_THROWS_WITH_AS(
+      make_ec_key_pair(pem),
+      "Cannot construct ECKeyPair_OpenSSL from non-EC key",
+      std::logic_error);
+  }
+  for (const auto& pem : {ec_pem, eddsa_pem})
+  {
+    CHECK_THROWS_WITH_AS(
+      make_rsa_key_pair(pem),
+      "Cannot construct RSAKeyPair_OpenSSL from non-RSA key",
+      std::logic_error);
+  }
+}
+
+TEST_CASE("Malformed, wrong-family and unsupported key material is rejected")
+{
+  const auto rsa = make_rsa_key_pair();
+  const auto rsa_der = rsa->public_key_der();
+  const std::vector<uint8_t> garbage = {0xde, 0xad, 0xbe, 0xef};
+  const Pem garbage_pem(
+    "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n");
+
+  CHECK_THROWS_AS(
+    make_ec_public_key(std::span<const uint8_t>(garbage)), std::runtime_error);
+  CHECK_THROWS_AS(make_ec_public_key(rsa_der), std::logic_error);
+  CHECK_THROWS_AS(make_ec_public_key(rsa->public_key_pem()), std::logic_error);
+  CHECK_THROWS_AS(make_rsa_public_key(garbage), std::runtime_error);
+  CHECK_THROWS_AS(make_rsa_public_key(garbage_pem), std::runtime_error);
+  CHECK_THROWS_AS(make_eddsa_public_key(garbage_pem), std::runtime_error);
+  CHECK_THROWS_AS(make_verifier(garbage), std::invalid_argument);
+  CHECK(
+    make_rsa_public_key(rsa_der.data(), rsa_der.size())->public_key_der() ==
+    rsa_der);
+
+  CHECK(ECPublicKey_OpenSSL::get_openssl_group_id(CurveID::NONE) == NID_undef);
+  CHECK_THROWS_AS(
+    ECPublicKey_OpenSSL::get_openssl_group_id(CurveID::CURVE25519),
+    std::logic_error);
+  CHECK_THROWS_AS(
+    EdDSAPublicKey_OpenSSL::get_openssl_group_id(CurveID::NONE),
+    std::logic_error);
+}
+
+TEST_CASE("Reported OpenSSL failures drain the error queue")
+{
+  // OpenSSL queues errors per thread, so an entry left behind by a failure
+  // would be reported by a later, unrelated, failure on this thread.
+  ERR_clear_error();
+  using Failure = std::pair<std::string, std::function<void()>>;
+
+  SUBCASE("Check helpers report the first queued error")
+  {
+    CHECK_THROWS_WITH_AS(
+      OpenSSL::CHECK1(0),
+      "OpenSSL error (rc=0): unknown error",
+      std::runtime_error);
+
+    const std::vector<Failure> checks = {
+      {"OpenSSL error (rc=0): ", []() { OpenSSL::CHECK1(0); }},
+      {"OpenSSL error (rc=2): ", []() { OpenSSL::CHECKEQUAL(1, 2); }},
+      {"OpenSSL error (rc=-1): ", []() { OpenSSL::CHECKPOSITIVE(-1); }},
+      {"OpenSSL error (missing object): ",
+       []() { OpenSSL::CHECKNULL(nullptr); }}};
+    for (const auto& [prefix, fail] : checks)
+    {
+      ERR_raise(ERR_LIB_EVP, EVP_R_BAD_DECRYPT);
+      ERR_raise(ERR_LIB_PEM, PEM_R_NO_START_LINE);
+      const auto expected_message =
+        prefix + "error:03000064:digital envelope routines::bad decrypt";
+      CHECK_THROWS_WITH_AS(
+        fail(), expected_message.c_str(), std::runtime_error);
+      CHECK(ERR_peek_error() == 0);
+    }
+  }
+
+  SUBCASE("Failed key and certificate imports")
+  {
+    const std::vector<uint8_t> garbage = {0xde, 0xad, 0xbe, 0xef};
+    const Pem garbage_public_key(
+      "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n");
+    const Pem garbage_private_key(
+      "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n");
+    const Pem garbage_cert(
+      "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n");
+
+    const std::vector<Failure> imports = {
+      {"EC public key PEM",
+       [&]() { (void)make_ec_public_key(garbage_public_key); }},
+      {"EC public key DER", [&]() { (void)make_ec_public_key(garbage); }},
+      {"RSA public key PEM",
+       [&]() { (void)make_rsa_public_key(garbage_public_key); }},
+      {"RSA public key DER", [&]() { (void)make_rsa_public_key(garbage); }},
+      {"EdDSA public key PEM",
+       [&]() { (void)make_eddsa_public_key(garbage_public_key); }},
+      {"EC key pair PEM",
+       [&]() { (void)make_ec_key_pair(garbage_private_key); }},
+      {"RSA key pair PEM",
+       [&]() { (void)make_rsa_key_pair(garbage_private_key); }},
+      {"EdDSA key pair PEM",
+       [&]() { (void)make_eddsa_key_pair(garbage_private_key); }},
+      {"Certificate DER", [&]() { (void)make_verifier(garbage); }},
+      {"Certificate PEM", [&]() { (void)make_verifier(garbage_cert); }},
+      {"COSE public key PEM",
+       [&]() { (void)make_cose_verifier_from_key(garbage_public_key); }},
+      {"COSE certificate PEM",
+       [&]() { (void)make_cose_verifier_from_pem_cert(garbage_cert); }}};
+    for (const auto& [description, fail] : imports)
+    {
+      INFO(description);
+      CHECK_THROWS(fail());
+      CHECK(ERR_peek_error() == 0);
+    }
+  }
+
+  SUBCASE("Failed signature verification")
+  {
+    const auto ec = make_ec_key_pair();
+    auto ec_signature = ec->sign(contents);
+    corrupt(ec_signature);
+    CHECK_FALSE(ec->verify(contents, ec_signature));
+    CHECK(ERR_peek_error() == 0);
+
+    const auto rsa = make_rsa_key_pair();
+    auto rsa_signature = rsa->sign(contents, MDType::SHA256);
+    corrupt(rsa_signature);
+    CHECK_FALSE(rsa->verify(
+      contents.data(),
+      contents.size(),
+      rsa_signature.data(),
+      rsa_signature.size(),
+      MDType::SHA256));
+    CHECK(ERR_peek_error() == 0);
+
+    const auto eddsa = make_eddsa_key_pair();
+    auto eddsa_signature = eddsa->sign(contents);
+    corrupt(eddsa_signature);
+    CHECK_FALSE(eddsa->verify(contents, eddsa_signature));
+    CHECK(ERR_peek_error() == 0);
+  }
+
+  SUBCASE("PKCS#1 RSA public key import")
+  {
+    // PKCS#1 DER is first tried, and fails to parse, as SubjectPublicKeyInfo.
+    const auto spki = make_rsa_key_pair()->public_key_der();
+    const auto* cursor = spki.data();
+    const OpenSSL::Unique_PKEY decoded(
+      d2i_PUBKEY(nullptr, &cursor, static_cast<long>(spki.size())),
+      EVP_PKEY_free);
+    unsigned char* encoded = nullptr;
+    const auto encoded_size = i2d_PublicKey(decoded, &encoded);
+    REQUIRE(encoded_size > 0);
+    const std::vector<uint8_t> pkcs1(encoded, encoded + encoded_size);
+    OPENSSL_free(encoded);
+
+    CHECK(make_rsa_public_key(pkcs1)->public_key_der() == spki);
+    CHECK(ERR_peek_error() == 0);
+  }
+}
+
+TEST_CASE("Sign, verify, with ECKeyPair")
 {
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    const vector<uint8_t> signature = kp->sign(contents);
-    CHECK(kp->verify(contents, signature));
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    const vector<uint8_t> signature = kp->sign(payload);
+    CHECK(kp->verify(payload, signature));
+    CHECK(kp->verify(
+      payload.data(), payload.size(), signature.data(), signature.size()));
 
-    auto kp2 = make_key_pair(kp->private_key_pem());
-    CHECK(kp2->verify(contents, signature));
+    auto kp2 = make_ec_key_pair(kp->private_key_pem());
+    CHECK(kp2->verify(payload, signature));
 
     // Signatures won't necessarily be identical due to entropy, but should be
     // mutually verifiable
     for (auto i = 0; i < 10; ++i)
     {
-      const auto new_sig = kp2->sign(contents);
-      CHECK(kp->verify(contents, new_sig));
-      CHECK(kp2->verify(contents, new_sig));
+      const auto new_sig = kp2->sign(payload);
+      CHECK(kp->verify(payload, new_sig));
+      CHECK(kp2->verify(payload, new_sig));
     }
   }
 }
 
-TEST_CASE("Sign, verify, with PublicKey")
+TEST_CASE("Sign, verify, with ECKeyPair (P-521, regression for #8428)")
+{
+  // Not part of supported_curves/labels above (shared by many other tests):
+  // some OpenSSL providers (eg - SymCrypt) report a smaller EVP_PKEY_size()
+  // for a P-521 key than the buffer their signing implementation actually
+  // needs, once the private key has been reconstructed from PEM. sign_hash()
+  // must size its buffer from the signing operation itself, not
+  // EVP_PKEY_size(), or signing fails with "output buffer too small".
+  auto kp = make_ec_key_pair(CurveID::SECP521R1);
+  auto kp2 = make_ec_key_pair(kp->private_key_pem());
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+  const vector<uint8_t> signature = kp2->sign(payload);
+  CHECK(kp->verify(payload, signature));
+}
+
+TEST_CASE("Sign, verify, with ECPublicKey")
 {
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    const vector<uint8_t> signature = kp->sign(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    const vector<uint8_t> signature = kp->sign(payload);
 
     const auto public_key = kp->public_key_pem();
-    auto pubk = make_public_key(public_key);
-    CHECK(pubk->verify(contents, signature));
+    auto pubk = make_ec_public_key(public_key);
+    CHECK(pubk->verify(payload, signature));
+  }
+}
+
+TEST_CASE("Public key from a raw EC point")
+{
+  for (const auto curve : supported_curves)
+  {
+    INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
+    auto kp = make_ec_key_pair(curve);
+    const auto nid = ECPublicKey_OpenSSL::get_openssl_group_id(curve);
+    const auto raw = kp->public_key_raw();
+
+    // key_from_raw_ec_point hands over its only reference to the key, so
+    // moving the result into a public key must not leak (checked when this
+    // test runs under LeakSanitizer) and the public key is the sole owner.
+    const auto pubk =
+      std::make_shared<ECPublicKey_OpenSSL>(key_from_raw_ec_point(raw, nid));
+    CHECK(pubk->public_key_der() == kp->public_key_der());
+    CHECK(pubk->get_curve_id() == curve);
+
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    CHECK(pubk->verify(payload, kp->sign(payload)));
+
+    // The raw point is an uncompressed SEC1 encoding, 0x04 || x || y, so
+    // changing its last byte changes y and the point is no longer on the curve
+    const auto coordinate_size = pubk->coordinates().x.size();
+    REQUIRE(raw.size() == 1 + (2 * coordinate_size));
+    REQUIRE(raw.front() == 0x04);
+    auto off_curve = raw;
+    off_curve.back() ^= 0xff;
+    CHECK_THROWS_AS(
+      std::ignore = key_from_raw_ec_point(off_curve, nid), std::runtime_error);
   }
 }
 
@@ -113,14 +731,14 @@ TEST_CASE("Sign, fail to verify with bad signature")
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    vector<uint8_t> signature = kp->sign(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    vector<uint8_t> signature = kp->sign(payload);
 
     const auto public_key = kp->public_key_pem();
-    auto pubk = make_public_key(public_key);
+    auto pubk = make_ec_public_key(public_key);
     corrupt(signature);
-    CHECK_FALSE(pubk->verify(contents, signature));
+    CHECK_FALSE(pubk->verify(payload, signature));
   }
 }
 
@@ -129,14 +747,14 @@ TEST_CASE("Sign, fail to verify with bad contents")
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    vector<uint8_t> signature = kp->sign(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    vector<uint8_t> signature = kp->sign(payload);
 
     const auto public_key = kp->public_key_pem();
-    auto pubk = make_public_key(public_key);
-    corrupt(contents);
-    CHECK_FALSE(pubk->verify(contents, signature));
+    auto pubk = make_ec_public_key(public_key);
+    corrupt(payload);
+    CHECK_FALSE(pubk->verify(payload, signature));
   }
 }
 
@@ -145,14 +763,14 @@ TEST_CASE("Sign, fail to verify with wrong key on correct curve")
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    vector<uint8_t> signature = kp->sign(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    vector<uint8_t> signature = kp->sign(payload);
 
-    auto kp2 = make_key_pair(curve);
+    auto kp2 = make_ec_key_pair(curve);
     const auto public_key = kp2->public_key_pem();
-    auto pubk = make_public_key(public_key);
-    CHECK_FALSE(pubk->verify(contents, signature));
+    auto pubk = make_ec_public_key(public_key);
+    CHECK_FALSE(pubk->verify(payload, signature));
   }
 }
 
@@ -160,19 +778,19 @@ TEST_CASE("Sign, fail to verify with wrong key on wrong curve")
 {
   constexpr size_t num_supported_curves =
     static_cast<size_t>(sizeof(supported_curves) / sizeof(CurveID));
-  for (auto i = 0; i < num_supported_curves; ++i)
+  for (size_t i = 0; i < num_supported_curves; ++i)
   {
     const auto curve = supported_curves[i];
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    vector<uint8_t> signature = kp->sign(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    vector<uint8_t> signature = kp->sign(payload);
 
     const auto wrong_curve = supported_curves[(i + 1) % num_supported_curves];
-    auto kp2 = make_key_pair(wrong_curve);
+    auto kp2 = make_ec_key_pair(wrong_curve);
     const auto public_key = kp2->public_key_pem();
-    auto pubk = make_public_key(public_key);
-    CHECK_FALSE(pubk->verify(contents, signature));
+    auto pubk = make_ec_public_key(public_key);
+    CHECK_FALSE(pubk->verify(payload, signature));
   }
 }
 
@@ -180,11 +798,11 @@ template <typename T, typename S, CurveID CID>
 void run_alt()
 {
   T kp1(CID);
-  vector<uint8_t> contents(contents_.begin(), contents_.end());
-  vector<uint8_t> signature = kp1.sign(contents);
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+  vector<uint8_t> signature = kp1.sign(payload);
 
   S kp2(kp1.public_key_pem());
-  CHECK(kp2.verify(contents, signature));
+  CHECK(kp2.verify(payload, signature));
 }
 
 TEST_CASE("Sign, verify with certificate")
@@ -192,13 +810,13 @@ TEST_CASE("Sign, verify with certificate")
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    const vector<uint8_t> signature = kp->sign(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    const vector<uint8_t> signature = kp->sign(payload);
 
     auto cert = generate_self_signed_cert(kp, "CN=name");
     auto verifier = make_verifier(cert);
-    CHECK(verifier->verify(contents, signature));
+    CHECK(verifier->verify(payload, signature));
   }
 }
 
@@ -207,24 +825,24 @@ TEST_CASE("Sign, verify. Fail to verify with bad contents")
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    const vector<uint8_t> signature = kp->sign(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    const vector<uint8_t> signature = kp->sign(payload);
 
     auto cert = generate_self_signed_cert(kp, "CN=name");
     auto verifier = make_verifier(cert);
-    CHECK(verifier->verify(contents, signature));
-    corrupt(contents);
-    CHECK_FALSE(verifier->verify(contents, signature));
+    CHECK(verifier->verify(payload, signature));
+    corrupt(payload);
+    CHECK_FALSE(verifier->verify(payload, signature));
   }
 }
 
-crypto::HashBytes bad_manual_hash(const std::vector<uint8_t>& data)
+ccf::crypto::HashBytes bad_manual_hash(const std::vector<uint8_t>& data)
 {
   // secp256r1 requires 32-byte hashes, other curves don't care. So use 32 for
   // general hasher
   constexpr auto n = 32;
-  crypto::HashBytes hash(n);
+  ccf::crypto::HashBytes hash(n);
 
   for (size_t i = 0; i < data.size(); ++i)
   {
@@ -234,18 +852,18 @@ crypto::HashBytes bad_manual_hash(const std::vector<uint8_t>& data)
   return hash;
 }
 
-TEST_CASE("Manually hash, sign, verify, with PublicKey")
+TEST_CASE("Manually hash, sign, verify, with ECPublicKey")
 {
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    crypto::HashBytes hash = bad_manual_hash(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    ccf::crypto::HashBytes hash = bad_manual_hash(payload);
     const vector<uint8_t> signature = kp->sign_hash(hash.data(), hash.size());
 
     const auto public_key = kp->public_key_pem();
-    auto pubk = make_public_key(public_key);
+    auto pubk = make_ec_public_key(public_key);
     CHECK(pubk->verify_hash(hash, signature, MDType::SHA256));
     corrupt(hash);
     CHECK_FALSE(pubk->verify_hash(hash, signature, MDType::SHA256));
@@ -257,42 +875,42 @@ TEST_CASE("Manually hash, sign, verify, with certificate")
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
-    vector<uint8_t> contents(contents_.begin(), contents_.end());
-    crypto::HashBytes hash = bad_manual_hash(contents);
+    auto kp = make_ec_key_pair(curve);
+    vector<uint8_t> payload(contents_.begin(), contents_.end());
+    ccf::crypto::HashBytes hash = bad_manual_hash(payload);
     const vector<uint8_t> signature = kp->sign_hash(hash.data(), hash.size());
 
     auto cert = generate_self_signed_cert(kp, "CN=name");
     auto verifier = make_verifier(cert);
     CHECK(verifier->verify_hash(hash, signature, MDType::SHA256));
     corrupt(hash);
-    CHECK_FALSE(verifier->verify(hash, signature, MDType::SHA256));
+    CHECK_FALSE(verifier->verify_hash(hash, signature, MDType::SHA256));
   }
 }
 
-TEST_CASE("Sign, verify, with KeyPair of EdDSA")
+TEST_CASE("Sign, verify, with ECKeyPair of EdDSA")
 {
   constexpr auto curve = "curve25519";
   constexpr auto curve_id = CurveID::CURVE25519;
   INFO("With curve: " << curve);
   auto kp = make_eddsa_key_pair(curve_id);
-  vector<uint8_t> contents(contents_.begin(), contents_.end());
-  const vector<uint8_t> signature = kp->sign(contents);
-  CHECK(kp->verify(contents, signature));
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+  const vector<uint8_t> signature = kp->sign(payload);
+  CHECK(kp->verify(payload, signature));
 }
 
-TEST_CASE("Sign, verify, with PublicKey of EdDSA")
+TEST_CASE("Sign, verify, with ECPublicKey of EdDSA")
 {
   constexpr auto curve = "curve25519";
   constexpr auto curve_id = CurveID::CURVE25519;
   INFO("With curve: " << curve);
   auto kp = make_eddsa_key_pair(curve_id);
-  vector<uint8_t> contents(contents_.begin(), contents_.end());
-  const vector<uint8_t> signature = kp->sign(contents);
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+  const vector<uint8_t> signature = kp->sign(payload);
 
   const auto public_key = kp->public_key_pem();
   auto pubk = make_eddsa_public_key(public_key);
-  CHECK(pubk->verify(contents, signature));
+  CHECK(pubk->verify(payload, signature));
 }
 
 TEST_CASE("Sign, fail to verify with bad signature (EdDSA)")
@@ -301,13 +919,13 @@ TEST_CASE("Sign, fail to verify with bad signature (EdDSA)")
   constexpr auto curve_id = CurveID::CURVE25519;
   INFO("With curve: " << curve);
   auto kp = make_eddsa_key_pair(curve_id);
-  vector<uint8_t> contents(contents_.begin(), contents_.end());
-  vector<uint8_t> signature = kp->sign(contents);
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+  vector<uint8_t> signature = kp->sign(payload);
 
   const auto public_key = kp->public_key_pem();
   auto pubk = make_eddsa_public_key(public_key);
   corrupt(signature);
-  CHECK_FALSE(pubk->verify(contents, signature));
+  CHECK_FALSE(pubk->verify(payload, signature));
 }
 
 TEST_CASE("Sign, fail to verify with bad contents (EdDSA)")
@@ -316,13 +934,13 @@ TEST_CASE("Sign, fail to verify with bad contents (EdDSA)")
   constexpr auto curve_id = CurveID::CURVE25519;
   INFO("With curve: " << curve);
   auto kp = make_eddsa_key_pair(curve_id);
-  vector<uint8_t> contents(contents_.begin(), contents_.end());
-  vector<uint8_t> signature = kp->sign(contents);
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+  vector<uint8_t> signature = kp->sign(payload);
 
   const auto public_key = kp->public_key_pem();
   auto pubk = make_eddsa_public_key(public_key);
-  corrupt(contents);
-  CHECK_FALSE(pubk->verify(contents, signature));
+  corrupt(payload);
+  CHECK_FALSE(pubk->verify(payload, signature));
 }
 
 TEST_CASE("Sign, fail to verify with wrong key on correct curve (EdDSA)")
@@ -331,13 +949,13 @@ TEST_CASE("Sign, fail to verify with wrong key on correct curve (EdDSA)")
   constexpr auto curve_id = CurveID::CURVE25519;
   INFO("With curve: " << curve);
   auto kp = make_eddsa_key_pair(curve_id);
-  vector<uint8_t> contents(contents_.begin(), contents_.end());
-  vector<uint8_t> signature = kp->sign(contents);
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+  vector<uint8_t> signature = kp->sign(payload);
 
   auto kp2 = make_eddsa_key_pair(curve_id);
   const auto public_key = kp2->public_key_pem();
   auto pubk = make_eddsa_public_key(public_key);
-  CHECK_FALSE(pubk->verify(contents, signature));
+  CHECK_FALSE(pubk->verify(payload, signature));
 }
 
 TEST_CASE("base64")
@@ -373,13 +991,13 @@ TEST_CASE("base64url")
 TEST_CASE("Wrap, unwrap with RSAKeyPair")
 {
   size_t input_len = 64;
-  std::vector<uint8_t> input = create_entropy()->random(input_len);
+  std::vector<uint8_t> input = get_entropy()->random(input_len);
 
   INFO("Cannot make RSA key from EC key");
   {
     for (const auto curve : supported_curves)
     {
-      auto rsa_kp = make_key_pair(curve); // EC Key
+      auto rsa_kp = make_ec_key_pair(curve); // EC Key
 
       REQUIRE_THROWS_AS(
         make_rsa_public_key(rsa_kp->public_key_pem()), std::logic_error);
@@ -415,6 +1033,19 @@ TEST_CASE("Wrap, unwrap with RSAKeyPair")
     auto unwrapped = rsa_kp->rsa_oaep_unwrap(wrapped, label);
     REQUIRE(input == unwrapped);
   }
+
+  INFO("Key pair can wrap, and rejects empty labels");
+  {
+    auto rsa_kp = make_rsa_key_pair();
+    REQUIRE(rsa_kp->rsa_oaep_unwrap(rsa_kp->rsa_oaep_wrap(input)) == input);
+    REQUIRE(
+      rsa_kp->rsa_oaep_unwrap(
+        rsa_kp->rsa_oaep_wrap(input.data(), input.size())) == input);
+    const std::vector<uint8_t> empty;
+    REQUIRE_THROWS_AS(rsa_kp->rsa_oaep_wrap(input, empty), std::logic_error);
+    REQUIRE_THROWS_AS(
+      (void)rsa_kp->rsa_oaep_unwrap(input, empty), std::logic_error);
+  }
 }
 
 TEST_CASE("Extract public key from cert")
@@ -422,7 +1053,7 @@ TEST_CASE("Extract public key from cert")
   for (const auto curve : supported_curves)
   {
     INFO("With curve: " << labels[static_cast<size_t>(curve) - 1]);
-    auto kp = make_key_pair(curve);
+    auto kp = make_ec_key_pair(curve);
     auto pk = kp->public_key_der();
     auto cert = generate_self_signed_cert(kp, "CN=name");
     auto cert_der = make_verifier(cert.raw())->cert_der();
@@ -443,7 +1074,13 @@ void create_csr_and_extract_pubk()
 
 TEST_CASE("Extract public key from csr")
 {
-  create_csr_and_extract_pubk<KeyPair_OpenSSL>();
+  create_csr_and_extract_pubk<ECKeyPair_OpenSSL>();
+
+  const auto kp = make_ec_key_pair();
+  const auto csr_der = kp->create_csr_der("CN=name", {});
+  REQUIRE(
+    public_key_pem_from_csr(pem_from_der("CERTIFICATE REQUEST", csr_der)) ==
+    kp->public_key_pem());
 }
 
 template <typename T, typename S>
@@ -475,7 +1112,9 @@ void run_csr(bool corrupt_csr = false)
 
   if (corrupt_csr)
   {
-    REQUIRE_THROWS(kpm.sign_csr(icrt, csr, valid_from, valid_to));
+    REQUIRE_THROWS([&]() {
+      auto discard = kpm.sign_csr(icrt, csr, valid_from, valid_to);
+    }());
     return;
   }
 
@@ -488,79 +1127,169 @@ void run_csr(bool corrupt_csr = false)
 
   std::string valid_from_, valid_to_;
   std::tie(valid_from_, valid_to_) = v.validity_period();
-  REQUIRE(valid_from_.find(valid_from) != std::string::npos);
-  REQUIRE(valid_to_.find(valid_to) != std::string::npos);
+  REQUIRE(valid_from_.contains(valid_from));
+  REQUIRE(valid_to_.contains(valid_to));
 }
 
 TEST_CASE("2-digit years")
 {
   auto time_str = "220405175422Z";
-  auto tp = ds::time_point_from_string(time_str);
-  auto conv = ds::to_x509_time_string(tp);
+  auto tp = ccf::ds::time_point_from_string(time_str);
+  auto conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == std::string("20") + time_str);
 }
 
 TEST_CASE("Non-ASN.1 timepoint formats")
 {
   auto time_str = "2022-04-05 18:53:27";
-  auto tp = ds::time_point_from_string(time_str);
-  auto conv = ds::to_x509_time_string(tp);
+  auto tp = ccf::ds::time_point_from_string(time_str);
+  auto conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220405185327Z");
 
   time_str = "2022-04-05 18:53:27.190380";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220405185327Z");
 
   time_str = "2022-04-05 18:53:27 +03:00";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220405155327Z");
 
   time_str = "2022-04-05 18:53:27 +0300";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220405155327Z");
 
   time_str = "2022-04-05 18:53:27.190380+03:00";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220405155327Z");
 
   time_str = "2022-04-05 18:53:27 -03:00";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220405215327Z");
 
+  time_str = "2026-02-09 05:00:00 -03:30";
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
+  REQUIRE(conv == "20260209083000Z");
+
   time_str = "2022-04-07T10:37:49.567612";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220407103749Z");
 
   time_str = "2022-04-07T10:37:49.567612+03:00";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220407073749Z");
 
   time_str = "2022-04-07T10:37:49.567612Z";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220407103749Z");
 
   time_str = "220425165619+0000";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220425165619Z");
 
   time_str = "220425165619+0200";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220425145619Z");
 
   time_str = "20220425165619-0300";
-  tp = ds::time_point_from_string(time_str);
-  conv = ds::to_x509_time_string(tp);
+  tp = ccf::ds::time_point_from_string(time_str);
+  conv = ccf::ds::to_x509_time_string(tp);
   REQUIRE(conv == "20220425195619Z");
+}
+
+TEST_CASE("Timepoint bounds")
+{
+  // Can handle values beyond bounds of system_clock::time_point
+  {
+    INFO("Beyond system_clock::time_point min");
+    auto time_str = "1677-09-21 00:12:44";
+    auto tp = ccf::ds::time_point_from_string(time_str);
+    auto conv = ccf::ds::to_x509_time_string(tp);
+    REQUIRE(conv == "16770921001244Z");
+
+    time_str = "1677-09-21 00:12:43";
+    tp = ccf::ds::time_point_from_string(time_str);
+    conv = ccf::ds::to_x509_time_string(tp);
+    REQUIRE(conv == "16770921001243Z");
+  }
+
+  {
+    INFO("Beyond system_clock::time_point max");
+    auto time_str = "2262-04-11 23:47:16";
+    auto tp = ccf::ds::time_point_from_string(time_str);
+    auto conv = ccf::ds::to_x509_time_string(tp);
+    REQUIRE(conv == "22620411234716Z");
+
+    time_str = "2262-04-11 23:47:17";
+    tp = ccf::ds::time_point_from_string(time_str);
+    conv = ccf::ds::to_x509_time_string(tp);
+    CHECK(conv == "22620411234717Z");
+  }
+
+  {
+    INFO("Approx ASN.1 format bounds");
+    auto time_str = "9999-12-31 23:59:59";
+    auto tp = ccf::ds::time_point_from_string(time_str);
+    auto conv = ccf::ds::to_x509_time_string(tp);
+    REQUIRE(conv == "99991231235959Z");
+
+    INFO("sscanf variants of near-min value");
+    for (auto near_min_time_str : {
+           "0001-02-03 04:05:06",
+           "0001-02-03 04:05:06.700000 +0:00",
+           "0001-02-03 12:14:06.700000 +8:09",
+           "0001-02-02 19:56:06.700000 -8:09",
+
+           "0001-02-03T04:05:06.700000 +0:00",
+           "0001-02-03T12:14:06.700000 +8:09",
+           "0001-02-02T19:56:06.700000 -8:09",
+
+           "0001-02-03 04:05:06.700000 +00 00",
+           "0001-02-03 12:14:06.700000 +08:09",
+           "0001-02-02 19:56:06.700000 -08:09",
+
+           "00010203040506.700000+0000",
+           "00010203121406.700000+0809",
+           "00010202195606.700000-0809",
+
+           "0001-02-03T04:05:06.700000",
+           "0001-02-03 04:05:06.700000",
+         })
+    {
+      tp = ccf::ds::time_point_from_string(near_min_time_str);
+      conv = ccf::ds::to_x509_time_string(tp);
+      CHECK(conv == "00010203040506Z");
+    }
+  }
+}
+
+TEST_CASE("Invalid times")
+{
+  REQUIRE_THROWS_WITH(
+    ccf::ds::time_point_from_string("hello"),
+    "'hello' does not match any accepted time format");
+
+  REQUIRE_THROWS_WITH(
+    ccf::ds::time_point_from_string("Monday"),
+    "'Monday' does not match any accepted time format");
+
+  REQUIRE_THROWS_WITH(
+    ccf::ds::time_point_from_string("April 1st, 1984"),
+    "'April 1st, 1984' does not match any accepted time format");
+
+  REQUIRE_THROWS_WITH(
+    ccf::ds::time_point_from_string("1111-1111"),
+    "'1111-1111' does not match any accepted time format");
 }
 
 TEST_CASE("Create sign and verify certificates")
@@ -568,7 +1297,7 @@ TEST_CASE("Create sign and verify certificates")
   bool corrupt_csr = false;
   do
   {
-    run_csr<KeyPair_OpenSSL, Verifier_OpenSSL>(corrupt_csr);
+    run_csr<ECKeyPair_OpenSSL, Verifier_OpenSSL>(corrupt_csr);
     corrupt_csr = !corrupt_csr;
   } while (corrupt_csr);
 }
@@ -579,9 +1308,817 @@ static const vector<uint8_t>& get_raw_key()
   return v;
 }
 
+TEST_CASE("AES-GCM context reuse")
+{
+  const std::vector<uint8_t> key(16, 0);
+  const std::vector<uint8_t> iv(12, 0);
+  const std::vector<uint8_t> plain(16, 0);
+  const std::vector<uint8_t> expected_cipher = {
+    0x03,
+    0x88,
+    0xda,
+    0xce,
+    0x60,
+    0xb6,
+    0xa3,
+    0x92,
+    0xf3,
+    0x28,
+    0xc2,
+    0xb9,
+    0x71,
+    0xb2,
+    0xfe,
+    0x78};
+  const uint8_t expected_tag[GCM_SIZE_TAG] = {
+    0xab,
+    0x6e,
+    0x47,
+    0xd4,
+    0x2c,
+    0xec,
+    0x13,
+    0xbd,
+    0xf5,
+    0x3a,
+    0x67,
+    0xb2,
+    0x12,
+    0x57,
+    0xbd,
+    0xdf};
+  auto aes_gcm_key = make_key_aes_gcm(key);
+  auto context = aes_gcm_key->make_context();
+  aes_gcm_key.reset();
+
+  std::vector<uint8_t> cipher;
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  context->encrypt(iv, plain, {}, cipher, tag);
+
+  REQUIRE(cipher == expected_cipher);
+  REQUIRE(std::equal(std::begin(tag), std::end(tag), std::begin(expected_tag)));
+
+  std::vector<uint8_t> decrypted(8, 0xAB);
+  std::array<uint8_t, GCM_SIZE_TAG> invalid_tag;
+  std::copy(std::begin(tag), std::end(tag), invalid_tag.begin());
+  invalid_tag[0] ^= 1;
+  REQUIRE_FALSE(
+    context->decrypt(iv, invalid_tag.data(), cipher, {}, decrypted));
+  REQUIRE(decrypted.empty());
+
+  REQUIRE(context->decrypt(iv, tag, cipher, {}, decrypted));
+  REQUIRE(decrypted == plain);
+
+  const std::vector<uint8_t> second_iv(12, 1);
+  const std::vector<uint8_t> second_plain(31, 0x24);
+  const std::vector<uint8_t> second_aad(7, 0x42);
+  std::vector<uint8_t> reused_context_cipher;
+  uint8_t reused_context_tag[GCM_SIZE_TAG] = {};
+  context->encrypt(
+    second_iv,
+    second_plain,
+    second_aad,
+    reused_context_cipher,
+    reused_context_tag);
+
+  auto fresh_aes_gcm_key = make_key_aes_gcm(key);
+  std::vector<uint8_t> fresh_context_cipher;
+  uint8_t fresh_context_tag[GCM_SIZE_TAG] = {};
+  fresh_aes_gcm_key->encrypt(
+    second_iv,
+    second_plain,
+    second_aad,
+    fresh_context_cipher,
+    fresh_context_tag);
+
+  REQUIRE(reused_context_cipher == fresh_context_cipher);
+  REQUIRE(std::equal(
+    std::begin(reused_context_tag),
+    std::end(reused_context_tag),
+    std::begin(fresh_context_tag)));
+}
+
+TEST_CASE("AES-GCM empty inputs")
+{
+  auto aes_gcm_key = make_key_aes_gcm(get_raw_key());
+  const std::vector<uint8_t> iv(12, 0);
+  const std::vector<uint8_t> aad(8, 0x42);
+  const std::vector<uint8_t> plain(8, 0x24);
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  std::vector<uint8_t> cipher(8, 0xAB);
+  std::vector<uint8_t> decrypted(8, 0xAB);
+
+  aes_gcm_key->encrypt(iv, {}, aad, cipher, tag);
+  REQUIRE(cipher.empty());
+  REQUIRE(aes_gcm_key->decrypt(iv, tag, cipher, aad, decrypted));
+  REQUIRE(decrypted.empty());
+
+  aes_gcm_key->encrypt(iv, plain, {}, cipher, tag);
+  REQUIRE(aes_gcm_key->decrypt(iv, tag, cipher, {}, decrypted));
+  REQUIRE(decrypted == plain);
+
+  REQUIRE_THROWS_AS(
+    aes_gcm_key->encrypt(iv, {}, {}, cipher, tag), std::logic_error);
+
+  const std::vector<uint8_t> empty_key(16, 0);
+  auto empty_aes_gcm_key = make_key_aes_gcm(empty_key);
+  const uint8_t empty_tag[GCM_SIZE_TAG] = {
+    0x58,
+    0xe2,
+    0xfc,
+    0xce,
+    0xfa,
+    0x7e,
+    0x30,
+    0x61,
+    0x36,
+    0x7f,
+    0x1d,
+    0x57,
+    0xa4,
+    0xe7,
+    0x45,
+    0x5a};
+  decrypted.assign(8, 0xAB);
+  REQUIRE(empty_aes_gcm_key->decrypt(iv, empty_tag, {}, {}, decrypted));
+  REQUIRE(decrypted.empty());
+}
+
+TEST_CASE("AES-GCM caller-owned ciphertext")
+{
+  auto key = make_key_aes_gcm(get_raw_key());
+  auto context = key->make_context();
+  const std::vector<uint8_t> iv(12, 0);
+  const std::vector<uint8_t> plain(31, 0x24);
+  const std::vector<uint8_t> aad(7, 0x42);
+  std::vector<uint8_t> expected;
+  uint8_t expected_tag[GCM_SIZE_TAG] = {};
+  key->encrypt(iv, plain, aad, expected, expected_tag);
+
+  std::array<uint8_t, 33> storage = {};
+  storage.front() = 0xAA;
+  storage.back() = 0xBB;
+  auto output = std::span<uint8_t>(storage).subspan(1, plain.size());
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  key->encrypt(iv, plain, aad, output, tag);
+  REQUIRE(std::equal(output.begin(), output.end(), expected.begin()));
+  REQUIRE(std::equal(std::begin(tag), std::end(tag), std::begin(expected_tag)));
+  REQUIRE(storage.front() == 0xAA);
+  REQUIRE(storage.back() == 0xBB);
+
+  context->encrypt(iv, plain, aad, output, tag);
+  REQUIRE(std::equal(output.begin(), output.end(), expected.begin()));
+  REQUIRE(std::equal(std::begin(tag), std::end(tag), std::begin(expected_tag)));
+
+  std::vector<uint8_t> preallocated(plain.size(), 0);
+  auto* original_data = preallocated.data();
+  key->encrypt(iv, plain, aad, preallocated, tag);
+  REQUIRE(preallocated.data() == original_data);
+  REQUIRE(preallocated == expected);
+
+  auto in_place_plain = plain;
+  key->encrypt(
+    iv,
+    std::span<const uint8_t>(in_place_plain),
+    aad,
+    std::span<uint8_t>(in_place_plain),
+    tag);
+  REQUIRE(in_place_plain == expected);
+
+  auto vector_in_place = plain;
+  key->encrypt(
+    iv, std::span<const uint8_t>(vector_in_place), aad, vector_in_place, tag);
+  REQUIRE(vector_in_place == expected);
+
+  REQUIRE_THROWS_AS(
+    key->encrypt(iv, plain, aad, output.first(output.size() - 1), tag),
+    std::logic_error);
+  REQUIRE(storage.front() == 0xAA);
+  REQUIRE(storage.back() == 0xBB);
+
+  std::vector<uint8_t> decrypted;
+  REQUIRE(key->decrypt(iv, tag, output, aad, decrypted));
+  REQUIRE(decrypted == plain);
+  auto bad_aad = aad;
+  bad_aad.front() ^= 1;
+  REQUIRE_FALSE(key->decrypt(iv, tag, output, bad_aad, decrypted));
+
+  std::span<uint8_t> empty_output;
+  key->encrypt(iv, {}, aad, empty_output, tag);
+  REQUIRE(key->decrypt(iv, tag, empty_output, aad, decrypted));
+  REQUIRE(decrypted.empty());
+}
+
+// Implements only KeyAesGcm's pure virtual members, so that its default
+// decryption into caller-owned memory is used
+class VectorOnlyKeyAesGcm : public KeyAesGcm
+{
+private:
+  std::unique_ptr<KeyAesGcm> inner;
+
+public:
+  explicit VectorOnlyKeyAesGcm(std::unique_ptr<KeyAesGcm> inner_) :
+    inner(std::move(inner_))
+  {}
+
+  void encrypt(
+    std::span<const uint8_t> iv,
+    std::span<const uint8_t> plain,
+    std::span<const uint8_t> aad,
+    std::vector<uint8_t>& cipher,
+    uint8_t tag[GCM_SIZE_TAG]) const override
+  {
+    inner->encrypt(iv, plain, aad, cipher, tag);
+  }
+
+  bool decrypt(
+    std::span<const uint8_t> iv,
+    const uint8_t tag[GCM_SIZE_TAG],
+    std::span<const uint8_t> cipher,
+    std::span<const uint8_t> aad,
+    std::vector<uint8_t>& plain) const override
+  {
+    return inner->decrypt(iv, tag, cipher, aad, plain);
+  }
+
+  [[nodiscard]] size_t key_size() const override
+  {
+    return inner->key_size();
+  }
+};
+
+static bool is_zero(std::span<const uint8_t> data)
+{
+  return std::all_of(
+    data.begin(), data.end(), [](uint8_t byte) { return byte == 0; });
+}
+
+static void check_caller_owned_plaintext(const KeyAesGcm& key)
+{
+  const std::vector<uint8_t> iv(12, 0);
+  const std::vector<uint8_t> plain(31, 0x24);
+  const std::vector<uint8_t> aad(7, 0x42);
+  std::vector<uint8_t> cipher;
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  key.encrypt(iv, plain, aad, cipher, tag);
+  std::array<uint8_t, GCM_SIZE_TAG> bad_tag = {};
+  std::copy(std::begin(tag), std::end(tag), bad_tag.begin());
+  bad_tag.front() ^= 1;
+
+  std::array<uint8_t, 33> storage = {};
+  storage.front() = 0xAA;
+  storage.back() = 0xBB;
+  auto output = std::span<uint8_t>(storage).subspan(1, plain.size());
+  REQUIRE(key.decrypt(iv, tag, cipher, aad, output));
+  REQUIRE(std::equal(output.begin(), output.end(), plain.begin()));
+
+  // No unauthenticated plaintext is left in the output
+  REQUIRE_FALSE(key.decrypt(iv, bad_tag.data(), cipher, aad, output));
+  REQUIRE(is_zero(output));
+  REQUIRE(storage.front() == 0xAA);
+  REQUIRE(storage.back() == 0xBB);
+
+  REQUIRE_THROWS_AS(
+    key.decrypt(iv, tag, cipher, aad, output.first(output.size() - 1)),
+    std::logic_error);
+
+  auto in_place_cipher = cipher;
+  REQUIRE(key.decrypt(
+    iv,
+    tag,
+    std::span<const uint8_t>(in_place_cipher),
+    aad,
+    std::span<uint8_t>(in_place_cipher)));
+  REQUIRE(in_place_cipher == plain);
+
+  in_place_cipher = cipher;
+  REQUIRE_FALSE(key.decrypt(
+    iv,
+    bad_tag.data(),
+    std::span<const uint8_t>(in_place_cipher),
+    aad,
+    std::span<uint8_t>(in_place_cipher)));
+  REQUIRE(is_zero(in_place_cipher));
+
+  // An empty ciphertext only authenticates the AAD
+  std::vector<uint8_t> empty_cipher;
+  uint8_t empty_tag[GCM_SIZE_TAG] = {};
+  key.encrypt(iv, {}, aad, empty_cipher, empty_tag);
+  REQUIRE(key.decrypt(iv, empty_tag, {}, aad, std::span<uint8_t>()));
+  auto bad_aad = aad;
+  bad_aad.front() ^= 1;
+  REQUIRE_FALSE(key.decrypt(iv, empty_tag, {}, bad_aad, std::span<uint8_t>()));
+}
+
+TEST_CASE("AES-GCM caller-owned plaintext")
+{
+  SUBCASE("OpenSSL implementation")
+  {
+    auto key = make_key_aes_gcm(get_raw_key());
+    check_caller_owned_plaintext(*key);
+
+    // Nor if decryption fails with an exception, here an invalid IV length
+    const std::vector<uint8_t> iv(12, 0);
+    const std::vector<uint8_t> plain(31, 0x24);
+    std::vector<uint8_t> cipher;
+    uint8_t tag[GCM_SIZE_TAG] = {};
+    key->encrypt(iv, plain, {}, cipher, tag);
+    std::vector<uint8_t> output(cipher.size(), 0xCC);
+    REQUIRE_THROWS(
+      key->decrypt({}, tag, cipher, {}, std::span<uint8_t>(output)));
+    REQUIRE(is_zero(output));
+  }
+
+  SUBCASE("Default implementation")
+  {
+    const VectorOnlyKeyAesGcm key(make_key_aes_gcm(get_raw_key()));
+    check_caller_owned_plaintext(key);
+  }
+}
+
+TEST_CASE("AES-GCM decryption replaces plain, which cipher may alias")
+{
+  auto key = make_key_aes_gcm(get_raw_key());
+  const std::vector<uint8_t> iv(12, 0);
+  const auto plain = get_entropy()->random(100);
+  const std::vector<uint8_t> aad(7, 0x42);
+  std::vector<uint8_t> cipher;
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  key->encrypt(iv, plain, aad, cipher, tag);
+
+  auto vector_in_place = cipher;
+  REQUIRE(key->decrypt(
+    iv, tag, std::span<const uint8_t>(vector_in_place), aad, vector_in_place));
+  REQUIRE(vector_in_place == plain);
+
+  // As for a ciphertext preceded by its header in the same buffer
+  constexpr size_t header_size = 5;
+  std::vector<uint8_t> entry(header_size, 0xAA);
+  entry.insert(entry.end(), cipher.begin(), cipher.end());
+  REQUIRE(key->decrypt(
+    iv, tag, std::span<const uint8_t>(entry).subspan(header_size), aad, entry));
+  REQUIRE(entry == plain);
+}
+
+static void check_gcm_updates(
+  size_t plain_size,
+  size_t aad_size,
+  size_t key_size = 16,
+  size_t iv_length = 12)
+{
+  CAPTURE(plain_size);
+  CAPTURE(aad_size);
+  CAPTURE(key_size);
+  CAPTURE(iv_length);
+  // Must match a single OpenSSL call over the same inputs
+  const std::vector<uint8_t> raw_key(key_size, 0x42);
+  auto key = make_key_aes_gcm(raw_key);
+  const std::vector<uint8_t> iv(iv_length, 0);
+  auto entropy = get_entropy();
+  const auto plain = entropy->random(plain_size);
+  auto aad = entropy->random(aad_size);
+
+  std::vector<uint8_t> expected_cipher(plain.size());
+  uint8_t expected_tag[GCM_SIZE_TAG] = {};
+  {
+    OpenSSL::Unique_EVP_CIPHER_CTX ctx;
+    const auto* algorithm = key_size == 16 ? EVP_aes_128_gcm() :
+      key_size == 24                       ? EVP_aes_192_gcm() :
+                                             EVP_aes_256_gcm();
+    int outl = 0;
+    REQUIRE(
+      EVP_EncryptInit_ex2(ctx, algorithm, raw_key.data(), nullptr, nullptr) ==
+      1);
+    REQUIRE(
+      EVP_CIPHER_CTX_ctrl(
+        ctx, EVP_CTRL_GCM_SET_IVLEN, static_cast<int>(iv.size()), nullptr) ==
+      1);
+    REQUIRE(
+      EVP_EncryptInit_ex2(ctx, nullptr, nullptr, iv.data(), nullptr) == 1);
+    if (!aad.empty())
+    {
+      REQUIRE(
+        EVP_EncryptUpdate(
+          ctx, nullptr, &outl, aad.data(), static_cast<int>(aad.size())) == 1);
+    }
+    if (!plain.empty())
+    {
+      REQUIRE(
+        EVP_EncryptUpdate(
+          ctx,
+          expected_cipher.data(),
+          &outl,
+          plain.data(),
+          static_cast<int>(plain.size())) == 1);
+      REQUIRE(static_cast<size_t>(outl) == plain.size());
+    }
+    uint8_t final[EVP_MAX_BLOCK_LENGTH] = {};
+    REQUIRE(EVP_EncryptFinal_ex(ctx, final, &outl) == 1);
+    REQUIRE(outl == 0);
+    REQUIRE(
+      EVP_CIPHER_CTX_ctrl(
+        ctx, EVP_CTRL_GCM_GET_TAG, GCM_SIZE_TAG, expected_tag) == 1);
+  }
+
+  std::vector<uint8_t> cipher;
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  key->encrypt(iv, plain, aad, cipher, tag);
+  REQUIRE(cipher == expected_cipher);
+  REQUIRE(std::equal(std::begin(tag), std::end(tag), std::begin(expected_tag)));
+
+  std::vector<uint8_t> decrypted;
+  REQUIRE(key->decrypt(iv, tag, cipher, aad, decrypted));
+  REQUIRE(decrypted == plain);
+
+  auto context = key->make_context();
+  REQUIRE(context->decrypt(iv, expected_tag, expected_cipher, aad, decrypted));
+  REQUIRE(decrypted == plain);
+  context->encrypt(iv, plain, aad, cipher, tag);
+  REQUIRE(cipher == expected_cipher);
+  REQUIRE(std::equal(std::begin(tag), std::end(tag), std::begin(expected_tag)));
+  cipher = plain;
+  context->encrypt(iv, cipher, aad, std::span<uint8_t>(cipher), tag);
+  REQUIRE(cipher == expected_cipher);
+  REQUIRE(std::equal(std::begin(tag), std::end(tag), std::begin(expected_tag)));
+
+  tag[GCM_SIZE_TAG - 1] ^= 1;
+  REQUIRE_FALSE(context->decrypt(iv, tag, cipher, aad, decrypted));
+  REQUIRE(decrypted.empty());
+  tag[GCM_SIZE_TAG - 1] ^= 1;
+  if (!cipher.empty())
+  {
+    cipher.back() ^= 1;
+    REQUIRE_FALSE(context->decrypt(iv, tag, cipher, aad, decrypted));
+    REQUIRE(decrypted.empty());
+    cipher.back() ^= 1;
+  }
+  if (!aad.empty())
+  {
+    aad.back() ^= 1;
+    REQUIRE_FALSE(context->decrypt(iv, tag, cipher, aad, decrypted));
+    REQUIRE(decrypted.empty());
+    aad.back() ^= 1;
+  }
+  REQUIRE(context->decrypt(iv, tag, cipher, aad, decrypted));
+  REQUIRE(decrypted == plain);
+}
+
+TEST_CASE("AES-GCM inputs spanning several OpenSSL updates")
+{
+  check_gcm_updates(GCM_MAX_UPDATE_SIZE + 31, GCM_MAX_UPDATE_SIZE + 7);
+}
+
+TEST_CASE("AES-GCM chunk boundaries")
+{
+  for (const auto size :
+       {GCM_MAX_UPDATE_SIZE - 1,
+        GCM_MAX_UPDATE_SIZE,
+        GCM_MAX_UPDATE_SIZE + 1,
+        2 * GCM_MAX_UPDATE_SIZE + 31})
+  {
+    check_gcm_updates(size, 17);
+    check_gcm_updates(17, size);
+  }
+}
+
+TEST_CASE("AES-GCM key IV and block boundaries")
+{
+  for (const size_t key_size : {16, 24, 32})
+  {
+    for (const size_t iv_length : {12, 16})
+    {
+      for (const size_t size : {0, 1, 15, 16, 17, 31, 32, 33})
+      {
+        check_gcm_updates(size, 17, key_size, iv_length);
+        check_gcm_updates(17, size, key_size, iv_length);
+      }
+    }
+  }
+}
+
+TEST_CASE("AES-GCM AAD larger than INT_MAX")
+{
+  // OpenSSL update calls take an int length. The AAD is mapped lazily, so its
+  // untouched zero pages do not use memory.
+  constexpr size_t aad_size = size_t{std::numeric_limits<int>::max()} + 17;
+  auto unmap = [](void* data) { munmap(data, aad_size); };
+  std::unique_ptr<void, decltype(unmap)> mapping(
+    mmap(
+      nullptr,
+      aad_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+      -1,
+      0),
+    unmap);
+  REQUIRE(mapping.get() != MAP_FAILED);
+  std::span<uint8_t> aad(static_cast<uint8_t*>(mapping.get()), aad_size);
+
+  auto key = make_key_aes_gcm(get_raw_key());
+  const std::vector<uint8_t> iv(12, 0);
+  const std::vector<uint8_t> plain(31, 0x24);
+  std::vector<uint8_t> cipher;
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  key->encrypt(iv, plain, aad, cipher, tag);
+
+  std::vector<uint8_t> decrypted;
+  REQUIRE(key->decrypt(iv, tag, cipher, aad, decrypted));
+  REQUIRE(decrypted == plain);
+
+  // Ledger entries, snapshots included, are decrypted through a reusable
+  // context
+  auto context = key->make_context();
+  decrypted.clear();
+  REQUIRE(context->decrypt(iv, tag, cipher, aad, decrypted));
+  REQUIRE(decrypted == plain);
+
+  // The AAD past INT_MAX is authenticated too. Each pass hashes the full 2 GiB,
+  // so no further passes: the other API entry points share this code path.
+  aad.back() ^= 1;
+  REQUIRE_FALSE(key->decrypt(iv, tag, cipher, aad, decrypted));
+  REQUIRE(decrypted.empty());
+}
+
+TEST_CASE("AES-GCM data larger than the GCM limit")
+{
+  // Inaccessible, so the data must be rejected before any byte is read
+  constexpr size_t data_size = GCM_MAX_DATA_SIZE + 1;
+  auto unmap = [](void* data) { munmap(data, data_size); };
+  std::unique_ptr<void, decltype(unmap)> mapping(
+    mmap(
+      nullptr,
+      data_size,
+      PROT_NONE,
+      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+      -1,
+      0),
+    unmap);
+  REQUIRE(mapping.get() != MAP_FAILED);
+  std::span<uint8_t> oversized(static_cast<uint8_t*>(mapping.get()), data_size);
+
+  auto key = make_key_aes_gcm(get_raw_key());
+  const std::vector<uint8_t> iv(12, 0);
+  uint8_t tag[GCM_SIZE_TAG] = {};
+  REQUIRE_THROWS_AS(
+    key->encrypt(iv, oversized, {}, oversized, tag), std::logic_error);
+
+  std::vector<uint8_t> decrypted(8, 0xAB);
+  REQUIRE_FALSE(key->decrypt(iv, tag, oversized, {}, decrypted));
+  REQUIRE(decrypted.empty());
+
+  auto context = key->make_context();
+  REQUIRE_THROWS_AS(
+    context->encrypt(iv, oversized, {}, oversized, tag), std::logic_error);
+  decrypted.assign(8, 0xAB);
+  REQUIRE_FALSE(context->decrypt(iv, tag, oversized, {}, decrypted));
+  REQUIRE(decrypted.empty());
+  const std::vector<uint8_t> plain(31, 0x24);
+  std::vector<uint8_t> cipher;
+  context->encrypt(iv, plain, {}, cipher, tag);
+  REQUIRE(context->decrypt(iv, tag, cipher, {}, decrypted));
+  REQUIRE(decrypted == plain);
+}
+
+namespace
+{
+  // Anonymous mapping whose untouched pages use no memory. With PROT_NONE, any
+  // access faults, so a rejected input is shown never to have been read.
+  struct LazyMapping
+  {
+    void* data = MAP_FAILED;
+    size_t size;
+
+    LazyMapping(size_t size_, int prot) : size(size_)
+    {
+      data = mmap(
+        nullptr,
+        size,
+        prot,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+        -1,
+        0);
+      REQUIRE(data != MAP_FAILED);
+    }
+
+    LazyMapping(const LazyMapping&) = delete;
+    LazyMapping& operator=(const LazyMapping&) = delete;
+
+    ~LazyMapping()
+    {
+      munmap(data, size);
+    }
+
+    std::span<uint8_t> span() const
+    {
+      return {static_cast<uint8_t*>(data), size};
+    }
+  };
+
+  constexpr size_t over_int_max = size_t{std::numeric_limits<int>::max()} + 1;
+}
+
+TEST_CASE("Memory BIO larger than INT_MAX")
+{
+  // BIO_new_mem_buf takes an int length, and reads a negative one as a
+  // NUL-terminated string. Neither constructor reads the buffer, so the
+  // in-range size is accepted without any page being touched.
+  LazyMapping mapping(over_int_max, PROT_NONE);
+  const auto oversized = mapping.span();
+  REQUIRE_THROWS_AS(
+    OpenSSL::Unique_BIO(std::span<const uint8_t>(oversized)),
+    std::invalid_argument);
+  REQUIRE_THROWS_AS(
+    OpenSSL::Unique_BIO(oversized.data(), oversized.size()),
+    std::invalid_argument);
+
+  const auto largest = oversized.first(over_int_max - 1);
+  REQUIRE_NOTHROW(OpenSSL::Unique_BIO(std::span<const uint8_t>(largest)));
+  REQUIRE_NOTHROW(OpenSSL::Unique_BIO(largest.data(), largest.size()));
+}
+
+TEST_CASE("AES key wrap inputs larger than INT_MAX")
+{
+  // The single EVP update call takes an int length, so an input of
+  // 2^32 + n bytes would wrap to the same n-byte prefix
+  LazyMapping mapping(over_int_max, PROT_NONE);
+  const auto oversized = mapping.span();
+  auto ossl = std::make_unique<KeyAesGcm_OpenSSL>(get_raw_key());
+
+  // The wrapped output must also fit, so the input limit is a little lower
+  REQUIRE_THROWS_AS(
+    (void)ossl->ckm_aes_key_wrap_pad(
+      oversized.first(AES_KEY_WRAP_PAD_MAX_SIZE + 1)),
+    std::logic_error);
+  REQUIRE_THROWS_AS(
+    (void)ossl->ckm_aes_key_unwrap_pad(oversized), std::logic_error);
+
+  const std::vector<uint8_t> key_to_wrap(17, 0x42);
+  REQUIRE(
+    ossl->ckm_aes_key_unwrap_pad(ossl->ckm_aes_key_wrap_pad(key_to_wrap)) ==
+    key_to_wrap);
+}
+
+TEST_CASE("Entropy larger than INT_MAX")
+{
+  // RAND_bytes takes an int length, so 2^32 + n bytes would fill only an
+  // n-byte prefix yet report success. INT_MAX + 1 is the smallest size that
+  // is not representable.
+  //
+  // Unlike the other oversized-input tests, this one cannot use an
+  // inaccessible mapping: the fix is that every byte is written, so every
+  // page is committed. It costs about 2 GiB of transient memory and a second
+  // or two of DRBG output on a modern machine. That is a known, accepted
+  // cost: the alternative, a fake RAND provider which records the length,
+  // would not exercise OpenSSL and so would not have caught the defect.
+  LazyMapping mapping(over_int_max, PROT_READ | PROT_WRITE);
+  const auto data = mapping.span();
+  get_entropy()->random(data.data(), data.size());
+
+  // All-zero would mean the end of the buffer was never written to
+  const auto tail = data.last(16);
+  REQUIRE(
+    std::any_of(tail.begin(), tail.end(), [](uint8_t b) { return b != 0; }));
+}
+
+TEST_CASE("Base64 text larger than INT_MAX")
+{
+  // Decoding is a single update call taking an int length, so the input is
+  // rejected without being read. Encoding is chunked, so it is not limited.
+  LazyMapping mapping(over_int_max, PROT_NONE);
+  const auto oversized = mapping.span();
+  REQUIRE_THROWS_AS(
+    (void)raw_from_b64(std::string_view(
+      reinterpret_cast<const char*>(oversized.data()), oversized.size())),
+    std::invalid_argument);
+}
+
+TEST_CASE("Base64 inputs spanning several encoded lines")
+{
+  // OpenSSL breaks encoded output into 64-character lines, removed on return
+  for (size_t length = 40; length < 300; length += 7)
+  {
+    std::vector<uint8_t> raw(length);
+    std::generate(raw.begin(), raw.end(), rand);
+
+    const auto encoded = b64_from_raw(raw.data(), raw.size());
+    REQUIRE(encoded.find('\n') == std::string::npos);
+    REQUIRE(encoded.size() == (length + 2) / 3 * 4);
+    REQUIRE(raw_from_b64(encoded) == raw);
+  }
+}
+
+TEST_CASE("Other OpenSSL int lengths larger than INT_MAX")
+{
+  LazyMapping mapping(over_int_max, PROT_NONE);
+  const auto oversized = mapping.span();
+
+  INFO("RSA-OAEP label");
+  {
+    auto rsa_kp = make_rsa_key_pair();
+    const std::vector<uint8_t> input(16, 0x24);
+    REQUIRE_THROWS_AS(
+      (void)rsa_kp->rsa_oaep_wrap(
+        input.data(), input.size(), oversized.data(), oversized.size()),
+      std::invalid_argument);
+  }
+
+  INFO("ECDSA signature components");
+  {
+    const std::vector<uint8_t> small(1, 0x01);
+    REQUIRE_THROWS_AS(
+      (void)ecdsa_sig_from_r_s(
+        oversized.data(), oversized.size(), small.data(), small.size(), true),
+      std::invalid_argument);
+    REQUIRE_THROWS_AS(
+      (void)ecdsa_sig_from_r_s(
+        small.data(), small.size(), oversized.data(), oversized.size(), false),
+      std::invalid_argument);
+  }
+
+  INFO("RSA key size");
+  {
+    REQUIRE_THROWS_AS(
+      (void)make_rsa_key_pair(over_int_max), std::invalid_argument);
+  }
+}
+
+TEST_CASE("Const GCM header serialisation")
+{
+  StandardGcmHeader header;
+  std::iota(std::begin(header.tag), std::end(header.tag), 0);
+  std::iota(header.iv.begin(), header.iv.end(), GCM_SIZE_TAG);
+  const auto& const_header = header;
+
+  std::vector<uint8_t> expected(const_header.serialised_size());
+  std::iota(expected.begin(), expected.end(), 0);
+  REQUIRE(const_header.serialise() == expected);
+
+  std::vector<uint8_t> output(expected.size());
+  const_header.serialise(output);
+  REQUIRE(output == expected);
+}
+
+TEST_CASE("Concurrent AES-GCM convenience calls")
+{
+  constexpr size_t thread_count = 24;
+  constexpr size_t iteration_count = 128;
+  auto aes_gcm_key = make_key_aes_gcm(get_raw_key());
+  std::atomic<bool> success = true;
+  std::exception_ptr worker_error;
+  std::mutex worker_error_lock;
+  std::vector<std::thread> threads;
+
+  for (size_t thread_index = 0; thread_index < thread_count; ++thread_index)
+  {
+    threads.emplace_back([&, thread_index]() {
+      try
+      {
+        for (size_t i = 0; i < iteration_count; ++i)
+        {
+          const uint64_t nonce = (thread_index * iteration_count) + i + 1;
+          std::vector<uint8_t> iv(12, 0);
+          memcpy(iv.data(), &nonce, sizeof(nonce));
+          const std::vector<uint8_t> plain(64, thread_index);
+          const std::vector<uint8_t> aad(16, i);
+          std::vector<uint8_t> cipher;
+          uint8_t tag[GCM_SIZE_TAG] = {};
+
+          aes_gcm_key->encrypt(iv, plain, aad, cipher, tag);
+          std::vector<uint8_t> decrypted;
+          if (
+            !aes_gcm_key->decrypt(iv, tag, cipher, aad, decrypted) ||
+            decrypted != plain)
+          {
+            success = false;
+          }
+        }
+      }
+      catch (...)
+      {
+        std::lock_guard<std::mutex> guard(worker_error_lock);
+        if (worker_error == nullptr)
+        {
+          worker_error = std::current_exception();
+        }
+      }
+    });
+  }
+
+  for (auto& thread : threads)
+  {
+    thread.join();
+  }
+
+  if (worker_error != nullptr)
+  {
+    std::rethrow_exception(worker_error);
+  }
+  REQUIRE(success);
+}
+
 TEST_CASE("ExtendedIv0")
 {
-  auto k = crypto::make_key_aes_gcm(get_raw_key());
+  auto k = ccf::crypto::make_key_aes_gcm(get_raw_key());
 
   // setup plain text
   std::vector<uint8_t> plain(100);
@@ -601,7 +2138,7 @@ TEST_CASE("ExtendedIv0")
   std::vector<uint8_t> cipher;
   k->encrypt(h.get_iv(), plain, {}, cipher, h.tag);
 
-  auto k2 = crypto::make_key_aes_gcm(get_raw_key());
+  auto k2 = ccf::crypto::make_key_aes_gcm(get_raw_key());
   std::vector<uint8_t> decrypted_plain;
   REQUIRE(k2->decrypt(h.get_iv(), h.tag, cipher, {}, decrypted_plain));
   REQUIRE(plain == decrypted_plain);
@@ -612,7 +2149,7 @@ TEST_CASE("AES Key wrap with padding")
   auto key = get_raw_key();
   std::vector<uint8_t> aad(123, 'y');
 
-  std::vector<uint8_t> key_to_wrap = create_entropy()->random(997);
+  std::vector<uint8_t> key_to_wrap = get_entropy()->random(997);
 
   auto ossl = std::make_unique<KeyAesGcm_OpenSSL>(key);
 
@@ -630,21 +2167,21 @@ TEST_CASE("CKM_RSA_PKCS_OAEP")
   auto rsa_kp = make_rsa_key_pair();
   auto rsa_pk = make_rsa_public_key(rsa_kp->public_key_pem());
 
-  auto wrapped = crypto::ckm_rsa_pkcs_oaep_wrap(rsa_pk, key);
-  auto wrapped_ = crypto::ckm_rsa_pkcs_oaep_wrap(rsa_pk, key);
+  auto wrapped = ccf::crypto::ckm_rsa_pkcs_oaep_wrap(rsa_pk, key);
+  auto wrapped_ = ccf::crypto::ckm_rsa_pkcs_oaep_wrap(rsa_pk, key);
 
   // CKM_RSA_PKCS_OAEP wrap is non deterministic
   REQUIRE(wrapped != wrapped_);
 
-  auto unwrapped = crypto::ckm_rsa_pkcs_oaep_unwrap(rsa_kp, wrapped);
-  auto unwrapped_ = crypto::ckm_rsa_pkcs_oaep_unwrap(rsa_kp, wrapped_);
+  auto unwrapped = ccf::crypto::ckm_rsa_pkcs_oaep_unwrap(rsa_kp, wrapped);
+  auto unwrapped_ = ccf::crypto::ckm_rsa_pkcs_oaep_unwrap(rsa_kp, wrapped_);
 
   REQUIRE(unwrapped == unwrapped_);
 }
 
 TEST_CASE("CKM_RSA_AES_KEY_WRAP")
 {
-  std::vector<uint8_t> key_to_wrap = create_entropy()->random(256);
+  std::vector<uint8_t> key_to_wrap = get_entropy()->random(256);
 
   auto rsa_kp = make_rsa_key_pair();
   auto rsa_pk = make_rsa_public_key(rsa_kp->public_key_pem());
@@ -656,18 +2193,9 @@ TEST_CASE("CKM_RSA_AES_KEY_WRAP")
   REQUIRE(unwrapped == key_to_wrap);
 }
 
-TEST_CASE("AES-GCM convenience functions")
-{
-  EntropyPtr entropy = create_entropy();
-  std::vector<uint8_t> key = entropy->random(GCM_DEFAULT_KEY_SIZE);
-  auto encrypted = aes_gcm_encrypt(key, contents);
-  auto decrypted = aes_gcm_decrypt(key, encrypted);
-  REQUIRE(decrypted == contents);
-}
-
 TEST_CASE("x509 time")
 {
-  auto time = std::chrono::system_clock::now();
+  auto time = ccf::nonstd::SystemClock::now();
 
   auto next_minute_time = time + 1min;
   auto next_day_time = time + 24h;
@@ -679,10 +2207,11 @@ TEST_CASE("x509 time")
     {
       struct Input
       {
-        std::chrono::system_clock::time_point from;
-        std::chrono::system_clock::time_point to;
+        ccf::nonstd::SystemClock::time_point from;
+        ccf::nonstd::SystemClock::time_point to;
         std::optional<uint32_t> maximum_validity_period_days = std::nullopt;
       };
+
       Input input;
 
       bool expected_verification_result;
@@ -705,9 +2234,9 @@ TEST_CASE("x509 time")
       const auto& from = data.input.from;
       const auto& to = data.input.to;
       REQUIRE(
-        crypto::OpenSSL::validate_chronological_times(
-          crypto::OpenSSL::Unique_X509_TIME(from),
-          crypto::OpenSSL::Unique_X509_TIME(to),
+        ccf::crypto::OpenSSL::validate_chronological_times(
+          ccf::crypto::OpenSSL::Unique_X509_TIME(from),
+          ccf::crypto::OpenSSL::Unique_X509_TIME(to),
           data.input.maximum_validity_period_days) ==
         data.expected_verification_result);
     }
@@ -715,7 +2244,7 @@ TEST_CASE("x509 time")
 
   INFO("Adjust time");
   {
-    std::vector<std::chrono::system_clock::time_point> times = {
+    std::vector<ccf::nonstd::SystemClock::time_point> times = {
       time, next_day_time, next_day_time};
     size_t days_offset = 100;
 
@@ -723,14 +2252,14 @@ TEST_CASE("x509 time")
     {
       auto adjusted_time = t + std::chrono::days(days_offset);
 
-      auto from = crypto::OpenSSL::Unique_X509_TIME(t);
-      auto to = crypto::OpenSSL::Unique_X509_TIME(adjusted_time);
+      auto from = ccf::crypto::OpenSSL::Unique_X509_TIME(t);
+      auto to = ccf::crypto::OpenSSL::Unique_X509_TIME(adjusted_time);
 
       // Convert to string and back to time_points
-      auto from_conv =
-        ds::time_point_from_string(crypto::OpenSSL::to_x509_time_string(from));
-      auto to_conv =
-        ds::time_point_from_string(crypto::OpenSSL::to_x509_time_string(to));
+      auto from_conv = ccf::ds::time_point_from_string(
+        ccf::crypto::OpenSSL::to_x509_time_string(from));
+      auto to_conv = ccf::ds::time_point_from_string(
+        ccf::crypto::OpenSSL::to_x509_time_string(to));
 
       // Diff is still the same amount of days
       auto days_diff =
@@ -747,10 +2276,138 @@ TEST_CASE("x509 time")
     for (auto const& days_offset : days_offsets)
     {
       auto adjusted_time = time + std::chrono::days(days_offset);
-      auto adjusted_str = ds::to_x509_time_string(adjusted_time);
-      auto asn1_time = crypto::OpenSSL::Unique_X509_TIME(adjusted_str);
-      auto converted_str = crypto::OpenSSL::to_x509_time_string(asn1_time);
+      auto adjusted_str = ccf::ds::to_x509_time_string(adjusted_time);
+      auto asn1_time = ccf::crypto::OpenSSL::Unique_X509_TIME(adjusted_str);
+      auto converted_str = ccf::crypto::OpenSSL::to_x509_time_string(asn1_time);
       REQUIRE(converted_str == adjusted_str);
+    }
+  }
+}
+
+TEST_CASE("X509 chain common validity period")
+{
+  const auto make_certificate =
+    [](const std::string& not_before, const std::string& not_after) {
+      auto key_pair =
+        ccf::crypto::make_ec_key_pair(ccf::crypto::CurveID::SECP384R1);
+      return ccf::crypto::cert_pem_to_der(
+        key_pair->self_sign("CN=test", not_before, not_after));
+    };
+
+  const auto first = make_certificate("20240101000000Z", "20241231235959Z");
+  const auto second = make_certificate("20240601000000Z", "20250601235959Z");
+
+  const auto common_validity_period =
+    ccf::crypto::OpenSSL::get_x509_chain_common_validity_period(
+      {first, second});
+  REQUIRE(common_validity_period.has_value());
+  REQUIRE(
+    ccf::ds::to_x509_time_string(common_validity_period->not_before) ==
+    "20240601000000Z");
+  REQUIRE(
+    ccf::ds::to_x509_time_string(common_validity_period->not_after) ==
+    "20241231235959Z");
+
+  const auto touching = make_certificate("20241231235959Z", "20260101000000Z");
+  const auto touching_common_validity_period =
+    ccf::crypto::OpenSSL::get_x509_chain_common_validity_period(
+      {first, touching});
+  REQUIRE(touching_common_validity_period.has_value());
+  REQUIRE(
+    touching_common_validity_period->not_before ==
+    touching_common_validity_period->not_after);
+  REQUIRE(
+    ccf::ds::to_x509_time_string(touching_common_validity_period->not_before) ==
+    "20241231235959Z");
+
+  const auto disjoint = make_certificate("20250101000000Z", "20260101000000Z");
+  REQUIRE_FALSE(ccf::crypto::OpenSSL::get_x509_chain_common_validity_period(
+                  {first, disjoint})
+                  .has_value());
+  REQUIRE_FALSE(ccf::crypto::OpenSSL::get_x509_chain_common_validity_period({})
+                  .has_value());
+}
+
+TEST_CASE("Certificate validity period")
+{
+  using namespace std::literals;
+  const auto kp = make_ec_key_pair();
+  REQUIRE_THROWS_AS(
+    (void)kp->self_sign("CN=name", "20240102000000Z", "20240101000000Z"),
+    std::logic_error);
+
+  const auto cert =
+    kp->self_sign("CN=name", "20240101000000Z", "20240102000000Z");
+  const auto verifier = make_verifier(cert);
+  const auto midpoint = ccf::ds::time_point_from_string("20240101120000Z");
+  const auto not_before = midpoint - 12h;
+  const auto not_after = midpoint + 12h;
+  // Both ends of the validity period are included, so it lasts 86401s
+  CHECK(verifier->remaining_seconds(midpoint) == 43201);
+  CHECK(
+    verifier->remaining_percentage(midpoint) ==
+    doctest::Approx(43201.0 / 86401));
+  CHECK(verifier->remaining_seconds(not_before) == 86401);
+  CHECK(verifier->remaining_percentage(not_before) == doctest::Approx(1.0));
+  CHECK(verifier->remaining_seconds(not_after) == 1);
+  CHECK(
+    verifier->remaining_percentage(not_after) == doctest::Approx(1.0 / 86401));
+
+  // Before the period starts, all of it remains
+  CHECK(verifier->remaining_seconds(not_before - 1s) == 86401);
+  CHECK(
+    verifier->remaining_percentage(not_before - 1s) == doctest::Approx(1.0));
+  CHECK(verifier->remaining_seconds(midpoint - 24h) == 86401);
+  CHECK(verifier->remaining_percentage(midpoint - 24h) == doctest::Approx(1.0));
+
+  // After it ends, none of it does
+  CHECK(verifier->remaining_seconds(not_after + 1s) == 0);
+  CHECK(verifier->remaining_percentage(not_after + 1s) == doctest::Approx(0.0));
+  CHECK(verifier->remaining_seconds(midpoint + 24h) == 0);
+  CHECK(verifier->remaining_percentage(midpoint + 24h) == doctest::Approx(0.0));
+
+  // CCF refuses to issue a certificate whose period is a single second or
+  // ends before it starts, but a verifier accepts any certificate without
+  // checking its signature, so forge both by rewriting notBefore on an
+  // issued certificate.
+  {
+    const auto der = cert_pem_to_der(cert);
+    OpenSSL::Unique_BIO in(der);
+    OpenSSL::Unique_X509 x509(in, false, /*check_null=*/true);
+    const auto with_not_before = [&](const std::string& from) {
+      OpenSSL::Unique_X509_TIME tp(from);
+      REQUIRE(X509_set1_notBefore(x509, tp) == 1);
+      OpenSSL::Unique_BIO out;
+      REQUIRE(i2d_X509_bio(out, x509) == 1);
+      BUF_MEM* bptr = nullptr;
+      REQUIRE(BIO_get_mem_ptr(out, &bptr) > 0);
+      const auto v = make_verifier(std::vector<uint8_t>(
+        reinterpret_cast<uint8_t*>(bptr->data),
+        reinterpret_cast<uint8_t*>(bptr->data) + bptr->length));
+      REQUIRE(v->validity_period() == std::make_pair(from, "20240102000000Z"s));
+      return v;
+    };
+
+    // A period of a single second is all or nothing
+    const auto single_second = with_not_before("20240102000000Z");
+    CHECK(single_second->remaining_seconds(not_after - 1s) == 1);
+    CHECK(
+      single_second->remaining_percentage(not_after - 1s) ==
+      doctest::Approx(1.0));
+    CHECK(single_second->remaining_seconds(not_after) == 1);
+    CHECK(
+      single_second->remaining_percentage(not_after) == doctest::Approx(1.0));
+    CHECK(single_second->remaining_seconds(not_after + 1s) == 0);
+    CHECK(
+      single_second->remaining_percentage(not_after + 1s) ==
+      doctest::Approx(0.0));
+
+    // Nothing of an inverted period remains
+    const auto inverted = with_not_before("20240102000001Z");
+    for (const auto now : {not_before, midpoint, not_after, not_after + 1s})
+    {
+      CHECK(inverted->remaining_seconds(now) == 0);
+      CHECK(inverted->remaining_percentage(now) == doctest::Approx(0.0));
     }
   }
 }
@@ -764,15 +2421,15 @@ TEST_CASE("hmac")
 
   INFO("Same inputs, same hmac");
   {
-    auto r0 = crypto::hmac(MDType::SHA256, key, zeros);
-    auto r1 = crypto::hmac(MDType::SHA256, key, zeros);
+    auto r0 = ccf::crypto::hmac(MDType::SHA256, key, zeros);
+    auto r1 = ccf::crypto::hmac(MDType::SHA256, key, zeros);
     REQUIRE(r0 == r1);
   }
 
   INFO("Different inputs, different hmacs");
   {
-    auto r0 = crypto::hmac(MDType::SHA256, key, zeros);
-    auto r1 = crypto::hmac(MDType::SHA256, key, mostly_zeros);
+    auto r0 = ccf::crypto::hmac(MDType::SHA256, key, zeros);
+    auto r1 = ccf::crypto::hmac(MDType::SHA256, key, mostly_zeros);
     REQUIRE(r0 != r1);
   }
 }
@@ -785,12 +2442,12 @@ TEST_CASE("PEM to JWK and back")
 
   INFO("EC");
   {
-    auto curves = {CurveID::SECP384R1, CurveID::SECP256R1, CurveID::SECP256K1};
+    auto curves = {CurveID::SECP384R1, CurveID::SECP256R1, CurveID::SECP521R1};
 
     for (auto const& curve : curves)
     {
-      auto kp = make_key_pair(curve);
-      auto pubk = make_public_key(kp->public_key_pem());
+      auto kp = make_ec_key_pair(curve);
+      auto pubk = make_ec_public_key(kp->public_key_pem());
 
       INFO("Public");
       {
@@ -799,7 +2456,7 @@ TEST_CASE("PEM to JWK and back")
         jwk = pubk->public_key_jwk(kid);
         REQUIRE(jwk.kid.value() == kid);
 
-        auto pubk2 = make_public_key(jwk);
+        auto pubk2 = make_ec_public_key(jwk);
         auto jwk2 = pubk2->public_key_jwk(kid);
         REQUIRE(jwk == jwk2);
       }
@@ -811,7 +2468,7 @@ TEST_CASE("PEM to JWK and back")
         jwk = kp->private_key_jwk(kid);
         REQUIRE(jwk.kid.value() == kid);
 
-        auto kp2 = make_key_pair(jwk);
+        auto kp2 = make_ec_key_pair(jwk);
         auto jwk2 = kp2->private_key_jwk(kid);
         REQUIRE(jwk == jwk2);
       }
@@ -832,25 +2489,25 @@ TEST_CASE("PEM to JWK and back")
 
     INFO("Public");
     {
-      auto jwk = pubk->public_key_jwk_rsa();
+      auto jwk = pubk->public_key_jwk();
       REQUIRE_FALSE(jwk.kid.has_value());
-      jwk = pubk->public_key_jwk_rsa(kid);
+      jwk = pubk->public_key_jwk(kid);
       REQUIRE(jwk.kid.value() == kid);
 
       auto pubk2 = make_rsa_public_key(jwk);
-      auto jwk2 = pubk2->public_key_jwk_rsa(kid);
+      auto jwk2 = pubk2->public_key_jwk(kid);
       REQUIRE(jwk == jwk2);
     }
 
     INFO("Private");
     {
-      auto jwk = kp->private_key_jwk_rsa();
+      auto jwk = kp->private_key_jwk();
       REQUIRE_FALSE(jwk.kid.has_value());
-      jwk = kp->private_key_jwk_rsa(kid);
+      jwk = kp->private_key_jwk(kid);
       REQUIRE(jwk.kid.value() == kid);
 
       auto kp2 = make_rsa_key_pair(jwk);
-      auto jwk2 = kp2->private_key_jwk_rsa(kid);
+      auto jwk2 = kp2->private_key_jwk(kid);
 
       REQUIRE(jwk == jwk2);
     }
@@ -889,8 +2546,7 @@ TEST_CASE("PEM to JWK and back")
 
 TEST_CASE("Incremental hash")
 {
-  crypto::openssl_sha256_init();
-  auto simple_hash = crypto::Sha256Hash(contents);
+  auto simple_hash = ccf::crypto::Sha256Hash(contents);
 
   INFO("Incremental hash");
   {
@@ -918,11 +2574,13 @@ TEST_CASE("Incremental hash")
     {
       constexpr size_t chunk_size = 10;
       auto ihash = make_incremental_sha256();
-      for (auto it = contents.begin(); it < contents.end(); it += chunk_size)
+      for (auto it = contents.begin(); it < contents.end();)
       {
-        auto end =
-          it + chunk_size > contents.end() ? contents.end() : it + chunk_size;
+        auto remaining = static_cast<size_t>(std::distance(it, contents.end()));
+        auto step = std::min(chunk_size, remaining);
+        auto end = it + step;
         ihash->update(std::vector<uint8_t>{it, end});
+        it = end;
       }
       auto final_hash = ihash->finalise();
       REQUIRE(final_hash == simple_hash);
@@ -930,5 +2588,241 @@ TEST_CASE("Incremental hash")
       REQUIRE_THROWS_AS(ihash->finalise(), std::logic_error);
     }
   }
-  crypto::openssl_sha256_shutdown();
+}
+
+TEST_CASE("Sign and verify with RSA key")
+{
+  const auto kp = ccf::crypto::make_rsa_key_pair();
+  const auto pub = ccf::crypto::make_rsa_public_key(kp->public_key_pem());
+  const auto mdtype = ccf::crypto::MDType::SHA256;
+  vector<uint8_t> payload(contents_.begin(), contents_.end());
+
+  {
+    constexpr size_t salt_length = 0;
+    const auto sig = kp->sign(payload, mdtype, salt_length);
+    REQUIRE(pub->verify(
+      payload.data(),
+      payload.size(),
+      sig.data(),
+      sig.size(),
+      mdtype,
+      RSAPadding::PKCS_PSS,
+      salt_length));
+  }
+
+  {
+    constexpr size_t sign_salt_length = 0, verify_salt_legth = 32;
+    const auto sig = kp->sign(payload, mdtype, sign_salt_length);
+    REQUIRE(!pub->verify(
+      payload.data(),
+      payload.size(),
+      sig.data(),
+      sig.size(),
+      mdtype,
+      RSAPadding::PKCS_PSS,
+      verify_salt_legth));
+  }
+
+  {
+    constexpr size_t sign_salt_length = 32, verify_salt_legth = 32;
+    const auto sig = kp->sign(payload, mdtype, sign_salt_length);
+    REQUIRE(pub->verify(
+      payload.data(),
+      payload.size(),
+      sig.data(),
+      sig.size(),
+      mdtype,
+      RSAPadding::PKCS_PSS,
+      verify_salt_legth));
+  }
+
+  {
+    // The key pair can verify its own signatures
+    const auto sig = kp->sign(payload, mdtype);
+    REQUIRE(kp->verify(
+      payload.data(), payload.size(), sig.data(), sig.size(), mdtype));
+    const auto hash = ccf::crypto::sha256(payload);
+    REQUIRE(kp->verify_hash(
+      hash.data(), hash.size(), sig.data(), sig.size(), mdtype));
+    REQUIRE(kp->public_key_jwk() == pub->public_key_jwk());
+
+    constexpr auto bad_salt_length = std::numeric_limits<size_t>::max();
+    REQUIRE_THROWS_AS(
+      (void)kp->sign(payload, mdtype, bad_salt_length), std::invalid_argument);
+
+    const auto issuer = make_ec_key_pair();
+    const auto issuer_cert = generate_self_signed_cert(issuer, "CN=issuer");
+    const auto [valid_from, valid_to] =
+      make_verifier(issuer_cert)->validity_period();
+    const auto cert = create_endorsed_cert(
+      kp->public_key_pem(),
+      "CN=RSA subject",
+      {},
+      valid_from,
+      valid_to,
+      issuer->private_key_pem(),
+      issuer_cert);
+    auto bad_payload = payload;
+    corrupt(bad_payload);
+    auto bad_hash = hash;
+    corrupt(bad_hash);
+    for (const auto& encoded_cert : {cert.raw(), cert_pem_to_der(cert)})
+    {
+      const auto verifier = make_verifier(encoded_cert);
+      CHECK(verifier->public_key_der() == kp->public_key_der());
+      CHECK(verifier->verify(payload, sig, mdtype));
+      CHECK(verifier->verify_hash(hash, sig, mdtype));
+      CHECK_FALSE(verifier->verify(bad_payload, sig, mdtype));
+      CHECK_FALSE(verifier->verify_hash(bad_hash, sig, mdtype));
+    }
+  }
+}
+
+TEST_CASE("Sign and verify a chain with an intermediate and different subjects")
+{
+  auto root_kp = ccf::crypto::make_ec_key_pair(CurveID::SECP384R1);
+  auto root_cert = generate_self_signed_cert(root_kp, "CN=root");
+
+  auto intermediate_kp = ccf::crypto::make_ec_key_pair(CurveID::SECP384R1);
+  auto intermediate_csr = intermediate_kp->create_csr("CN=intermediate", {});
+
+  std::string valid_from = "20210311000000Z";
+  std::string valid_to = "20230611235959Z";
+  auto intermediate_cert =
+    root_kp->sign_csr(root_cert, intermediate_csr, valid_from, valid_to, true);
+
+  auto leaf_kp = ccf::crypto::make_ec_key_pair(CurveID::SECP384R1);
+  auto leaf_csr = leaf_kp->create_csr("CN=leaf", {});
+  auto leaf_cert = intermediate_kp->sign_csr(
+    intermediate_cert, leaf_csr, valid_from, valid_to, true);
+
+  auto verifier = ccf::crypto::make_verifier(leaf_cert.raw());
+  auto rc = verifier->verify_certificate(
+    {&root_cert}, {&intermediate_cert}, true /* ignore time */
+  );
+
+  // Failed with pathlen: 0
+  REQUIRE(rc);
+
+  // Missing intermediate
+  rc = verifier->verify_certificate(
+    {&root_cert}, {}, true /* ignore time */
+  );
+
+  REQUIRE(!rc);
+
+  // Invalid root
+  rc = verifier->verify_certificate(
+    {&leaf_cert}, {}, true /* ignore time */
+  );
+
+  REQUIRE(!rc);
+
+  // Expired: the same chain is rejected once validity times are checked
+  REQUIRE_FALSE(
+    verifier->verify_certificate({&root_cert}, {&intermediate_cert}));
+
+  // Unparseable trusted or chain certificates, whose parsing errors must not
+  // be left on the OpenSSL error queue
+  const Pem not_a_cert(
+    "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n");
+  REQUIRE_FALSE(verifier->verify_certificate({&not_a_cert}, {}, true));
+  CHECK(ERR_peek_error() == 0);
+  REQUIRE_FALSE(
+    verifier->verify_certificate({&root_cert}, {&not_a_cert}, true));
+  CHECK(ERR_peek_error() == 0);
+
+  // Bad leaf signature, which also queues OpenSSL errors
+  auto bad_signature = ccf::crypto::cert_pem_to_der(leaf_cert);
+  bad_signature.back() ^= 1;
+  auto bad_verifier = ccf::crypto::make_verifier(bad_signature);
+  REQUIRE_FALSE(
+    bad_verifier->verify_certificate({&root_cert}, {&intermediate_cert}, true));
+  CHECK(ERR_peek_error() == 0);
+}
+
+TEST_CASE("Do not trust non-ca certs")
+{
+  auto kp = ccf::crypto::make_ec_key_pair(CurveID::SECP384R1);
+  auto ca_cert = generate_self_signed_cert(kp, "CN=name");
+
+  auto ca_cert_verifier = ccf::crypto::make_verifier(ca_cert.raw());
+  // CA cert is accepted as a trusted root (self-signed, CA:TRUE).
+  REQUIRE(ca_cert_verifier->verify_certificate({&ca_cert}, {}, true));
+
+  ccf::crypto::Pem non_ca_cert;
+  {
+    constexpr size_t certificate_validity_period_days = 365;
+    using namespace std::literals;
+    auto valid_from =
+      ccf::ds::to_x509_time_string(ccf::nonstd::SystemClock::now() - 24h);
+    auto valid_to = compute_cert_valid_to_string(
+      valid_from, certificate_validity_period_days);
+    std::vector<SubjectAltName> subject_alt_names = {};
+    non_ca_cert =
+      kp->self_sign("CN=name", valid_from, valid_to, subject_alt_names, false);
+  }
+
+  auto non_ca_cert_verifier = ccf::crypto::make_verifier(non_ca_cert.raw());
+  // Non-CA cert must NOT be accepted as a trusted root (self-signed but
+  // CA:FALSE).
+  REQUIRE_FALSE(
+    non_ca_cert_verifier->verify_certificate({&non_ca_cert}, {}, true));
+}
+
+TEST_CASE("Sha256 hex conversions")
+{
+  {
+    INFO("Sha256 via operator<<");
+
+    const std::string hex{
+      "f3d25d4670b742f035c1f1d9fffa2eba676ddc491c5288403fa1091e62f26dd6"};
+    auto hash = ccf::crypto::Sha256Hash::from_hex_string(hex);
+
+    std::stringstream ss;
+    ss << hash;
+
+    REQUIRE(ss.str() == hex);
+  }
+}
+
+TEST_CASE("Carriage returns in PEM certificates")
+{
+  const std::string single_cert =
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIByDCCAU6gAwIBAgIQOBe5SrcwReWmSzTjzj2HDjAKBggqhkjOPQQDAzATMREw\n"
+    "DwYDVQQDDAhDQ0YgTm9kZTAeFw0yMzA1MTcxMzUwMzFaFw0yMzA1MTgxMzUwMzBa\n"
+    "MBMxETAPBgNVBAMMCENDRiBOb2RlMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE74qL\n"
+    "Ac/45tiriN5MuquYhHVdMGQRvYSm08HBfYcODtET88qC0A39o6Y2TmfbIn6BdjMG\n"
+    "kD58o377ZMTaApQu/oJcwt7qZ9/LE8j8WU2qHn0cPTlpwH/2tiud2w+U3voSo2cw\n"
+    "ZTASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBS9FJNwWSXtUpHaBV57EwTW\n"
+    "oM8vHjAfBgNVHSMEGDAWgBS9FJNwWSXtUpHaBV57EwTWoM8vHjAPBgNVHREECDAG\n"
+    "hwR/xF96MAoGCCqGSM49BAMDA2gAMGUCMQDKxpjPToJ7VSqKqQSeMuW9tr4iL+9I\n"
+    "7gTGdGwiIYV1qTSS35Sk9XQZ0VpSa58c/5UCMEgmH71k7XlTGVUypm4jAgjpC46H\n"
+    "s+hJpGMvyD9dKzEpZgmZYtghbyakUkwBiqmFQA==\n"
+    "-----END CERTIFICATE-----";
+  Pem cert_pem(single_cert);
+  auto cert_vec = cert_pem.raw();
+  OpenSSL::Unique_BIO certbio(cert_vec);
+  OpenSSL::Unique_X509 cert(certbio, true);
+  REQUIRE_NE(cert, nullptr);
+
+  const std::string single_cert_cr =
+    "-----BEGIN CERTIFICATE-----\r\n"
+    "MIIByDCCAU6gAwIBAgIQOBe5SrcwReWmSzTjzj2HDjAKBggqhkjOPQQDAzATMREw\r\n"
+    "DwYDVQQDDAhDQ0YgTm9kZTAeFw0yMzA1MTcxMzUwMzFaFw0yMzA1MTgxMzUwMzBa\r\n"
+    "MBMxETAPBgNVBAMMCENDRiBOb2RlMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE74qL\r\n"
+    "Ac/45tiriN5MuquYhHVdMGQRvYSm08HBfYcODtET88qC0A39o6Y2TmfbIn6BdjMG\r\n"
+    "kD58o377ZMTaApQu/oJcwt7qZ9/LE8j8WU2qHn0cPTlpwH/2tiud2w+U3voSo2cw\r\n"
+    "ZTASBgNVHRMBAf8ECDAGAQH/AgEAMB0GA1UdDgQWBBS9FJNwWSXtUpHaBV57EwTW\r\n"
+    "oM8vHjAfBgNVHSMEGDAWgBS9FJNwWSXtUpHaBV57EwTWoM8vHjAPBgNVHREECDAG\r\n"
+    "hwR/xF96MAoGCCqGSM49BAMDA2gAMGUCMQDKxpjPToJ7VSqKqQSeMuW9tr4iL+9I\r\n"
+    "7gTGdGwiIYV1qTSS35Sk9XQZ0VpSa58c/5UCMEgmH71k7XlTGVUypm4jAgjpC46H\r\n"
+    "s+hJpGMvyD9dKzEpZgmZYtghbyakUkwBiqmFQA==\r\n"
+    "-----END CERTIFICATE-----";
+  Pem cert_pem_cr(single_cert_cr);
+  auto cert_vec_cr = cert_pem_cr.raw();
+  OpenSSL::Unique_BIO certbio_cr(cert_vec_cr);
+  OpenSSL::Unique_X509 cert_cr(certbio_cr, true);
+  REQUIRE_NE(cert_cr, nullptr);
 }

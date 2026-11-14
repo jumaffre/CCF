@@ -4,9 +4,9 @@
       "post": {
         "js_module": "batched.js",
         "js_function": "submit_batch",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "to_primary",
         "authn_policies": ["user_cert"],
-        "mode": "readonly",
+        "mode": "readwrite",
         "openapi": {}
       }
     },
@@ -14,9 +14,29 @@
       "post": {
         "js_module": "batched.js",
         "js_function": "fetch_batch",
-        "forwarding_required": "sometimes",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/batch/generate": {
+      "post": {
+        "js_module": "batched.js",
+        "js_function": "generate_response",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/batch/generate/config": {
+      "post": {
+        "js_module": "batched.js",
+        "js_function": "configure_response",
+        "redirection_strategy": "none",
+        "authn_policies": ["member_cert"],
+        "mode": "readwrite",
         "openapi": {}
       }
     }

@@ -6,34 +6,49 @@
 #include "ccf/crypto/sha256.h"
 #include "ccf/crypto/symmetric_key.h"
 #include "ccf/ds/hex.h"
-#include "ccf/pal/locking.h"
-#include "ds/messaging.h"
+#include "ccf/ds/locking.h"
+#include "ds/files.h"
+#include "ds/internal_logger.h"
+#include "ds/serialized.h"
+#include "ds/time_bound_logger.h"
 #include "indexing/lfs_interface.h"
-#include "indexing/lfs_ringbuffer_types.h"
+#include "tasks/ordered_tasks.h"
 
-#include <optional>
-#include <set>
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <unordered_map>
 
 // Uncomment to disable encryption and obfuscation, writing cache content
 // directly unencrypted to host disk
 // #define PLAINTEXT_CACHE
 
-#if defined(INSIDE_ENCLAVE) && defined(PLAINTEXT_CACHE)
-#  error \
-    "PLAINTEXT_CACHE should only be used for debugging, and not enabled for enclave builds"
+#if defined(PLAINTEXT_CACHE)
+#  pragma message( \
+    "PLAINTEXT_CACHE should only be used for debugging, and not enabled for enclave builds")
 #endif
 
 namespace ccf::indexing
 {
   static inline bool verify_and_decrypt(
-    crypto::KeyAesGcm& encryption_key,
+    ccf::crypto::KeyAesGcm& encryption_key,
     const LFSKey& key,
     LFSEncryptedContents&& encrypted,
     std::vector<uint8_t>& plaintext)
   {
-    crypto::GcmCipher gcm;
-    gcm.deserialise(encrypted);
+    ccf::crypto::GcmCipher gcm;
+    try
+    {
+      gcm.deserialise(encrypted);
+    }
+    catch (const serialized::InsufficientSpaceException& e)
+    {
+      // The file on disk is untrusted, and may have been truncated below the
+      // size of a GCM header
+      LOG_TRACE_FMT("Malformed encrypted contents for {}: {}", key, e.what());
+      return false;
+    }
 
 #ifdef PLAINTEXT_CACHE
     plaintext = gcm.cipher;
@@ -51,7 +66,7 @@ namespace ccf::indexing
         return false;
       }
 
-      auto data = (const uint8_t*)plaintext.data();
+      const auto* data = reinterpret_cast<const uint8_t*>(plaintext.data());
       auto size = plaintext.size();
       const auto prefix_size = serialized::read<size_t>(data, size);
       if (prefix_size != key.size())
@@ -74,11 +89,9 @@ namespace ccf::indexing
     {
       return true;
     }
-    else
-    {
-      LOG_TRACE_FMT("Decryption failed for {}", key);
-      return false;
-    }
+
+    LOG_TRACE_FMT("Decryption failed for {}", key);
+    return false;
   }
 
   class EnclaveLFSAccess : public AbstractLFSAccess
@@ -87,25 +100,49 @@ namespace ccf::indexing
     using PendingResult = std::weak_ptr<FetchResult>;
 
     std::unordered_map<LFSKey, PendingResult> pending;
-    ccf::pal::Mutex pending_access;
+    ccf::ds::Mutex pending_access;
 
-    ringbuffer::WriterPtr to_host;
+    // Directory where encrypted blobs are persisted to disk
+    const std::filesystem::path root_dir = ".index";
 
-    crypto::EntropyPtr entropy_src;
-    std::unique_ptr<crypto::KeyAesGcm> encryption_key;
+    // All disk I/O is performed as actions on this single ordered task queue,
+    // off the calling (indexing) thread. A single ordered queue preserves the
+    // submission order of stores and fetches, so a fetch issued after a store
+    // for the same key always observes the written file.
+    std::shared_ptr<ccf::tasks::OrderedTasks> tasks;
+
+    ccf::crypto::EntropyPtr entropy_src;
+    std::unique_ptr<ccf::crypto::KeyAesGcm> encryption_key;
+
+    // Size of the largest encrypted blob written by this instance. Only files
+    // written by this instance can be decrypted, so any larger file on disk
+    // cannot be valid, and is rejected before it is read into memory.
+    std::atomic<size_t> max_stored_size = 0;
+
+    void update_max_stored_size(size_t size)
+    {
+      auto current = max_stored_size.load();
+      while (size > current)
+      {
+        if (max_stored_size.compare_exchange_weak(current, size))
+        {
+          break;
+        }
+      }
+    }
 
     LFSEncryptedContents encrypt(const LFSKey& key, LFSContents&& contents)
     {
       // Prefix the contents with the key, to be checked during decryption
       {
         std::vector<uint8_t> key_prefix(sizeof(key.size()) + key.size());
-        auto data = key_prefix.data();
+        auto* data = key_prefix.data();
         auto size = key_prefix.size();
         serialized::write(data, size, key);
         contents.insert(contents.begin(), key_prefix.begin(), key_prefix.end());
       }
 
-      crypto::GcmCipher gcm(contents.size());
+      ccf::crypto::GcmCipher gcm(contents.size());
 
       // Use a random IV for each call
       gcm.hdr.set_random_iv();
@@ -120,129 +157,177 @@ namespace ccf::indexing
       return gcm.serialise();
     }
 
+    void write_blob(
+      const LFSKey& obfuscated, const LFSEncryptedContents& encrypted)
+    {
+      const auto target_path = root_dir / obfuscated;
+      ccf::ds::TimeBoundLogger log_if_slow(fmt::format(
+        "Writing LFS file ({} bytes) - {}",
+        encrypted.size(),
+        target_path.string()));
+      LOG_TRACE_FMT(
+        "Writing {} byte file to {}", encrypted.size(), target_path.string());
+      files::dump(encrypted, target_path);
+    }
+
+    struct BlobReadResult
+    {
+      enum class Status : std::uint8_t
+      {
+        Success,
+        NotFound,
+        Error,
+      };
+
+      Status status;
+      LFSEncryptedContents contents;
+    };
+
+    BlobReadResult read_blob(const LFSKey& obfuscated)
+    {
+      const auto target_path = root_dir / obfuscated;
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(target_path, ec))
+      {
+        if (ec && ec != std::errc::no_such_file_or_directory)
+        {
+          LOG_FAIL_FMT(
+            "Failed to inspect LFS file {}: {}",
+            target_path.string(),
+            ec.message());
+          return {
+            .status = BlobReadResult::Status::Error,
+            .contents = {},
+          };
+        }
+
+        LOG_TRACE_FMT("File {} not found", target_path.string());
+        return {
+          .status = BlobReadResult::Status::NotFound,
+          .contents = {},
+        };
+      }
+
+      ccf::ds::TimeBoundLogger log_if_slow(
+        fmt::format("Reading LFS file - ifstream({})", target_path.string()));
+      std::ifstream f(target_path, std::ios::binary | std::ios::ate);
+      if (!f)
+      {
+        LOG_FAIL_FMT("Failed to open LFS file {}", target_path.string());
+        return {
+          .status = BlobReadResult::Status::Error,
+          .contents = {},
+        };
+      }
+
+      const auto file_size = static_cast<std::streamoff>(f.tellg());
+      if (file_size < 0)
+      {
+        LOG_FAIL_FMT(
+          "Failed to determine the size of LFS file {}", target_path.string());
+        return {
+          .status = BlobReadResult::Status::Error,
+          .contents = {},
+        };
+      }
+
+      // The file contents are untrusted, so bound the allocation below by the
+      // largest blob this instance has written. Any store of a larger blob
+      // publishes its size before its write is queued, so a fetch ordered
+      // after that store always accepts the resulting file.
+      const auto max_size = max_stored_size.load();
+      if (static_cast<std::uintmax_t>(file_size) > max_size)
+      {
+        LOG_FAIL_FMT(
+          "LFS file {} is {} bytes, larger than any stored blob ({} bytes)",
+          target_path.string(),
+          file_size,
+          max_size);
+        return {
+          .status = BlobReadResult::Status::Error,
+          .contents = {},
+        };
+      }
+
+      f.seekg(0, std::ios::beg);
+      if (!f)
+      {
+        LOG_FAIL_FMT(
+          "Failed to seek to the start of LFS file {}", target_path.string());
+        return {
+          .status = BlobReadResult::Status::Error,
+          .contents = {},
+        };
+      }
+
+      LFSEncryptedContents blob(static_cast<size_t>(file_size));
+      if (!blob.empty())
+      {
+        const auto expected_size = static_cast<std::streamsize>(blob.size());
+        f.read(reinterpret_cast<char*>(blob.data()), expected_size);
+        if (!f || f.gcount() != expected_size)
+        {
+          LOG_FAIL_FMT(
+            "Failed to read the complete LFS file {}", target_path.string());
+          return {
+            .status = BlobReadResult::Status::Error,
+            .contents = {},
+          };
+        }
+      }
+
+      return {
+        .status = BlobReadResult::Status::Success,
+        .contents = std::move(blob),
+      };
+    }
+
   public:
-    EnclaveLFSAccess(const ringbuffer::WriterPtr& writer) :
-      to_host(writer),
-      entropy_src(crypto::create_entropy())
+    EnclaveLFSAccess(ccf::tasks::JobBoard& job_board) :
+      tasks(ccf::tasks::OrderedTasks::create(job_board, "LFSAccess")),
+      entropy_src(ccf::crypto::get_entropy())
     {
-      // Generate a fresh random key. Only this specific instance, in this
-      // enclave, can read these files!
-      encryption_key = crypto::make_key_aes_gcm(
-        entropy_src->random(crypto::GCM_DEFAULT_KEY_SIZE));
+      // Generate a fresh random key. Only this specific instance can read
+      // these files!
+      encryption_key = ccf::crypto::make_key_aes_gcm(
+        entropy_src->random(ccf::crypto::GCM_DEFAULT_KEY_SIZE));
+
+      if (std::filesystem::is_directory(root_dir))
+      {
+        LOG_INFO_FMT(
+          "Clearing contents from existing directory {}", root_dir.string());
+        ccf::ds::TimeBoundLogger log_if_slow(fmt::format(
+          "Clearing LFS index directory - remove_all({})", root_dir.string()));
+        std::filesystem::remove_all(root_dir);
+      }
+
+      {
+        ccf::ds::TimeBoundLogger log_if_slow(fmt::format(
+          "Creating LFS index directory - create_directory({})",
+          root_dir.string()));
+        if (!std::filesystem::create_directory(root_dir))
+        {
+          throw std::logic_error(
+            fmt::format("Could not create directory: {}", root_dir.string()));
+        }
+      }
     }
 
-    void register_message_handlers(
-      messaging::Dispatcher<ringbuffer::Message>& dispatcher)
+    ~EnclaveLFSAccess() override
     {
-      DISPATCHER_SET_MESSAGE_HANDLER(
-        dispatcher, LFSMsg::response, [this](const uint8_t* data, size_t size) {
-          auto [obfuscated, encrypted] =
-            ringbuffer::read_message<LFSMsg::response>(data, size);
-          std::lock_guard<ccf::pal::Mutex> guard(pending_access);
-          auto it = pending.find(obfuscated);
-          if (it != pending.end())
-          {
-            auto result = it->second.lock();
-            if (result != nullptr)
-            {
-              if (result->fetch_result == FetchResult::Fetching)
-              {
-                const auto success = verify_and_decrypt(
-                  *encryption_key,
-                  obfuscated,
-                  std::move(encrypted),
-                  result->contents);
-                if (success)
-                {
-                  result->fetch_result = FetchResult::Loaded;
-                }
-                else
-                {
-                  result->fetch_result = FetchResult::Corrupt;
-                  LOG_TRACE_FMT(
-                    "Cache was given invalid contents for {} (aka {})",
-                    obfuscated,
-                    result->key);
-                }
-              }
-              else
-              {
-                LOG_FAIL_FMT(
-                  "Retained result for {} (aka {}) in state {}",
-                  obfuscated,
-                  result->key,
-                  result->fetch_result);
-              }
-            }
-            else
-            {
-              LOG_TRACE_FMT(
-                "Received response for {}, but caller has already dropped "
-                "result",
-                obfuscated);
-            }
-            pending.erase(it);
-          }
-          else
-          {
-            LOG_TRACE_FMT(
-              "Ignoring response message for unrequested key {}", obfuscated);
-          }
-        });
-
-      DISPATCHER_SET_MESSAGE_HANDLER(
-        dispatcher,
-        LFSMsg::not_found,
-        [this](const uint8_t* data, size_t size) {
-          auto [obfuscated] =
-            ringbuffer::read_message<LFSMsg::not_found>(data, size);
-          std::lock_guard<ccf::pal::Mutex> guard(pending_access);
-          auto it = pending.find(obfuscated);
-          if (it != pending.end())
-          {
-            auto result = it->second.lock();
-            if (result != nullptr)
-            {
-              if (result->fetch_result == FetchResult::Fetching)
-              {
-                LOG_TRACE_FMT(
-                  "Host has no contents for key {} (aka {})",
-                  obfuscated,
-                  result->key);
-                result->fetch_result = FetchResult::NotFound;
-              }
-              else
-              {
-                LOG_FAIL_FMT(
-                  "Retained result for {} (aka {}) in state {}",
-                  obfuscated,
-                  result->key,
-                  result->fetch_result);
-              }
-            }
-            else
-            {
-              LOG_TRACE_FMT(
-                "Received not_found for {}, but caller has already dropped "
-                "result",
-                obfuscated);
-            }
-            pending.erase(it);
-          }
-          else
-          {
-            LOG_TRACE_FMT(
-              "Ignoring not_found message for unrequested key {}", obfuscated);
-          }
-        });
+      // Stop processing any further queued I/O actions. In production the task
+      // threads have already been stopped by this point; in tests actions are
+      // drained synchronously before destruction.
+      tasks->cancel_task();
     }
 
-    static inline LFSKey obfuscate_key(const LFSKey& key)
+    static LFSKey obfuscate_key(const LFSKey& key)
     {
 #ifdef PLAINTEXT_CACHE
       return key;
 #else
-      const auto h = crypto::sha256((const uint8_t*)key.data(), key.size());
+      const auto h = ccf::crypto::sha256(
+        reinterpret_cast<const uint8_t*>(key.data()), key.size());
       return ds::to_hex(h);
 #endif
     }
@@ -250,19 +335,21 @@ namespace ccf::indexing
     void store(const LFSKey& key, LFSContents&& contents) override
     {
       const auto obfuscated = obfuscate_key(key);
-      RINGBUFFER_WRITE_MESSAGE(
-        LFSMsg::store,
-        to_host,
-        // To avoid leaking potentially confidential information to the host,
-        // all cached data is encrypted and stored at an obfuscated key
-        obfuscated,
-        encrypt(obfuscated, std::move(contents)));
+      // To avoid leaking potentially confidential information, all cached data
+      // is encrypted and stored at an obfuscated key. Encryption happens on the
+      // calling thread; the resulting blob is written to disk asynchronously.
+      auto encrypted = encrypt(obfuscated, std::move(contents));
+      update_max_stored_size(encrypted.size());
+      tasks->add_action(ccf::tasks::make_basic_action(
+        [this, obfuscated, encrypted = std::move(encrypted)]() {
+          write_blob(obfuscated, encrypted);
+        }));
     }
 
     FetchResultPtr fetch(const LFSKey& key) override
     {
       const auto obfuscated = obfuscate_key(key);
-      std::lock_guard<ccf::pal::Mutex> guard(pending_access);
+      std::lock_guard<ccf::ds::Mutex> guard(pending_access);
       auto it = pending.find(obfuscated);
 
       FetchResultPtr result;
@@ -284,11 +371,9 @@ namespace ccf::indexing
 
           return result;
         }
-        else
-        {
-          result = std::make_shared<FetchResult>();
-          it->second = result;
-        }
+
+        result = std::make_shared<FetchResult>();
+        it->second = result;
       }
       else
       {
@@ -296,9 +381,55 @@ namespace ccf::indexing
         pending.emplace(obfuscated, result);
       }
 
-      result->fetch_result = FetchResult::Fetching;
+      result->fetch_result = FetchResult::FetchResultType::Fetching;
       result->key = key;
-      RINGBUFFER_WRITE_MESSAGE(LFSMsg::get, to_host, obfuscated);
+
+      // Read and decrypt the file from disk asynchronously, updating the
+      // result's state when complete.
+      tasks->add_action(
+        ccf::tasks::make_basic_action([this, obfuscated, result]() {
+          auto read_result = read_blob(obfuscated);
+          if (read_result.status == BlobReadResult::Status::NotFound)
+          {
+            LOG_TRACE_FMT(
+              "No contents for key {} (aka {})", obfuscated, result->key);
+            result->fetch_result = FetchResult::FetchResultType::NotFound;
+          }
+          else if (read_result.status == BlobReadResult::Status::Error)
+          {
+            result->fetch_result = FetchResult::FetchResultType::Corrupt;
+          }
+          else
+          {
+            const auto success = verify_and_decrypt(
+              *encryption_key,
+              obfuscated,
+              std::move(read_result.contents),
+              result->contents);
+            if (success)
+            {
+              result->fetch_result = FetchResult::FetchResultType::Loaded;
+            }
+            else
+            {
+              result->fetch_result = FetchResult::FetchResultType::Corrupt;
+              LOG_TRACE_FMT(
+                "Cache was given invalid contents for {} (aka {})",
+                obfuscated,
+                result->key);
+            }
+          }
+
+          // Drop the pending entry, unless a newer fetch has already replaced
+          // it with a different result.
+          std::lock_guard<ccf::ds::Mutex> guard(pending_access);
+          auto it = pending.find(obfuscated);
+          if (it != pending.end() && it->second.lock() == result)
+          {
+            pending.erase(it);
+          }
+        }));
+
       return result;
     }
   };

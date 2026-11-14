@@ -9,27 +9,17 @@ First, checkout the CCF repository:
 
     $ git clone git@github.com:microsoft/CCF.git
 
-To build CCF from source on a SGX-enabled machine, run the following:
+To build CCF from source, run the following:
 
 .. code-block:: bash
 
     $ cd CCF
     $ mkdir build
     $ cd build
-    $ cmake -GNinja ..
+    $ cmake -GNinja .. 
     $ ninja
 
-Alternatively, on a non-SGX machine, you can build a `virtual` instance of CCF:
-
-.. code-block:: bash
-
-    $ cd CCF
-    $ mkdir build
-    $ cd build
-    $ cmake -GNinja -DCOMPILE_TARGET=virtual ..
-    $ ninja
-
-.. note:::
+.. note::
 
     CCF defaults to building in the `RelWithDebInfo <https://cmake.org/cmake/help/latest/variable/CMAKE_BUILD_TYPE.html>`_ configuration.
 
@@ -50,7 +40,14 @@ The most common build switches include:
 
 * **BUILD_TESTS**: Boolean. Build all tests for CCF. Default to ON.
 * **SAN**: Boolean. Build unit tests with Address and Undefined behaviour sanitizers enabled. Default to OFF.
-* **COMPILE_TARGET**: String. Target compilation platform. Defaults to ``sgx``. Supported values are ``sgx``, ``snp``, or ``virtual``.
+* **CCF_STACKTRACE_BACKEND**: ``AUTO`` (default), ``STD``, or ``LIBBACKTRACE``. Selects the task exception stacktrace implementation.
+
+Task Stacktraces
+~~~~~~~~~~~~~~~~
+
+``AUTO`` prefers C++23 ``std::stacktrace`` when the active compiler and standard library can compile and link its required operations, trying the default libraries, ``stdc++exp``, then ``stdc++_libbacktrace``. Otherwise it requires standalone libbacktrace headers and a library. ``STD`` and ``LIBBACKTRACE`` fail configuration if the requested backend is unavailable.
+
+Configuration reports the selected backend and support library. The installed ``ccf_tasks`` target propagates its support-library and dynamic-loader dependencies by link name. Azure Linux 4's standard support archive requires the matching ``libstdc++-devel`` package; Azure Linux 3's fallback requires ``libbacktrace-static``.
 
 Run Tests
 ---------
@@ -64,36 +61,12 @@ Tests can be started through the ``tests.sh`` wrapper for ``ctest``.
 
 Although CCF's unit tests can be run through ``ctest`` directly, the end-to-end tests that start a network require some Python infrastructure. :ccf_repo:`tests.sh </tests/tests.sh>` will set up a virtual environment with these dependencies and activate it before running ``ctest``. Add ``-VV`` for verbose test output. Further runs will re-use that virtual environment.
 
-.. note::
-    On a full build of CCF, it is also possible to run tests with virtual enclaves by setting the ``TEST_ENCLAVE`` environment variable:
-
-    .. code-block:: bash
-
-        $ TEST_ENCLAVE=virtual ./tests.sh [-VV]
-
-    Tests that require enclave attestation will be skipped.
-
-Build Older Versions of CCF
----------------------------
-
-Building older versions of CCF may require a different toolchain than the one used to build the current ``main`` branch (e.g. 1.x CCF releases are built with `clang-8`). To build an old version of CCF locally without having to install another toolchain that may conflict with the current one, it is recommended to use the ``ccfciteam/ccf-ci`` docker image (now ``ccfmsrc.azurecr.io/ccf/ci``). The version tag of the ``cci-ci`` (now ``ccf/ci``) image used to build the old version can be found in the :ccf_repo:`.azure-pipelines.yml` YAML file (under ``resources:container:image``).
-
-.. code-block:: bash
-
-    $ export CCF_CI_IMAGE_TAG="oe0.17.2-clang-8" # e.g. building CCF 1.0.15
-    $ export LOCAL_CCF_CHECKOUT_PATH=/path/to/local/ccf/checkout
-    $ cd $LOCAL_CCF_CHECKOUT_PATH
-    $ git checkout ccf-1.0.15 # e.g. building CCF 1.0.15
-    $ docker run -ti --device /dev/sgx_enclave:/dev/sgx_enclave --device /dev/sgx_provision:/dev/sgx_provision -v $LOCAL_CCF_CHECKOUT_PATH:/CCF ccfmsrc.azurecr.io/ccf/ci:$CCF_CI_IMAGE_TAG-sgx bash
-    # container started, following lines are in container
-     $ cd CCF/
-     $ mkdir build_docker && cd build_docker
-     $ cmake -GNinja .. && ninja
-
-The built libraries and binaries are then available outside of the container in the ``build_docker`` directory in the local CCF checkout.
-
 Update the Documentation
 ------------------------
+
+Building the documentation and Python SDK requires Python 3.12 or newer.
+Diagrams use ``sphinx-pele`` with its default rendering options and bundled browser assets; no Mermaid CDN is required.
+Keep using the ``mermaid`` directive for diagram sources.
 
 It is possible to preview local documentation changes by running
 
@@ -106,3 +79,31 @@ or if there are no Doxygen changes
 .. code-block:: bash
 
     $ SKIP_DOXYGEN=ON ./livehtml.sh
+
+The published multi-version documentation is built with:
+
+.. code-block:: bash
+
+    $ python3 scripts/build-docs.py -D smv_remote_whitelist=origin doc build/html
+
+Each version is built from its own sources and configuration in a separate Python environment.
+This keeps older releases' documentation dependencies compatible while sharing version-selector metadata across all builds.
+
+HTML builds also build the :ref:`trace viewer <operations/recovery:Trace viewer>`, which needs ``lake``; ``SKIP_TRACE_VIEWER=ON`` skips it.
+See :ref:`architecture/verification:Running locally` for installing Lean and ``lake``.
+
+Rust API documentation
+~~~~~~~~~~~~~~~~~~~~~~
+
+HTML builds generate the :doc:`Rust API reference </build_apps/rust_api>` by running ``cargo doc`` on ``src/rust/ccf-app``, without building CCF, and publish it in each version's ``rust/`` directory.
+Versions without the SDK are skipped.
+Document the SDK in rustdoc comments, and link to its pages from RST with the ``rustdoc`` role:
+
+.. code-block:: rst
+
+    :rustdoc:`Registry <struct.Registry.html>`
+
+Builds fail on rustdoc warnings and broken ``rustdoc`` links.
+``SKIP_RUSTDOC=ON`` skips generation and these checks, for local previews only.
+Run the SDK doctests with ``cargo test --locked --doc`` in ``src/rust/ccf-app``.
+Doctests are linked without CCF, so examples that call into CCF cannot link, even with ``no_run``.

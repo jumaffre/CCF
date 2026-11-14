@@ -3,6 +3,7 @@
 #pragma once
 
 #include "node/node_client.h"
+#include "node/rpc/http_rpc_context.h"
 
 #include <chrono>
 
@@ -13,20 +14,15 @@ namespace ccf
   public:
     HTTPNodeClient(
       std::shared_ptr<ccf::RPCMap> rpc_map,
-      crypto::KeyPairPtr node_sign_kp,
-      const crypto::Pem& self_signed_node_cert_,
-      const std::optional<crypto::Pem>& endorsed_node_cert_) :
-      NodeClient(
-        rpc_map, node_sign_kp, self_signed_node_cert_, endorsed_node_cert_)
+      std::function<ccf::crypto::Pem()> get_node_certificate_) :
+      NodeClient(std::move(rpc_map), std::move(get_node_certificate_))
     {}
 
-    virtual ~HTTPNodeClient() {}
+    ~HTTPNodeClient() override = default;
 
-    virtual bool make_request(http::Request& request) override
+    bool make_request(::http::Request& request) override
     {
-      const auto& node_cert = endorsed_node_cert.has_value() ?
-        endorsed_node_cert.value() :
-        self_signed_node_cert;
+      const auto node_cert = get_node_certificate();
 
       std::vector<uint8_t> packed = request.build_request();
 
@@ -35,7 +31,7 @@ namespace ccf
       auto ctx = ccf::make_rpc_context(node_session, packed);
 
       std::shared_ptr<ccf::RpcHandler> search =
-        http::fetch_rpc_handler(ctx, rpc_map);
+        ::http::fetch_rpc_handler(ctx, rpc_map);
 
       search->process(ctx);
 
@@ -44,7 +40,8 @@ namespace ccf
       if (rs != HTTP_STATUS_OK)
       {
         auto ser_res = ctx->serialise_response();
-        std::string str((char*)ser_res.data(), ser_res.size());
+        std::string str(
+          reinterpret_cast<char*>(ser_res.data()), ser_res.size());
         LOG_DEBUG_FMT("Request failed: {}", str);
       }
 

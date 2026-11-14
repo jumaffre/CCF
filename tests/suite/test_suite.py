@@ -1,20 +1,20 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import e2e_logging
-import memberclient
-import reconfiguration
-import recovery
-import election
+from inspect import Parameter, signature
+
 import code_update
-import membership
+import e2e_common_endpoints
+import e2e_logging
+import e2e_operations
+import governance
 import governance_history
 import jwt_test
-import governance
-import e2e_operations
-import e2e_common_endpoints
-
-from inspect import signature, Parameter
+import memberclient
+import membership
+import nodes
+import reconfiguration
+import recovery
 
 suites = {}
 
@@ -22,6 +22,7 @@ suites = {}
 # This suite tests that rekeying, network configuration changes, recoveries and
 # curve changes can be interleaved
 suite_rekey_recovery = [
+    governance_history.test_service_signing_identities,
     recovery.test_recover_service,
     reconfiguration.test_add_node,
     reconfiguration.test_add_node_on_other_curve,
@@ -36,6 +37,7 @@ suite_rekey_recovery = [
     reconfiguration.test_add_node_on_other_curve,
     e2e_logging.test_rekey,
     recovery.test_recover_service,
+    governance_history.test_service_signing_identities,
     e2e_logging.test_rekey,
     recovery.test_recover_service_with_wrong_identity,
 ]
@@ -51,6 +53,7 @@ suite_membership_recovery = [
     recovery.test_recover_service,
     membership.test_update_recovery_shares,
     recovery.test_recover_service,
+    recovery.test_recovery_member_changes_rejected_during_recovery,
 ]
 suites["membership_recovery"] = suite_membership_recovery
 
@@ -61,14 +64,15 @@ suite_reconfiguration = [
     reconfiguration.test_retire_primary,
     e2e_logging.test_rekey,
     reconfiguration.test_add_node,
-    election.test_kill_primary,
-    election.test_commit_view_history,
+    reconfiguration.test_add_node_with_corrupted_ledger,
+    nodes.test_kill_primary,
+    nodes.test_commit_view_history,
     reconfiguration.test_add_node,
     reconfiguration.test_add_node_from_snapshot,
     reconfiguration.test_retire_backup,
     reconfiguration.test_add_node,
-    election.test_kill_primary,
-    election.test_commit_view_history,
+    nodes.test_kill_primary,
+    nodes.test_commit_view_history,
     e2e_logging.test_view_history,
     reconfiguration.test_ledger_invariants,
 ]
@@ -84,7 +88,6 @@ all_tests_suite = [
     e2e_logging.test_cert_prefix,
     e2e_logging.test_anonymous_caller,
     e2e_logging.test_raw_text,
-    e2e_logging.test_forwarding_frontends,
     e2e_logging.test_user_data_ACL,
     e2e_logging.test_view_history,
     e2e_logging.test_tx_statuses,
@@ -110,14 +113,15 @@ all_tests_suite = [
     # recovery:
     recovery.test_recover_service,
     recovery.test_recover_service_aborted,
+    recovery.test_recover_service_with_ledger_after_snapshot,
     # rekey:
     e2e_logging.test_rekey,
     # election:
     reconfiguration.test_add_node,
-    election.test_kill_primary,
+    nodes.test_kill_primary,
     # code update:
     code_update.test_verify_quotes,
-    code_update.test_add_node_with_bad_code,
+    code_update.test_add_node_with_different_package,
     # curve migration:
     reconfiguration.test_change_curve,
     recovery.test_recover_service,
@@ -137,8 +141,15 @@ all_tests_suite = [
     # test the most complete ledgers
     governance_history.test_ledger_is_readable,
     governance_history.test_tables_doc,
+    governance_history.test_service_signing_identities,
 ]
 suites["all"] = all_tests_suite
+
+# Keep a minimal ordering for the local-ledger watermark regression.
+suites["recovery_ledger"] = [
+    recovery.test_recover_service_with_ledger_after_snapshot,
+    governance_history.test_ledger_is_readable,
+]
 
 
 # https://github.com/microsoft/CCF/issues/5236
@@ -147,7 +158,6 @@ regression_5236_suite = [
     memberclient.test_corrupted_signature,
     e2e_operations.test_forced_snapshot,
     recovery.test_recover_service,
-    e2e_logging.test_forwarding_frontends,
     recovery.test_recover_service_aborted,
 ]
 suites["regression_5236"] = regression_5236_suite

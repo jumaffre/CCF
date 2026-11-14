@@ -25,9 +25,15 @@ The sample app has the following folder layout:
     ├── src
     │   └── endpoints
     │       ├── all.ts
+    │       ├── auth.ts
+    │       ├── base64.ts
+    │       ├── converters.ts
     │       ├── crypto.ts
+    │       ├── log.ts
     │       ├── partition.ts
-    │       └── proto.ts
+    │       ├── rpc.ts
+    │       ├── snp_attestation.ts
+    │       └── spin.ts
     ├── app.json
     ├── package.json
     ├── rollup.config.js
@@ -43,24 +49,22 @@ It contains these files:
 
 .. note::
     Rollup requires exactly one entry-point module.
-    The ``src/endpoints/all.ts`` module serves that purpose and re-exports all endpoint handlers
-    from the other files in the same folder.
-    Keeping endpoint handlers in separate modules and referencing those directly in ``app.json``
-    allows for fine-grained control over which other modules are loaded, per endpoint.
-    This in turn may improve load time and/or memory consumption, for example if not all endpoints
-    share the same npm package dependencies.
+    The ``src/endpoints/all.ts`` module serves that purpose and re-exports all endpoint handlers from the other files in the same folder.
+    Keeping endpoint handlers in separate modules and referencing those directly in ``app.json`` allows for fine-grained control over which other modules are loaded, per endpoint.
+    This in turn may improve load time and/or memory consumption, for example if not all endpoints share the same npm package dependencies.
 
 Dependencies
 ------------
 
 The sample uses several runtime and development packages (see ``package.json``).
-One of them is the :typedoc:package:`ccf-app` package.
+One of them is the :typedoc-package:`ccf-app` package.
 This package references the current branch's version of the ``ccf-app`` package using ``file:``.
-To test against a published version you should adjust the version number accordingly:
+To test against a published version, use the version of the ``@microsoft/ccf-app`` package that matches the CCF release the application will run on (the package is published with the same version number as each CCF release).
+For example, for CCF |ccf_version|:
 
 .. code-block:: js
 
-    "@microsoft/ccf-app": "~1.0.0",
+    "@microsoft/ccf-app": "~|ccf_version|",
 
 Now you can continue with installing all dependencies:
 
@@ -101,25 +105,22 @@ An endpoint handler, here named ``abc``, has the following structure:
     }
 
 ``AbcRequest`` and ``AbcResponse`` define the JSON schema of the request and response body, respectively.
-If an endpoint has no request or response body, the type parameters of :typedoc:interface:`ccfapp.Request <ccf-app/endpoints/Request>`/:typedoc:interface:`ccfapp.Response <ccf-app/endpoints/Response>` can be omitted.
+If an endpoint has no request or response body, the type parameters of :typedoc-interface:`ccfapp.Request <ccf-app/endpoints/Request>`/:typedoc-interface:`ccfapp.Response <ccf-app/endpoints/Response>` can be omitted.
 
 As an example, the ``/partition`` endpoint of the sample app is implemented as:
 
 .. literalinclude:: ../../tests/npm-app/src/endpoints/partition.ts
    :language: ts
 
-Here, the request body is a JSON array with elements of arbitrary type,
-and the response body is an even/odd partitioning of those elements as nested JSON array.
-The example also shows how an external library, here ``lodash``, is imported and used.
+Here, the request body is a JSON array with elements of arbitrary type, and the response body is an even/odd partitioning of those elements as nested JSON array.
 
 .. warning::
-    Even though request body schemas can be defined as part of the OpenAPI :ref:`metadata <build_apps/js_app_ts:Metadata>`,
-    CCF does not validate incoming request data against those schemas.
+    Even though request body schemas can be defined as part of the OpenAPI :ref:`metadata <build_apps/js_app_ts:Metadata>`, CCF does not validate incoming request data against those schemas.
     It is up to the application to perform any necessary validation.
 
 .. tip::
-    See the :typedoc:package:`ccf-app` package API documentation for how to access the Key-Value Store and other CCF functionality.
-    Although not recommended, instead of using the :typedoc:package:`ccf-app` package, all native CCF functionality can also be directly accessed through the :typedoc:interface:`ccf <ccf-app/global/CCF>` global variable.
+    See the :typedoc-package:`ccf-app` package API documentation for how to access the Key-Value Store and other CCF functionality.
+    Although not recommended, instead of using the :typedoc-package:`ccf-app` package, all native CCF functionality can also be directly accessed through the :typedoc-interface:`ccf <ccf-app/global/CCF>` global variable.
 
 
 Metadata
@@ -138,13 +139,13 @@ Preparing the app for deployment means converting it to CCF's native JavaScript 
 This involves the following steps:
 
 - transform TypeScript into JavaScript,
-- transform bare imports (``lodash``) into relative imports (``./node_modules/lodash/lodash.js``),
+- transform bare imports into relative imports,
 - transform old-style CommonJS modules into native JavaScript modules, and
 - store all files according to the app bundle folder structure.
 
-For this, the sample app relies on the `TypeScript compiler <https://www.npmjs.com/package/typescript>`_ and
-`rollup <https://github.com/rollup/rollup>`_. Rollup also offers tree shaking support
-to avoid deploying unused modules. See ``package.json`` and ``rollup.config.js`` for details.
+For this, the sample app relies on the `TypeScript compiler <https://www.npmjs.com/package/typescript>`_ and `rollup <https://github.com/rollup/rollup>`_.
+Rollup also offers tree shaking support to avoid deploying unused modules.
+See ``package.json`` and ``rollup.config.js`` for details.
 
 The conversion command is invoked with
 
@@ -164,9 +165,7 @@ A note on CommonJS modules
 --------------------------
 
 The sample project uses the
-`@rollup/plugin-commonjs <https://github.com/rollup/plugins/tree/master/packages/commonjs>`_
-package to automatically convert npm packages with CommonJS modules to native JavaScript modules
-so that they can be used in CCF.
+`@rollup/plugin-commonjs <https://github.com/rollup/plugins/tree/master/packages/commonjs>`_ package to automatically convert npm packages with CommonJS modules to native JavaScript modules so that they can be used in CCF.
 
 For some packages this conversion may fail, for example when the package has circular module dependencies.
 If that is the case, try one of the following suggestions:
@@ -183,8 +182,7 @@ If that is the case, try one of the following suggestions:
 4. Manually wrap a browser bundle of the package without using npm.
    This may be needed if the browser bundle is not part of the npm package, although this is uncommon.
 
-Manually wrapping a browser bundle (step 4) means copying the bundle source code in a module
-file and surrounding it with module boiler-plate. This may look something like:
+Manually wrapping a browser bundle (step 4) means copying the bundle source code in a module file and surrounding it with module boiler-plate. This may look something like:
 
 .. code-block:: js
 
@@ -194,8 +192,7 @@ file and surrounding it with module boiler-plate. This may look something like:
 
     export default module.exports;
 
-If the bundle uses only global exports instead of CommonJS/Node.js exports,
-then the module should look something like:
+If the bundle uses only global exports instead of CommonJS/Node.js exports, then the module should look something like:
 
 .. code-block:: js
 

@@ -5,7 +5,7 @@
 
 #include "ccf/ds/hex.h"
 
-namespace crypto
+namespace ccf::crypto
 {
   extern void default_sha256(const std::span<const uint8_t>& data, uint8_t* h);
 
@@ -48,25 +48,21 @@ namespace crypto
     default_sha256(data, h.data());
   }
 
-  std::ostream& operator<<(std::ostream& os, const crypto::Sha256Hash& h)
+  std::ostream& operator<<(std::ostream& os, const ccf::crypto::Sha256Hash& h)
   {
-    for (unsigned i = 0; i < crypto::Sha256Hash::SIZE; i++)
-    {
-      os << std::hex << static_cast<int>(h.h[i]);
-    }
-
+    os << h.hex_str();
     return os;
   }
 
   std::string Sha256Hash::hex_str() const
   {
-    return ds::to_hex(h);
+    return ccf::ds::to_hex(h);
   }
 
   Sha256Hash Sha256Hash::from_hex_string(const std::string& str)
   {
     Sha256Hash digest;
-    ds::from_hex(str, digest.h);
+    ccf::ds::from_hex(str, digest.h);
     return digest;
   }
 
@@ -94,24 +90,26 @@ namespace crypto
     auto value = j.get<std::string>();
     try
     {
-      ds::from_hex(value, hash.h);
+      ccf::ds::from_hex(value, hash.h);
     }
     catch (const std::logic_error& e)
     {
-      throw JsonParseError(fmt::format(
+      throw ccf::JsonParseError(fmt::format(
         "Input string \"{}\" is not valid hex-encoded SHA-256: {}",
         value,
         e.what()));
     }
   }
 
-  std::string schema_name(const Sha256Hash*)
+  std::string schema_name(const Sha256Hash* hash)
   {
+    (void)hash;
     return "Sha256Digest";
   }
 
-  void fill_json_schema(nlohmann::json& schema, const Sha256Hash*)
+  void fill_json_schema(nlohmann::json& schema, const Sha256Hash* hash)
   {
+    (void)hash;
     schema["type"] = "string";
 
     // According to the spec, "format is an open value, so you can use any
@@ -123,7 +121,7 @@ namespace crypto
 
   bool operator==(const Sha256Hash& lhs, const Sha256Hash& rhs)
   {
-    for (unsigned i = 0; i < crypto::Sha256Hash::SIZE; i++)
+    for (unsigned i = 0; i < ccf::crypto::Sha256Hash::SIZE; i++)
     {
       if (lhs.h[i] != rhs.h[i])
       {

@@ -8,7 +8,7 @@
 
 namespace ccf
 {
-  enum class QuoteFormat
+  enum class QuoteFormat : uint8_t
   {
     oe_sgx_v1 = 0,
     insecure_virtual = 1,
@@ -32,7 +32,7 @@ namespace ccf
     std::vector<uint8_t> endorsements;
     /// UVM endorsements (SNP-only)
     std::optional<std::vector<uint8_t>> uvm_endorsements;
-    /// Endorsed TCB (hex-encoded)
+    /// Endorsed TCB (hex-encoded) (SNP-only)
     std::optional<std::string> endorsed_tcb = std::nullopt;
   };
 

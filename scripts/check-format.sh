@@ -2,7 +2,7 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-set -u
+set -uo pipefail
 
 if [ "$#" -eq 0 ]; then
   echo "No args given - specify dir(s) to be formatted"
@@ -28,24 +28,44 @@ else
   echo "Checking file format in" "$@"
 fi
 
-CLANG_FORMAT=clang-format
-if [ -x "$(command -v clang-format-11)" ]; then
-    CLANG_FORMAT=clang-format-11
+if [ -x "$(command -v clang-format-18)" ]; then
+    CLANG_FORMAT=(clang-format-18)
+else
+    # This is specifically for AzL4, where the clang-format is newer
+    # and behaves differently with the same configuration.
+    CLANG_FORMAT=(uvx --from clang-format==18.1.8 clang-format)
 fi
 
-file_name_regex="^[[:lower:]0-9_]+$"
-unformatted_files=""
-badly_named_files=""
-for file in $(git ls-files "$@" | grep -e '\.h$' -e '\.hpp$' -e '\.cpp$' -e '\.c$' -e '\.proto$'); do
-  if ! $CLANG_FORMAT -n -Werror -style=file "$file"; then
-    if $fix ; then
-      $CLANG_FORMAT -style=file -i "$file"
-    fi
-    if [ "$unformatted_files" != "" ]; then
-      unformatted_files+=$'\n'
-    fi
-    unformatted_files+="$file"
+if ! CLANG_FORMAT_VERSION=$("${CLANG_FORMAT[@]}" --version); then
+  echo "Unable to run clang-format. Install clang-format-18 or uv." >&2
+  exit 1
+fi
+echo "Using $CLANG_FORMAT_VERSION"
+
+NPROC=$(nproc 2>/dev/null || echo 4)
+
+# Collect the file list once
+mapfile -t files < <(git ls-files "$@" | grep -e '\.h$' -e '\.hpp$' -e '\.cpp$' -e '\.c$')
+
+# --- Format check (parallel) ---
+if [ "${#files[@]}" -eq 0 ]; then
+  unformatted_files=""
+else
+  # Check which files need formatting (parallel)
+  unformatted_files=$(printf '%s\n' "${files[@]}" | \
+    xargs -P "$NPROC" -n 50 "${CLANG_FORMAT[@]}" -n -Werror -style=file 2>&1 | \
+    sed -n 's/^\(.*\):[0-9]*:[0-9]*:.*/\1/p' | sort -u) || true
+
+  if $fix && [ "$unformatted_files" != "" ]; then
+    # Fix only the files that failed the check
+    echo "$unformatted_files" | xargs -P "$NPROC" -n 50 "${CLANG_FORMAT[@]}" -style=file -i
   fi
+fi
+
+# --- File name check ---
+file_name_regex="^[[:lower:]0-9_]+$"
+badly_named_files=""
+for file in "${files[@]}"; do
   file_base_name=$(basename "${file%.*}")
   if ! [[ $file_base_name =~ $file_name_regex ]]; then
     if [ "$badly_named_files" != "" ]; then
@@ -55,6 +75,7 @@ for file in $(git ls-files "$@" | grep -e '\.h$' -e '\.hpp$' -e '\.cpp$' -e '\.c
   fi
 done
 
+# --- Report results ---
 if [ "$unformatted_files" != "" ]; then
   if $fix ; then
     echo "Fixed formatting:"

@@ -2,8 +2,8 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ds/logger.h"
 #include "ccf/http_configuration.h"
+#include "ds/internal_logger.h"
 #include "http/http_exceptions.h"
 #include "http2_types.h"
 #include "http2_utils.h"
@@ -16,8 +16,8 @@ namespace http2
     uint8_t* buf,
     size_t length,
     uint32_t* data_flags,
-    nghttp2_data_source* source,
-    void* user_data)
+    nghttp2_data_source* /*source*/,
+    void* /*user_data*/)
   {
     auto* stream_data = get_stream_data(session, stream_id);
     if (stream_data->outgoing.state == StreamResponseState::Uninitialised)
@@ -28,42 +28,31 @@ namespace http2
       return NGHTTP2_ERR_CALLBACK_FAILURE;
     }
 
-    auto& body = stream_data->outgoing.body.ro_data();
-    size_t to_read = std::min(body.size(), length);
-
-    if (
-      to_read == 0 &&
-      stream_data->outgoing.state == StreamResponseState::Streaming)
-    {
-      // Early out: when streaming, avoid calling this callback
-      // repeatedly when there no data to read
-      return NGHTTP2_ERR_DEFERRED;
-    }
+    DataSource& body = stream_data->outgoing.body;
+    const auto body_remaining = body.data.size() - body.consumed;
+    size_t to_read = std::min(body_remaining, length);
 
     if (to_read > 0)
     {
-      memcpy(buf, body.data(), to_read);
-      body = body.subspan(to_read);
+      memcpy(buf, body.data.data() + body.consumed, to_read);
+      body.consumed += to_read;
     }
 
-    if (stream_data->outgoing.state == StreamResponseState::Closing)
+    if (body.consumed == body.data.size())
     {
-      if (body.empty())
-      {
-        *data_flags |= NGHTTP2_DATA_FLAG_EOF;
-      }
+      *data_flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
 
-      if (stream_data->outgoing.has_trailers)
-      {
-        *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
-      }
+    if (stream_data->outgoing.has_trailers)
+    {
+      *data_flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
     }
 
     return to_read;
   }
 
   static int on_begin_frame_recv_callback(
-    nghttp2_session* session, const nghttp2_frame_hd* hd, void* user_data)
+    nghttp2_session* /*session*/, const nghttp2_frame_hd* hd, void* user_data)
   {
     const auto& stream_id = hd->stream_id;
     LOG_TRACE_FMT(
@@ -123,7 +112,7 @@ namespace http2
         }
 
         // If the request is complete, process it
-        if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
+        if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0)
         {
           auto* p = get_parser(user_data);
           p->handle_completed(stream_id, stream_data);
@@ -175,7 +164,7 @@ namespace http2
     size_t namelen,
     const uint8_t* value,
     size_t valuelen,
-    uint8_t flags,
+    uint8_t /*flags*/,
     void* user_data)
   {
     const auto& stream_id = frame->hd.stream_id;
@@ -186,8 +175,8 @@ namespace http2
     auto* p = get_parser(user_data);
     const auto& configuration = p->get_configuration();
 
-    auto const& max_header_size =
-      configuration.max_header_size.value_or(http::default_max_header_size);
+    auto const& max_header_size = configuration.max_header_size.value_or(
+      ccf::http::default_max_header_size);
     if (namelen > max_header_size)
     {
       throw http::RequestHeaderTooLargeException(
@@ -202,15 +191,17 @@ namespace http2
     {
       throw http::RequestHeaderTooLargeException(
         fmt::format(
-          "Header value for '{}' is too large (max size allowed: {})",
-          v,
+          "Header value for key '{}' is too large (size: {}, max size allowed: "
+          "{})",
+          k,
+          valuelen,
           max_header_size),
         stream_id);
     }
 
     auto* stream_data = get_stream_data(session, stream_id);
-    const auto max_headers_count =
-      configuration.max_headers_count.value_or(http::default_max_headers_count);
+    const auto max_headers_count = configuration.max_headers_count.value_or(
+      ccf::http::default_max_headers_count);
     if (stream_data->incoming.headers.size() >= max_headers_count)
     {
       throw http::RequestHeaderTooLargeException(
@@ -226,7 +217,7 @@ namespace http2
 
   static int on_data_callback(
     nghttp2_session* session,
-    uint8_t flags,
+    uint8_t /*flags*/,
     StreamId stream_id,
     const uint8_t* data,
     size_t len,
@@ -242,7 +233,7 @@ namespace http2
       stream_data->incoming.body.end(), data, data + len);
 
     auto const& max_body_size =
-      configuration.max_body_size.value_or(http::default_max_body_size);
+      configuration.max_body_size.value_or(ccf::http::default_max_body_size);
     if (stream_data->incoming.body.size() > max_body_size)
     {
       throw http::RequestPayloadTooLargeException(
@@ -256,7 +247,7 @@ namespace http2
   }
 
   static int on_stream_close_callback(
-    nghttp2_session* session,
+    nghttp2_session* /*session*/,
     StreamId stream_id,
     uint32_t error_code,
     void* user_data)
@@ -271,8 +262,8 @@ namespace http2
   }
 
   static ssize_t on_data_source_read_length_callback(
-    nghttp2_session* session,
-    uint8_t frame_type,
+    nghttp2_session* /*session*/,
+    uint8_t /*frame_type*/,
     int32_t stream_id,
     int32_t session_remote_window_size,
     int32_t stream_remote_window_size,
@@ -282,7 +273,7 @@ namespace http2
     auto* p = get_parser(user_data);
     const auto& configuration = p->get_configuration();
     const auto& max_frame_size =
-      configuration.max_frame_size.value_or(http::default_max_frame_size);
+      configuration.max_frame_size.value_or(ccf::http::default_max_frame_size);
 
     LOG_TRACE_FMT(
       "http2::on_data_source_read_length_callback: {}, {}, allowed [1, "
@@ -297,11 +288,11 @@ namespace http2
   }
 
   static int on_error_callback(
-    nghttp2_session* session,
-    int lib_error_code,
+    nghttp2_session* /*session*/,
+    int /*lib_error_code*/,
     const char* msg,
     size_t len,
-    void* user_data)
+    void* /*user_data*/)
   {
     LOG_DEBUG_FMT("HTTP/2 error: {}", std::string(msg, msg + len));
     return 0;

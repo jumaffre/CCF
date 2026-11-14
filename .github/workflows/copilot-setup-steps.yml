@@ -1,0 +1,36 @@
+name: "Copilot Setup Steps"
+
+# Automatically run the setup steps when they are changed to allow for easy
+# validation, and allow manual testing through the repository's "Actions" tab.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+      - scripts/setup-ubuntu-ci-checks.sh
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+      - scripts/setup-ubuntu-ci-checks.sh
+
+permissions: {}
+
+jobs:
+  # The job MUST be called `copilot-setup-steps` or it will not be picked up by
+  # the Copilot coding agent.
+  copilot-setup-steps:
+    name: "Copilot Setup Steps"
+    runs-on: ubuntu-26.04
+
+    permissions:
+      # Needed for actions/checkout to clone the repository in the setup steps.
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: "Install CI checks dependencies"
+        shell: bash
+        run: |
+          set -ex
+          ./scripts/setup-ubuntu-ci-checks.sh

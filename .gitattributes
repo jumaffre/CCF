@@ -3,7 +3,20 @@
 *.png binary
 *.jpg binary
 
+src/crypto/test/cbor_fuzz_corpus/* binary
+
 *.h linguist-language=C++
 *.cpp linguist-language=C++
 
 .*canary merge=keeplocal
+
+lean/**/Proofs/**/*.lean linguist-generated=true
+lean/disaster-recovery/replayer/fixtures/**/*.diff linguist-generated=true
+lean/disaster-recovery/DisasterRecovery.lean text eol=lf
+
+lean/kv/Kv.lean text eol=lf
+
+# Hide third-party content from language statistics and diffs by default.
+3rdparty/** linguist-vendored linguist-generated
+# Keep locally maintained patches visible for review.
+3rdparty/patches/** -linguist-vendored -linguist-generated

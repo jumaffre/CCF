@@ -13,6 +13,41 @@
       }
     },
     "schemas": {
+      "Attestation": {
+        "properties": {
+          "endorsements": {
+            "$ref": "#/components/schemas/base64string"
+          },
+          "format": {
+            "$ref": "#/components/schemas/QuoteFormat"
+          },
+          "measurement": {
+            "$ref": "#/components/schemas/string"
+          },
+          "node_id": {
+            "$ref": "#/components/schemas/NodeId"
+          },
+          "raw": {
+            "$ref": "#/components/schemas/base64string"
+          },
+          "uvm_endorsements": {
+            "$ref": "#/components/schemas/base64string"
+          }
+        },
+        "required": [
+          "node_id",
+          "raw",
+          "endorsements",
+          "format"
+        ],
+        "type": "object"
+      },
+      "Attestation_array": {
+        "items": {
+          "$ref": "#/components/schemas/Attestation"
+        },
+        "type": "array"
+      },
       "Authority": {
         "enum": [
           "Node",
@@ -20,6 +55,10 @@
           "ACME",
           "Unsecured"
         ],
+        "type": "string"
+      },
+      "Binary": {
+        "format": "binary",
         "type": "string"
       },
       "CCFError": {
@@ -39,12 +78,6 @@
           }
         },
         "type": "object"
-      },
-      "CodeStatus": {
-        "enum": [
-          "AllowedToJoin"
-        ],
-        "type": "string"
       },
       "Configuration": {
         "properties": {
@@ -114,7 +147,18 @@
             "$ref": "#/components/schemas/MembershipState"
           },
           "primary_id": {
-            "$ref": "#/components/schemas/NodeId"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              {
+                "enum": [
+                  null
+                ],
+                "nullable": true,
+                "type": "object"
+              }
+            ]
           },
           "reconfiguration_type": {
             "$ref": "#/components/schemas/ReconfigurationType"
@@ -169,11 +213,12 @@
         ],
         "type": "string"
       },
+      "Cose": {
+        "format": "binary",
+        "type": "string"
+      },
       "Endorsement": {
         "properties": {
-          "acme_configuration": {
-            "$ref": "#/components/schemas/string"
-          },
           "authority": {
             "$ref": "#/components/schemas/Authority"
           }
@@ -183,85 +228,16 @@
         ],
         "type": "object"
       },
-      "EndpointMetrics": {
+      "GetAttestations__Out": {
         "properties": {
-          "metrics": {
-            "$ref": "#/components/schemas/EndpointMetricsEntry_array"
+          "attestations": {
+            "$ref": "#/components/schemas/Attestation_array"
           }
         },
         "required": [
-          "metrics"
+          "attestations"
         ],
         "type": "object"
-      },
-      "EndpointMetricsEntry": {
-        "properties": {
-          "calls": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "errors": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "failures": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "method": {
-            "$ref": "#/components/schemas/string"
-          },
-          "path": {
-            "$ref": "#/components/schemas/string"
-          },
-          "retries": {
-            "$ref": "#/components/schemas/uint64"
-          }
-        },
-        "required": [
-          "path",
-          "method",
-          "calls",
-          "errors",
-          "failures",
-          "retries"
-        ],
-        "type": "object"
-      },
-      "EndpointMetricsEntry_array": {
-        "items": {
-          "$ref": "#/components/schemas/EndpointMetricsEntry"
-        },
-        "type": "array"
-      },
-      "GetCode__Out": {
-        "properties": {
-          "versions": {
-            "$ref": "#/components/schemas/GetCode__Version_array"
-          }
-        },
-        "required": [
-          "versions"
-        ],
-        "type": "object"
-      },
-      "GetCode__Version": {
-        "properties": {
-          "digest": {
-            "$ref": "#/components/schemas/string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/CodeStatus"
-          }
-        },
-        "required": [
-          "digest",
-          "status"
-        ],
-        "type": "object"
-      },
-      "GetCode__Version_array": {
-        "items": {
-          "$ref": "#/components/schemas/GetCode__Version"
-        },
-        "type": "array"
       },
       "GetCommit__Out": {
         "properties": {
@@ -277,16 +253,63 @@
         ],
         "type": "object"
       },
+      "GetHistoricalCacheInfo__Out": {
+        "properties": {
+          "estimated_size": {
+            "$ref": "#/components/schemas/uint64"
+          }
+        },
+        "required": [
+          "estimated_size"
+        ],
+        "type": "object"
+      },
       "GetNetworkInfo__Out": {
         "properties": {
           "current_service_create_txid": {
-            "$ref": "#/components/schemas/TransactionId"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TransactionId"
+              },
+              {
+                "enum": [
+                  null
+                ],
+                "nullable": true,
+                "type": "object"
+              }
+            ]
           },
           "current_view": {
-            "$ref": "#/components/schemas/uint64"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/uint64"
+              },
+              {
+                "enum": [
+                  null
+                ],
+                "nullable": true,
+                "type": "object"
+              }
+            ]
+          },
+          "pq_service_certificate": {
+            "$ref": "#/components/schemas/Pem"
           },
           "primary_id": {
-            "$ref": "#/components/schemas/NodeId"
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NodeId"
+              },
+              {
+                "enum": [
+                  null
+                ],
+                "nullable": true,
+                "type": "object"
+              }
+            ]
           },
           "recovery_count": {
             "$ref": "#/components/schemas/uint64"
@@ -449,9 +472,12 @@
         ],
         "type": "object"
       },
-      "JWTMetrics": {
+      "JWTRefreshMetrics": {
         "properties": {
           "attempts": {
+            "$ref": "#/components/schemas/uint64"
+          },
+          "failures": {
             "$ref": "#/components/schemas/uint64"
           },
           "successes": {
@@ -460,7 +486,8 @@
         },
         "required": [
           "attempts",
-          "successes"
+          "successes",
+          "failures"
         ],
         "type": "object"
       },
@@ -500,6 +527,7 @@
           "None",
           "Leader",
           "Follower",
+          "PreVoteCandidate",
           "Candidate"
         ],
         "type": "string"
@@ -510,25 +538,6 @@
           "Retired"
         ],
         "type": "string"
-      },
-      "MemoryUsage__Out": {
-        "properties": {
-          "current_allocated_heap_size": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "max_total_heap_size": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "peak_allocated_heap_size": {
-            "$ref": "#/components/schemas/uint64"
-          }
-        },
-        "required": [
-          "max_total_heap_size",
-          "current_allocated_heap_size",
-          "peak_allocated_heap_size"
-        ],
-        "type": "object"
       },
       "NodeId": {
         "format": "hex",
@@ -564,6 +573,9 @@
           "bind_address": {
             "$ref": "#/components/schemas/string"
           },
+          "enabled_operator_features": {
+            "$ref": "#/components/schemas/OperatorFeature_set"
+          },
           "endorsement": {
             "$ref": "#/components/schemas/Endorsement"
           },
@@ -584,11 +596,25 @@
           },
           "published_address": {
             "$ref": "#/components/schemas/string"
+          },
+          "redirections": {
+            "$ref": "#/components/schemas/NodeInfoNetwork_v2__NetInterface__Redirections"
           }
         },
         "required": [
           "bind_address"
         ],
+        "type": "object"
+      },
+      "NodeInfoNetwork_v2__NetInterface__Redirections": {
+        "properties": {
+          "to_backup": {
+            "$ref": "#/components/schemas/RedirectionResolverConfig"
+          },
+          "to_primary": {
+            "$ref": "#/components/schemas/RedirectionResolverConfig"
+          }
+        },
         "type": "object"
       },
       "NodeMetrics": {
@@ -610,25 +636,42 @@
         ],
         "type": "string"
       },
+      "OperatorFeature": {
+        "enum": [
+          "SnapshotRead",
+          "LedgerChunkRead",
+          "SnapshotCreate"
+        ],
+        "type": "string"
+      },
+      "OperatorFeature_set": {
+        "items": {
+          "$ref": "#/components/schemas/OperatorFeature"
+        },
+        "type": "array"
+      },
       "ParserConfiguration": {
         "properties": {
           "initial_window_size": {
-            "$ref": "#/components/schemas/TimeString"
+            "$ref": "#/components/schemas/SizeString"
           },
           "max_body_size": {
-            "$ref": "#/components/schemas/TimeString"
+            "$ref": "#/components/schemas/SizeString"
           },
           "max_concurrent_streams_count": {
             "$ref": "#/components/schemas/uint64"
           },
           "max_frame_size": {
-            "$ref": "#/components/schemas/TimeString"
+            "$ref": "#/components/schemas/SizeString"
           },
           "max_header_size": {
-            "$ref": "#/components/schemas/TimeString"
+            "$ref": "#/components/schemas/SizeString"
           },
           "max_headers_count": {
             "$ref": "#/components/schemas/uint32"
+          },
+          "max_request_target_size": {
+            "$ref": "#/components/schemas/SizeString"
           }
         },
         "type": "object"
@@ -644,7 +687,7 @@
           "format": {
             "$ref": "#/components/schemas/QuoteFormat"
           },
-          "mrenclave": {
+          "measurement": {
             "$ref": "#/components/schemas/string"
           },
           "node_id": {
@@ -686,12 +729,33 @@
         ],
         "type": "string"
       },
+      "RedirectionResolutionKind": {
+        "enum": [
+          "NodeByRole",
+          "StaticAddress"
+        ],
+        "type": "string"
+      },
+      "RedirectionResolverConfig": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/RedirectionResolutionKind"
+          },
+          "target": {
+            "$ref": "#/components/schemas/json"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
       "RetirementPhase": {
         "enum": [
-          "Committed",
           "Ordered",
           "Signed",
-          "Completed"
+          "Completed",
+          "RetiredCommitted"
         ],
         "type": "string"
       },
@@ -770,12 +834,16 @@
           },
           "request_payload_too_large": {
             "$ref": "#/components/schemas/uint64"
+          },
+          "request_target_too_long": {
+            "$ref": "#/components/schemas/uint64"
           }
         },
         "required": [
           "parsing",
           "request_payload_too_large",
-          "request_header_too_large"
+          "request_header_too_large",
+          "request_target_too_long"
         ],
         "type": "object"
       },
@@ -806,7 +874,7 @@
         ],
         "type": "object"
       },
-      "TimeString": {
+      "SizeString": {
         "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
         "type": "string"
       },
@@ -905,12 +973,13 @@
   "info": {
     "description": "This API provides public, uncredentialed access to service and node state.",
     "title": "CCF Public Node API",
-    "version": "4.6.0"
+    "version": "5.0.10"
   },
   "openapi": "3.0.0",
   "paths": {
     "/node/api": {
       "get": {
+        "operationId": "GetNodeApi",
         "responses": {
           "200": {
             "content": {
@@ -932,14 +1001,15 @@
         }
       }
     },
-    "/node/api/metrics": {
+    "/node/attestations": {
       "get": {
+        "operationId": "GetNodeAttestations",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/EndpointMetrics"
+                  "$ref": "#/components/schemas/GetAttestations__Out"
                 }
               }
             },
@@ -949,22 +1019,20 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "summary": "Usage metrics for endpoints",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
       }
     },
-    "/node/code": {
+    "/node/attestations/self": {
       "get": {
-        "deprecated": true,
-        "description": "Permitted SGX code identities",
+        "operationId": "GetNodeAttestationsSelf",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GetCode__Out"
+                  "$ref": "#/components/schemas/Attestation"
                 }
               }
             },
@@ -974,15 +1042,31 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "summary": "This endpoint is deprecated. It is replaced by /gov/kv/nodes/code_ids endpoint",
         "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
+    "/node/backup": {
+      "get": {
+        "operationId": "GetNodeBackup",
+        "responses": {
+          "200": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
         }
       }
     },
     "/node/commit": {
       "get": {
         "description": "Latest transaction ID that has been committed on the service",
+        "operationId": "GetNodeCommit",
         "parameters": [
           {
             "in": "query",
@@ -1024,6 +1108,7 @@
     },
     "/node/config": {
       "get": {
+        "operationId": "GetNodeConfig",
         "responses": {
           "200": {
             "content": {
@@ -1046,6 +1131,7 @@
     },
     "/node/consensus": {
       "get": {
+        "operationId": "GetNodeConsensus",
         "responses": {
           "200": {
             "content": {
@@ -1066,8 +1152,32 @@
         }
       }
     },
+    "/node/historical_cache": {
+      "get": {
+        "operationId": "GetNodeHistoricalCache",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetHistoricalCacheInfo__Out"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      }
+    },
     "/node/index/strategies": {
       "get": {
+        "operationId": "GetNodeIndexStrategies",
         "responses": {
           "200": {
             "content": {
@@ -1090,6 +1200,7 @@
     },
     "/node/js_metrics": {
       "get": {
+        "operationId": "GetNodeJsMetrics",
         "responses": {
           "200": {
             "content": {
@@ -1110,14 +1221,15 @@
         }
       }
     },
-    "/node/jwt_metrics": {
+    "/node/jwt_keys/refresh/metrics": {
       "get": {
+        "operationId": "GetNodeJwtKeysRefreshMetrics",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/JWTMetrics"
+                  "$ref": "#/components/schemas/JWTRefreshMetrics"
                 }
               }
             },
@@ -1132,30 +1244,243 @@
         }
       }
     },
-    "/node/memory": {
+    "/node/ledger_chunk": {
       "get": {
+        "description": "Redirect to the corresponding /node/ledger_chunk/{chunk_name} endpoint for the ledger chunk including the sequence number specified in the 'since' query parameter. If 'include_committed_prefix' is true and no committed file is available, this may temporarily redirect to a synthetic committed-prefix resource.",
+        "operationId": "GetNodeLedgerChunk",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "since",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/uint64"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_committed_prefix",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/boolean"
+            }
+          }
+        ],
         "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemoryUsage__Out"
-                }
-              }
-            },
-            "description": "Default response description"
+          "307": {
+            "description": "Redirect to a temporary committed ledger prefix."
+          },
+          "308": {
+            "description": "Redirect to the selected ledger chunk."
+          },
+          "404": {
+            "description": "No matching ledger chunk is available."
           },
           "default": {
             "$ref": "#/components/responses/default"
           }
         },
+        "summary": "Download ledger chunk",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "head": {
+        "description": "Redirect to the corresponding /node/ledger_chunk/{chunk_name} endpoint for the ledger chunk including the sequence number specified in the 'since' query parameter. If 'include_committed_prefix' is true and no committed file is available, this may temporarily redirect to a synthetic committed-prefix resource.",
+        "operationId": "HeadNodeLedgerChunk",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "since",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/uint64"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include_committed_prefix",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/boolean"
+            }
+          }
+        ],
+        "responses": {
+          "307": {
+            "description": "Redirect to a temporary committed ledger prefix."
+          },
+          "308": {
+            "description": "Redirect to the selected ledger chunk."
+          },
+          "404": {
+            "description": "No matching ledger chunk is available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Ledger chunk metadata",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/never"
         }
       }
     },
+    "/node/ledger_chunk/committed_prefix/{chunk_name}": {
+      "get": {
+        "description": "Download a synthetic chunk containing only committed ledger entries. Supports HTTP Range and digest headers. The resource is not a canonical .committed ledger file and must not be used for recovery.",
+        "operationId": "GetNodeLedgerChunkCommittedPrefixChunkName",
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            },
+            "description": "The requested committed ledger prefix."
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            },
+            "description": "The requested byte range of the committed ledger prefix."
+          },
+          "304": {
+            "description": "The requested committed ledger prefix has not changed."
+          },
+          "404": {
+            "description": "The requested committed ledger prefix is not available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Download committed ledger prefix",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "head": {
+        "description": "Metadata about a synthetic chunk containing only committed ledger entries. The resource is not a canonical .committed ledger file.",
+        "operationId": "HeadNodeLedgerChunkCommittedPrefixChunkName",
+        "responses": {
+          "200": {
+            "description": "Metadata for the requested committed ledger prefix."
+          },
+          "206": {
+            "description": "Metadata for the requested committed ledger prefix range."
+          },
+          "304": {
+            "description": "The requested committed ledger prefix has not changed."
+          },
+          "404": {
+            "description": "The requested committed ledger prefix is not available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Committed ledger prefix metadata",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "chunk_name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/node/ledger_chunk/{chunk_name}": {
+      "get": {
+        "description": "Download a specific ledger chunk by name. Supports HTTP Range header for partial downloads.",
+        "operationId": "GetNodeLedgerChunkChunkName",
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            },
+            "description": "The requested ledger chunk."
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            },
+            "description": "The requested byte range of the ledger chunk."
+          },
+          "304": {
+            "description": "The requested ledger chunk has not changed."
+          },
+          "404": {
+            "description": "The requested ledger chunk is not available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Download ledger chunk",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "head": {
+        "description": "Metadata about a specific ledger chunk (Content-Length and x-ms-ccf-ledger-chunk-name)",
+        "operationId": "HeadNodeLedgerChunkChunkName",
+        "responses": {
+          "200": {
+            "description": "Metadata for the requested ledger chunk."
+          },
+          "206": {
+            "description": "Metadata for the requested ledger chunk range."
+          },
+          "304": {
+            "description": "The requested ledger chunk has not changed."
+          },
+          "404": {
+            "description": "The requested ledger chunk is not available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Ledger chunk metadata",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "chunk_name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
+    },
     "/node/metrics": {
       "get": {
+        "operationId": "GetNodeMetrics",
         "responses": {
           "200": {
             "content": {
@@ -1178,6 +1503,7 @@
     },
     "/node/network": {
       "get": {
+        "operationId": "GetNodeNetwork",
         "responses": {
           "200": {
             "content": {
@@ -1200,6 +1526,7 @@
     },
     "/node/network/nodes": {
       "get": {
+        "operationId": "GetNodeNetworkNodes",
         "parameters": [
           {
             "in": "query",
@@ -1248,6 +1575,7 @@
     },
     "/node/network/nodes/primary": {
       "get": {
+        "operationId": "GetNodeNetworkNodesPrimary",
         "responses": {
           "200": {
             "content": {
@@ -1270,6 +1598,7 @@
     },
     "/node/network/nodes/self": {
       "get": {
+        "operationId": "GetNodeNetworkNodesSelf",
         "responses": {
           "200": {
             "content": {
@@ -1292,6 +1621,7 @@
     },
     "/node/network/nodes/{node_id}": {
       "delete": {
+        "operationId": "DeleteNodeNetworkNodesNodeId",
         "responses": {
           "200": {
             "content": {
@@ -1312,6 +1642,7 @@
         }
       },
       "get": {
+        "operationId": "GetNodeNetworkNodesNodeId",
         "responses": {
           "200": {
             "content": {
@@ -1344,6 +1675,7 @@
     },
     "/node/network/removable_nodes": {
       "get": {
+        "operationId": "GetNodeNetworkRemovableNodes",
         "responses": {
           "200": {
             "content": {
@@ -1365,10 +1697,25 @@
       }
     },
     "/node/primary": {
-      "head": {
+      "get": {
+        "operationId": "GetNodePrimary",
         "responses": {
           "200": {
             "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "head": {
+        "operationId": "HeadNodePrimary",
+        "responses": {
+          "308": {
+            "description": "Redirect to the current primary node."
           },
           "default": {
             "$ref": "#/components/responses/default"
@@ -1381,6 +1728,7 @@
     },
     "/node/quotes": {
       "get": {
+        "operationId": "GetNodeQuotes",
         "responses": {
           "200": {
             "content": {
@@ -1403,6 +1751,7 @@
     },
     "/node/quotes/self": {
       "get": {
+        "operationId": "GetNodeQuotesSelf",
         "responses": {
           "200": {
             "content": {
@@ -1425,9 +1774,13 @@
     },
     "/node/ready/app": {
       "get": {
+        "operationId": "GetNodeReadyApp",
         "responses": {
           "204": {
             "description": "Default response description"
+          },
+          "503": {
+            "description": "The application frontend is not ready."
           },
           "default": {
             "$ref": "#/components/responses/default"
@@ -1440,9 +1793,13 @@
     },
     "/node/ready/gov": {
       "get": {
+        "operationId": "GetNodeReadyGov",
         "responses": {
           "204": {
             "description": "Default response description"
+          },
+          "503": {
+            "description": "The governance frontend is not ready."
           },
           "default": {
             "$ref": "#/components/responses/default"
@@ -1456,6 +1813,7 @@
     "/node/receipt": {
       "get": {
         "description": "A signed statement from the service over a transaction entry in the ledger",
+        "operationId": "GetNodeReceipt",
         "parameters": [
           {
             "in": "query",
@@ -1477,6 +1835,16 @@
             },
             "description": "Default response description"
           },
+          "202": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/string"
+                }
+              }
+            },
+            "description": "The transaction is not yet available. The response describes why and the Retry-After header indicates when to retry."
+          },
           "default": {
             "$ref": "#/components/responses/default"
           }
@@ -1487,8 +1855,54 @@
         }
       }
     },
+    "/node/receipt/cose": {
+      "get": {
+        "description": "A COSE Sign1 envelope containing a signed statement from the service over a transaction entry in the ledger, with a Merkle proof in the unprotected header. See https://datatracker.ietf.org/doc/draft-ietf-scitt-receipts-ccf-profile/ for a complete description.",
+        "operationId": "GetNodeReceiptCose",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "transaction_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TransactionId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/cose": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cose"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "202": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/string"
+                }
+              }
+            },
+            "description": "The transaction is not yet available. The response describes why and the Retry-After header indicates when to retry."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "COSE receipt for a transaction",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      }
+    },
     "/node/self_signed_certificate": {
       "get": {
+        "operationId": "GetNodeSelfSignedCertificate",
         "responses": {
           "200": {
             "content": {
@@ -1511,6 +1925,7 @@
     },
     "/node/service/configuration": {
       "get": {
+        "operationId": "GetNodeServiceConfiguration",
         "responses": {
           "200": {
             "content": {
@@ -1533,6 +1948,7 @@
     },
     "/node/service/previous_identity": {
       "get": {
+        "operationId": "GetNodeServicePreviousIdentity",
         "responses": {
           "200": {
             "content": {
@@ -1553,8 +1969,156 @@
         }
       }
     },
+    "/node/snapshot": {
+      "get": {
+        "operationId": "GetNodeSnapshot",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/uint64"
+            }
+          }
+        ],
+        "responses": {
+          "308": {
+            "description": "Redirect to the selected snapshot."
+          },
+          "404": {
+            "description": "No matching snapshot is available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "head": {
+        "operationId": "HeadNodeSnapshot",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/uint64"
+            }
+          }
+        ],
+        "responses": {
+          "308": {
+            "description": "Redirect to the selected snapshot."
+          },
+          "404": {
+            "description": "No matching snapshot is available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
+    "/node/snapshot/{snapshot_name}": {
+      "get": {
+        "operationId": "GetNodeSnapshotSnapshotName",
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            },
+            "description": "The requested snapshot."
+          },
+          "206": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Binary"
+                }
+              }
+            },
+            "description": "The requested byte range of the snapshot."
+          },
+          "304": {
+            "description": "The requested snapshot has not changed."
+          },
+          "404": {
+            "description": "The requested snapshot is not available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "head": {
+        "operationId": "HeadNodeSnapshotSnapshotName",
+        "responses": {
+          "200": {
+            "description": "Metadata for the requested snapshot."
+          },
+          "206": {
+            "description": "Metadata for the requested snapshot range."
+          },
+          "304": {
+            "description": "The requested snapshot has not changed."
+          },
+          "404": {
+            "description": "The requested snapshot is not available."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "snapshot_name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/node/snapshot:create": {
+      "post": {
+        "operationId": "PostNodeSnapshotCreate",
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "404": {
+            "description": "The required operator feature is not enabled on this interface."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/never"
+        }
+      }
+    },
     "/node/state": {
       "get": {
+        "operationId": "GetNodeState",
         "responses": {
           "200": {
             "content": {
@@ -1578,6 +2142,7 @@
     "/node/tx": {
       "get": {
         "description": "Possible statuses returned are Unknown, Pending, Committed or Invalid.",
+        "operationId": "GetNodeTx",
         "parameters": [
           {
             "in": "query",
@@ -1611,6 +2176,7 @@
     },
     "/node/version": {
       "get": {
+        "operationId": "GetNodeVersion",
         "responses": {
           "200": {
             "content": {

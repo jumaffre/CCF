@@ -4,12 +4,25 @@
 #include "../history.h"
 
 #define FMT_HEADER_ONLY
+
 #include <algorithm>
+#include <charconv>
+#include <cstdint>
+#include <cstdlib>
 #include <fmt/format.h>
+#include <iostream>
 #include <picobench/picobench.hpp>
 #include <random>
+#include <string_view>
 
 using namespace std;
+
+// Merkle tree operations do not depend on leaf hashes being unpredictable, so
+// synthetic leaves come from a PRNG rather than from per-byte hardware entropy,
+// which is slow and host-dependent. A seed is drawn once per run (or read from
+// RNG_SEED) and printed, and each sample re-seeds its own generator with it, so
+// a sample's inputs do not depend on picobench's randomised execution order.
+static uint32_t rng_seed = 0;
 
 template <class A>
 inline void do_not_optimize(A const& value)
@@ -25,13 +38,13 @@ inline void clobber_memory()
 static void append_retract(picobench::state& s)
 {
   ccf::MerkleTreeHistory t;
-  vector<crypto::Sha256Hash> hashes;
-  std::random_device r;
+  vector<ccf::crypto::Sha256Hash> hashes;
+  std::mt19937 r(rng_seed);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
-    crypto::Sha256Hash h;
-    for (size_t j = 0; j < crypto::Sha256Hash::SIZE; j++)
+    ccf::crypto::Sha256Hash h;
+    for (size_t j = 0; j < ccf::crypto::Sha256Hash::SIZE; j++)
       h.h[j] = r();
 
     hashes.emplace_back(h);
@@ -58,13 +71,13 @@ static void append_retract(picobench::state& s)
 static void append_flush(picobench::state& s)
 {
   ccf::MerkleTreeHistory t;
-  vector<crypto::Sha256Hash> hashes;
-  std::random_device r;
+  vector<ccf::crypto::Sha256Hash> hashes;
+  std::mt19937 r(rng_seed);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
-    crypto::Sha256Hash h;
-    for (size_t j = 0; j < crypto::Sha256Hash::SIZE; j++)
+    ccf::crypto::Sha256Hash h;
+    for (size_t j = 0; j < ccf::crypto::Sha256Hash::SIZE; j++)
       h.h[j] = r();
 
     hashes.emplace_back(h);
@@ -88,13 +101,13 @@ static void append_flush(picobench::state& s)
 static void append_get_proof_verify(picobench::state& s)
 {
   ccf::MerkleTreeHistory t;
-  vector<crypto::Sha256Hash> hashes;
-  std::random_device r;
+  vector<ccf::crypto::Sha256Hash> hashes;
+  std::mt19937 r(rng_seed);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
-    crypto::Sha256Hash h;
-    for (size_t j = 0; j < crypto::Sha256Hash::SIZE; j++)
+    ccf::crypto::Sha256Hash h;
+    for (size_t j = 0; j < ccf::crypto::Sha256Hash::SIZE; j++)
       h.h[j] = r();
 
     hashes.emplace_back(h);
@@ -120,13 +133,13 @@ static void append_get_proof_verify(picobench::state& s)
 static void append_get_proof_verify_v(picobench::state& s)
 {
   ccf::MerkleTreeHistory t;
-  vector<crypto::Sha256Hash> hashes;
-  std::random_device r;
+  vector<ccf::crypto::Sha256Hash> hashes;
+  std::mt19937 r(rng_seed);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
-    crypto::Sha256Hash h;
-    for (size_t j = 0; j < crypto::Sha256Hash::SIZE; j++)
+    ccf::crypto::Sha256Hash h;
+    for (size_t j = 0; j < ccf::crypto::Sha256Hash::SIZE; j++)
       h.h[j] = r();
 
     hashes.emplace_back(h);
@@ -153,12 +166,12 @@ static void append_get_proof_verify_v(picobench::state& s)
 static void serialise_deserialise(picobench::state& s)
 {
   ccf::MerkleTreeHistory t;
-  std::random_device r;
+  std::mt19937 r(rng_seed);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
-    crypto::Sha256Hash h;
-    for (size_t j = 0; j < crypto::Sha256Hash::SIZE; j++)
+    ccf::crypto::Sha256Hash h;
+    for (size_t j = 0; j < ccf::crypto::Sha256Hash::SIZE; j++)
       h.h[j] = r();
     t.append(h);
   }
@@ -172,12 +185,12 @@ static void serialise_deserialise(picobench::state& s)
 static void serialised_size(picobench::state& s)
 {
   ccf::MerkleTreeHistory t;
-  std::random_device r;
+  std::mt19937 r(rng_seed);
 
-  for (size_t i = 0; i < s.iterations(); ++i)
+  for (int i = 0; i < s.iterations(); ++i)
   {
-    crypto::Sha256Hash h;
-    for (size_t j = 0; j < crypto::Sha256Hash::SIZE; j++)
+    ccf::crypto::Sha256Hash h;
+    for (size_t j = 0; j < ccf::crypto::Sha256Hash::SIZE; j++)
       h.h[j] = r();
     t.append(h);
   }
@@ -191,23 +204,23 @@ static void serialised_size(picobench::state& s)
                  s.iterations(),
                  buf.size(),
                  bph,
-                 (bph - crypto::Sha256Hash::SIZE) * 100 /
-                   crypto::Sha256Hash::SIZE)
+                 (bph - ccf::crypto::Sha256Hash::SIZE) * 100 /
+                   ccf::crypto::Sha256Hash::SIZE)
             << std::endl;
 }
 
 const std::vector<int> sizes = {1000, 10000};
 
 PICOBENCH_SUITE("append_retract");
-PICOBENCH(append_retract).iterations(sizes).samples(10).baseline();
+PICOBENCH(append_retract).iterations(sizes).baseline();
 PICOBENCH_SUITE("append_flush");
-PICOBENCH(append_flush).iterations(sizes).samples(10).baseline();
+PICOBENCH(append_flush).iterations(sizes).baseline();
 PICOBENCH_SUITE("append_get_proof_verify");
-PICOBENCH(append_get_proof_verify).iterations(sizes).samples(10).baseline();
+PICOBENCH(append_get_proof_verify).iterations(sizes).baseline();
 PICOBENCH_SUITE("append_get_proof_verify_v");
-PICOBENCH(append_get_proof_verify_v).iterations(sizes).samples(10).baseline();
+PICOBENCH(append_get_proof_verify_v).iterations(sizes).baseline();
 PICOBENCH_SUITE("serialise_deserialise");
-PICOBENCH(serialise_deserialise).iterations(sizes).samples(10).baseline();
+PICOBENCH(serialise_deserialise).iterations(sizes).baseline();
 // Checks the size of serialised tree, timing results are irrelevant here
 // and since we run a single sample probably not that accurate anyway
 PICOBENCH_SUITE("serialised_size");
@@ -218,10 +231,30 @@ PICOBENCH(serialised_size)
 
 int main(int argc, char* argv[])
 {
+  const char* env_seed = std::getenv("RNG_SEED");
+  if (env_seed != nullptr && *env_seed != '\0')
+  {
+    const std::string_view seed_str(env_seed);
+    const auto* seed_end = seed_str.data() + seed_str.size();
+    const auto [ptr, ec] = std::from_chars(seed_str.data(), seed_end, rng_seed);
+    if (ec != std::errc() || ptr != seed_end)
+    {
+      std::cerr << fmt::format(
+                     "RNG_SEED must be an unsigned 32-bit integer, not '{}'",
+                     seed_str)
+                << std::endl;
+      return 1;
+    }
+  }
+  else
+  {
+    rng_seed = std::random_device{}();
+  }
+  std::cerr << fmt::format("RNG seed: {} (set RNG_SEED to reproduce)", rng_seed)
+            << std::endl;
+
   picobench::runner runner;
-  crypto::openssl_sha256_init();
   runner.parse_cmd_line(argc, argv);
   auto ret = runner.run();
-  crypto::openssl_sha256_shutdown();
   return ret;
 }

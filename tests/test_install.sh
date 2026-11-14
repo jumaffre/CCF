@@ -40,10 +40,11 @@ rm -rf "$working_dir"
 mkdir -p "$working_dir"
 cd "$working_dir"
 
+export BETTER_EXCEPTIONS=1
+
 # Start ephemeral network in the background
-network_live_time=120
-timeout --signal=SIGINT --kill-after=${network_live_time}s --preserve-status ${network_live_time}s \
-"$INSTALL_PREFIX"/bin/sandbox.sh --verbose &
+network_live_time=60
+"$INSTALL_PREFIX"/bin/sandbox.sh --auto-shutdown --auto-shutdown-delay-s ${network_live_time} --verbose &
 
 if poll_for_service_open ${network_live_time}; then
     echo "Error: Timeout waiting for service to open"
@@ -51,10 +52,15 @@ if poll_for_service_open ${network_live_time}; then
     exit 1
 fi
 
-python3.8 -m venv env
+python3 -m venv --without-pip env
+bash "$INSTALL_PREFIX"/bin/install_uv.sh "$PWD"/env/bin
 # shellcheck source=/dev/null
 source env/bin/activate
-python -m pip install -e ../../../python
+if [[ "${CCF_USE_RELEASED_PYTHON_PACKAGE:-0}" == "1" ]]; then
+    uv pip install --upgrade --reinstall-package ccf ccf
+else
+    uv pip install -e ../../../python
+fi
 
 # Poll until service has died
 while [ "$(service_http_status)" == "200" ]; do
@@ -68,9 +74,8 @@ python ../../../python/ledger_tutorial.py ./workspace/sandbox_0/0.ledger
 # Recover network
 cp -r ./workspace/sandbox_0/0.ledger .
 
-recovered_network_live_time=120
-timeout --signal=SIGINT --kill-after=${recovered_network_live_time}s --preserve-status ${recovered_network_live_time}s \
-"$INSTALL_PREFIX"/bin/sandbox.sh --verbose \
+recovered_network_live_time=10
+"$INSTALL_PREFIX"/bin/sandbox.sh --auto-shutdown --auto-shutdown-delay-s ${recovered_network_live_time} --verbose  \
     --recover \
     --ledger-dir 0.ledger \
     --common-dir ./workspace/sandbox_common/

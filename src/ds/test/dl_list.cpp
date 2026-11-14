@@ -3,6 +3,7 @@
 
 #include "ds/dl_list.h"
 
+#include <cstddef>
 #include <doctest/doctest.h>
 
 using namespace ds;
@@ -34,7 +35,7 @@ TEST_CASE(
   {
     for (size_t i = 0; i < elements_count; i++)
     {
-      auto* e = new Element{i};
+      auto* e = new Element{i, nullptr, nullptr};
       if (i % 2 == 0)
       {
         list.insert(e);

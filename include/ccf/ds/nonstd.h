@@ -2,13 +2,21 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
+#include <cstring>
+#include <ctime>
+#include <regex>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
+#include <unistd.h>
 #include <vector>
+
+#define FMT_HEADER_ONLY
+#include <fmt/format.h>
 
 /**
  * This file defines various type traits and utils that are not available in the
@@ -16,7 +24,7 @@
  * some are proposed, some are purely custom. They are defined here to avoid
  * repetition in other locations.
  */
-namespace nonstd
+namespace ccf::nonstd
 {
   /** is_specialization detects type-specialized templates. This does not work
    * for value-dependent types (eg - std::array)
@@ -95,7 +103,7 @@ namespace nonstd
   }
 
   /* split_1 wraps split and allows writing things like:
-   * auto [host, port] = nonstd::split_1("1.2.3.4:8000", ":")
+   * auto [host, port] = ccf::nonstd::split_1("1.2.3.4:8000", ":")
    */
   static inline std::tuple<std::string_view, std::string_view> split_1(
     const std::string_view& s, const std::string_view& separator)
@@ -139,10 +147,7 @@ namespace nonstd
       {
         break;
       }
-      else
-      {
-        next_separator_start = s.rfind(separator, prev_separator_start - 1);
-      }
+      next_separator_start = s.rfind(separator, prev_separator_start - 1);
     }
 
     result.push_back(s.substr(0, prev_separator_start));
@@ -152,7 +157,7 @@ namespace nonstd
 
   /* rsplit_1 wraps rsplit _and reverses the result order_ and allows writing
    * things like:
-   * auto [host, port] = nonstd::rsplit_1("[1:2:3:4]:8000", ":")
+   * auto [host, port] = ccf::nonstd::rsplit_1("[1:2:3:4]:8000", ":")
    */
   static inline std::tuple<std::string_view, std::string_view> rsplit_1(
     const std::string_view& s, const std::string_view& separator)
@@ -183,50 +188,13 @@ namespace nonstd
     });
   }
 
-  // Iterators for map-keys and map-values
-  template <typename TMapIterator>
-  class KeyIterator : public TMapIterator
+  static inline std::string_view trim(
+    std::string_view s, std::string_view trim_chars = " \t\r\n")
   {
-  public:
-    KeyIterator() : TMapIterator() {}
-    KeyIterator(TMapIterator it) : TMapIterator(it) {}
-
-    using Key =
-      typename std::iterator_traits<TMapIterator>::value_type::first_type;
-    using value_type = Key;
-
-    Key* operator->()
-    {
-      return TMapIterator::operator->()->first;
-    }
-
-    Key operator*()
-    {
-      return TMapIterator::operator*().first;
-    }
-  };
-
-  template <typename TMapIterator>
-  class ValueIterator : public TMapIterator
-  {
-  public:
-    ValueIterator() : TMapIterator() {}
-    ValueIterator(TMapIterator it) : TMapIterator(it) {}
-
-    using Value =
-      typename std::iterator_traits<TMapIterator>::value_type::second_type;
-    using value_type = Value;
-
-    Value* operator->()
-    {
-      return TMapIterator::operator->()->second;
-    }
-
-    Value operator*()
-    {
-      return TMapIterator::operator*().second;
-    }
-  };
+    const auto start = std::min(s.find_first_not_of(trim_chars), s.size());
+    const auto end = std::min(s.find_last_not_of(trim_chars) + 1, s.size());
+    return s.substr(start, end - start);
+  }
 
   /// Iterate through tuple, calling functor on each element
   template <size_t I = 0, typename F, typename... Ts>
@@ -238,4 +206,106 @@ namespace nonstd
       tuple_for_each<I + 1>(t, f);
     }
   }
+
+  static void close_fd(int* fd)
+  {
+    if (fd != nullptr && *fd >= 0)
+    {
+      // Best-effort cleanup from a scope guard, with no way to report failure
+      std::ignore = close(*fd);
+      *fd = -1;
+    }
+  }
+
+  using CloseFdGuard = std::unique_ptr<int, decltype(&close_fd)>;
+
+  static inline CloseFdGuard make_close_fd_guard(int* fd)
+  {
+    return {fd, close_fd};
+  }
+
+#if !defined(__STDC_LIB_EXT1__)
+  namespace detail
+  {
+    // POSIX specifies two incompatible variants of strerror_r, distinguished
+    // only by their return type. Overload on that return type so that the
+    // correct variant is selected at compile time.
+
+    // XSI-compliant variant: int strerror_r(int, char*, size_t). Returns 0 on
+    // success and writes the message into the supplied buffer.
+    static inline std::string strerror_r_result(int rc, const char* buf)
+    {
+      if (rc != 0)
+      {
+        return "Unknown error";
+      }
+      return buf;
+    }
+
+    // GNU variant: char* strerror_r(int, char*, size_t). Returns a pointer to
+    // the message, which may point to a static string rather than the supplied
+    // buffer.
+    static inline std::string strerror_r_result(
+      const char* msg, const char* /* buf */)
+    {
+      return msg;
+    }
+  }
+#endif
+
+  /** A thread-safe replacement for std::strerror.
+   *
+   * The C strerror (and std::strerror) may return a pointer to a statically
+   * allocated buffer which can be overwritten by a concurrent call from another
+   * thread, so clang-tidy flags it as concurrency-mt-unsafe. This wrapper uses
+   * the platform's safe equivalent - the C11 Annex K strerror_s/strerrorlen_s
+   * where available, or POSIX strerror_r otherwise - and returns an owning
+   * std::string.
+   */
+  static inline std::string strerror(int errnum)
+  {
+#if defined(__STDC_LIB_EXT1__)
+    const size_t len = ::strerrorlen_s(errnum);
+    std::string result(len + 1, '\0');
+    const errno_t rc = ::strerror_s(result.data(), result.size(), errnum);
+    if (rc != 0)
+    {
+      return "Unknown error";
+    }
+    result.resize(std::strlen(result.c_str()));
+    return result;
+#else
+    std::array<char, 256> buf{};
+    return detail::strerror_r_result(
+      ::strerror_r(errnum, buf.data(), buf.size()), buf.data());
+#endif
+  }
+
+  // A custom clock type for handling certificate validity periods, which are
+  // defined in terms of seconds since the epoch. This avoids issues with
+  // system_clock::time_point being unable to represent times after 2262-04-11
+  // 23:47:17 UTC (due to tracking nanosecond precision).
+  struct SystemClock
+  {
+    using duration = std::chrono::seconds;
+    using rep = duration::rep;
+    using period = duration::period;
+    using time_point = std::chrono::time_point<SystemClock>;
+    static constexpr bool is_steady = false;
+
+    static time_point now() noexcept
+    {
+      return time_point(duration(std::time(nullptr)));
+    }
+
+    static std::time_t to_time_t(const time_point& t) noexcept
+    {
+      return std::time_t(t.time_since_epoch().count());
+    }
+
+    static time_point from_time_t(std::time_t t) noexcept
+    {
+      return time_point(duration(t));
+    }
+  };
 }

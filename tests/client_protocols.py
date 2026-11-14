@@ -1,23 +1,24 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import difflib
+import os
+import re
+import subprocess
+
+import infra.e2e_args
+import infra.net
 import infra.network
 import infra.proc
-import infra.net
 import suite.test_requirements as reqs
-import infra.e2e_args
-import subprocess
-import os
-import difflib
-import re
 
-# As installed by ccf-dev Ansible playbook
+# As installed by setup scripts
 H2SPEC_BIN = "/opt/h2spec/h2spec"
 
 
 def compare_golden():
     script_path = os.path.realpath(__file__)
     script_dir = os.path.dirname(script_path)
-    golden_file = os.path.join(script_dir, "tls_report.csv")
+    golden_file = os.path.join(script_dir, "tls_report_azure_linux.csv")
     print(f"Comparing output to golden file: {golden_file}")
 
     # Read both files into arrays
@@ -86,7 +87,15 @@ def test_tls(network, args):
     cond_removal("tls_report.json")
     cond_removal("tls_report.log")
     r = subprocess.run(
-        ["testssl/testssl.sh", "--outfile", report_basename, endpoint], check=False
+        [
+            "testssl/testssl.sh",
+            "--add-ca",
+            network.cert_path,
+            "--outfile",
+            report_basename,
+            endpoint,
+        ],
+        check=False,
     )
     assert r.returncode == 0
     # Sort csv output lines to simplify comparison
@@ -117,7 +126,7 @@ def test_http2(network, args):
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         test_tls(network, args)
@@ -127,7 +136,7 @@ def run(args):
     args.http2 = True
     args.nodes = infra.e2e_args.nodes(args, 1)
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
         test_http2(network, args)
@@ -135,7 +144,13 @@ def run(args):
 
 if __name__ == "__main__":
     args = infra.e2e_args.cli_args()
-    args.package = "samples/apps/logging/liblogging"
+    args.package = "samples/apps/logging/logging"
 
     args.nodes = infra.e2e_args.nodes(args, 1)
+
+    # Retain only the primary interface, delete any others
+    args.nodes[0].rpc_interfaces = {
+        infra.interfaces.PRIMARY_RPC_INTERFACE: args.nodes[0].get_primary_interface()
+    }
+
     run(args)

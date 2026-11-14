@@ -1,0 +1,196 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+
+#include "ccf/js/extensions/ccf/kv.h"
+
+#include "ccf/js/core/context.h"
+#include "ccf/tx.h"
+#include "js/checks.h"
+#include "js/extensions/ccf/kv_helpers.h"
+#include "js/global_class_ids.h"
+#include "js/permissions_checks.h"
+#include "kv/compacted_version_conflict.h"
+
+#include <map>
+#include <quickjs/quickjs.h>
+
+namespace ccf::js::extensions
+{
+  struct KvExtension::Impl
+  {
+    ccf::kv::Tx* tx;
+    std::unordered_map<std::string, ccf::kv::untyped::Map::Handle*> kv_handles;
+
+    std::optional<ccf::kv::CompactedVersionConflict>
+      compacted_version_conflict = std::nullopt;
+
+    Impl(ccf::kv::Tx* t) : tx(t) {}
+  };
+
+  namespace
+  {
+    kvhelpers::KVMap::Handle* get_map_handle_for(
+      js::core::Context& jsctx,
+      JSValueConst this_val,
+      KVAccessPermissions required_permission)
+    {
+      auto* state = kvhelpers::get_checked_handle_state(
+        jsctx, this_val, required_permission, kvhelpers::KVSource::CurrentTx);
+      if (state == nullptr)
+      {
+        return nullptr;
+      }
+
+      auto* extension = jsctx.get_extension<KvExtension>();
+      if (extension == nullptr)
+      {
+        LOG_FAIL_FMT("No KV extension available");
+        return nullptr;
+      }
+
+      auto& handles = extension->impl->kv_handles;
+      auto it = handles.find(state->map_name);
+      if (it == handles.end())
+      {
+        it = handles.emplace_hint(it, state->map_name, nullptr);
+      }
+
+      if (it->second == nullptr)
+      {
+        ccf::kv::Tx* tx = extension->impl->tx;
+        if (tx == nullptr)
+        {
+          LOG_FAIL_FMT("Can't rehydrate MapHandle - no transaction context");
+          return nullptr;
+        }
+
+        try
+        {
+          it->second = tx->rw<kvhelpers::KVMap>(state->map_name);
+        }
+        catch (const ccf::kv::CompactedVersionConflict& e)
+        {
+          LOG_DEBUG_FMT(
+            "Caught CompactedVersionConflict in JS callback - storing to be "
+            "rethrown later");
+          extension->impl->compacted_version_conflict = e;
+        }
+      }
+
+      return it->second;
+    }
+
+    kvhelpers::KVMap::Handle* get_map_handle(
+      js::core::Context& jsctx, JSValueConst this_val)
+    {
+      return get_map_handle_for(
+        jsctx, this_val, KVAccessPermissions::WRITE_ONLY);
+    }
+
+    kvhelpers::KVMap::ReadOnlyHandle* get_ro_map_handle(
+      js::core::Context& jsctx, JSValueConst this_val)
+    {
+      // NB: This creates (and stores) a writeable handle internally, but
+      // converts to the (subtype) ReadOnlyHandle* in return here. This means
+      // that if we call has() and then put(), we'll correctly have a writeable
+      // handle for the put() despite reading initially.
+      return get_map_handle_for(
+        jsctx, this_val, KVAccessPermissions::READ_ONLY);
+    }
+
+    int js_kv_lookup(
+      JSContext* ctx,
+      JSPropertyDescriptor* desc,
+      [[maybe_unused]] JSValueConst this_val,
+      JSAtom property)
+    {
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+      const auto map_name = jsctx.to_str(property).value_or("");
+      LOG_TRACE_FMT("Looking for kv map '{}'", map_name);
+
+      auto* extension = jsctx.get_extension<KvExtension>();
+      if (extension == nullptr)
+      {
+        LOG_FAIL_FMT("No KV extension available");
+        return -1;
+      }
+
+      auto access_permission =
+        ccf::js::check_kv_map_access(jsctx.access, map_name);
+      std::string explanation =
+        ccf::js::explain_kv_map_access(access_permission, jsctx.access);
+
+      kvhelpers::apply_namespace_restriction(
+        extension->namespace_restriction,
+        map_name,
+        access_permission,
+        explanation);
+
+      auto handle_val =
+        kvhelpers::create_kv_map_handle<get_ro_map_handle, get_map_handle>(
+          jsctx,
+          {.map_name = map_name,
+           .access_permission = access_permission,
+           .permission_explanation = explanation,
+           .source = kvhelpers::KVSource::CurrentTx});
+
+      if (JS_IsException(handle_val) != 0)
+      {
+        return -1;
+      }
+
+      desc->flags = 0;
+      desc->value = handle_val;
+
+      return 1;
+    }
+  }
+
+  KvExtension::KvExtension(ccf::kv::Tx* t, ccf::js::NamespaceRestriction nr) :
+    namespace_restriction(std::move(nr))
+  {
+    impl = std::make_unique<KvExtension::Impl>(t);
+  }
+
+  KvExtension::~KvExtension() = default;
+
+  void KvExtension::install(js::core::Context& ctx)
+  {
+    auto kv = ctx.new_obj_class(kv_class_id);
+
+    auto ccf = ctx.get_or_create_global_property("ccf", ctx.new_obj());
+    JS_CHECK_OR_THROW(ccf.set("kv", std::move(kv)));
+  }
+
+  void KvExtension::rethrow_trapped_exceptions() const
+  {
+    auto& exception = impl->compacted_version_conflict;
+    if (exception.has_value())
+    {
+      throw std::move(exception.value());
+    }
+  }
+}
+
+namespace ccf::js
+{
+  JSClassExoticMethods kv_exotic_methods = {
+    .get_own_property = extensions::js_kv_lookup,
+    .get_own_property_names = {},
+    .delete_property = {},
+    .define_own_property = {},
+    .has_property = {},
+    .get_property = {},
+    .set_property = {},
+    .get_prototype = {},
+    .set_prototype = {},
+    .is_extensible = {},
+    .prevent_extensions = {}};
+  JSClassDef kv_class_def = {
+    .class_name = "KV Tables",
+    .finalizer = {},
+    .gc_mark = {},
+    .call = {},
+    .exotic = &kv_exotic_methods};
+}

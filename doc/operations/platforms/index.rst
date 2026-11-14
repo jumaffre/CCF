@@ -6,10 +6,7 @@ CCF can run on several hardware platforms/trusted execution environments, which 
 .. toctree::
     :maxdepth: 1
 
-    sgx
     snp
     virtual
 
-CCF releases (Debian packages and Docker images) are available for each platform.
-
-.. note:: Support for a single CCF service running a mix of node platforms is currently experimental.
+Current CCF releases provide a single RPM package supporting both SEV-SNP and insecure virtual operation.

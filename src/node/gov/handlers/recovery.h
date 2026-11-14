@@ -3,23 +3,62 @@
 #pragma once
 
 #include "ccf/base_endpoint_registry.h"
+#include "ccf/ds/json.h"
 #include "node/gov/api_version.h"
 #include "node/gov/handlers/helpers.h"
 #include "node/share_manager.h"
 
 namespace ccf::gov::endpoints
 {
-  void init_recovery_handlers(
+  namespace api
+  {
+    struct EncryptedRecoveryShare
+    {
+      ccf::MemberId member_id;
+      std::string encrypted_share;
+    };
+
+    DECLARE_JSON_TYPE(EncryptedRecoveryShare);
+    DECLARE_JSON_REQUIRED_FIELDS_WITH_RENAMES(
+      EncryptedRecoveryShare,
+      member_id,
+      "memberId",
+      encrypted_share,
+      "encryptedShare");
+
+    struct RecoveryResponse
+    {
+      std::string message;
+      size_t submitted_count = 0;
+      size_t recovery_threshold = 0;
+      bool full_key_submitted = false;
+    };
+
+    DECLARE_JSON_TYPE(RecoveryResponse);
+    DECLARE_JSON_REQUIRED_FIELDS_WITH_RENAMES(
+      RecoveryResponse,
+      message,
+      "message",
+      submitted_count,
+      "submittedCount",
+      recovery_threshold,
+      "recoveryThreshold",
+      full_key_submitted,
+      "fullKeySubmitted");
+  }
+
+  inline void init_recovery_handlers(
     ccf::BaseEndpointRegistry& registry,
     ShareManager& share_manager,
-    ccfapp::AbstractNodeContext& node_context)
+    ccf::AbstractNodeContext& node_context)
   {
     auto get_encrypted_share_for_member =
       [&](auto& ctx, ApiVersion api_version) {
         switch (api_version)
         {
           case ApiVersion::preview_v1:
-          default:
+          case ApiVersion::v1:
+          case ApiVersion::Latest:
           {
             ccf::MemberId member_id;
             if (!detail::try_parse_member_id(ctx.rpc_ctx, member_id))
@@ -41,10 +80,8 @@ namespace ccf::gov::endpoints
               return;
             }
 
-            auto response_body = nlohmann::json::object();
-            response_body["memberId"] = member_id;
-            response_body["encryptedShare"] =
-              crypto::b64_from_raw(encrypted_share.value());
+            const api::EncryptedRecoveryShare response_body{
+              member_id, ccf::crypto::b64_from_raw(encrypted_share.value())};
 
             ctx.rpc_ctx->set_response_json(response_body, HTTP_STATUS_OK);
             return;
@@ -57,14 +94,16 @@ namespace ccf::gov::endpoints
         HTTP_GET,
         api_version_adapter(get_encrypted_share_for_member),
         ccf::no_auth_required)
-      .set_openapi_hidden(true)
+      .set_auto_schema<void, api::EncryptedRecoveryShare>()
+      .set_openapi_summary("Get an encrypted recovery share")
       .install();
 
     auto submit_recovery_share = [&](auto& ctx, ApiVersion api_version) {
       switch (api_version)
       {
         case ApiVersion::preview_v1:
-        default:
+        case ApiVersion::v1:
+        case ApiVersion::Latest:
         {
           if (
             InternalTablesAccess::get_service_status(ctx.tx) !=
@@ -106,22 +145,35 @@ namespace ccf::gov::endpoints
             return;
           }
 
-          const auto& raw_body = ctx.rpc_ctx->get_request_body();
-          const nlohmann::json params = nlohmann::json::parse(raw_body);
+          const auto& cose_ident =
+            ctx.template get_caller<ccf::MemberCOSESign1AuthnIdentity>();
 
-          auto raw_recovery_share =
-            crypto::raw_from_b64(params["share"].get<std::string>());
+          auto params = ccf::parse_json_safe(cose_ident.content);
+          if (cose_ident.member_id != member_id)
+          {
+            detail::set_gov_error(
+              ctx.rpc_ctx,
+              HTTP_STATUS_BAD_REQUEST,
+              ccf::errors::InvalidAuthenticationInfo,
+              fmt::format(
+                "Member ID from path parameter ({}) does not match "
+                "member ID from body signature ({}).",
+                member_id,
+                cose_ident.member_id));
+            return;
+          }
 
-          // Cleanse other copies of secret where possible. Note that this
-          // leaves a JSON-parsed copy, and potentially others in the TLS/HTTP
-          // stack.
-          OPENSSL_cleanse((char*)raw_body.data(), raw_body.size());
+          auto raw_recovery_share = ccf::crypto::raw_from_b64(
+            params["share"].template get<std::string>());
 
           size_t submitted_shares_count = 0;
+          bool full_key_submitted = false;
           try
           {
             submitted_shares_count = share_manager.submit_recovery_share(
               ctx.tx, member_id, raw_recovery_share);
+
+            full_key_submitted = ShareManager::is_full_key(raw_recovery_share);
 
             OPENSSL_cleanse(
               raw_recovery_share.data(), raw_recovery_share.size());
@@ -145,14 +197,22 @@ namespace ccf::gov::endpoints
           const auto threshold =
             InternalTablesAccess::get_recovery_threshold(ctx.tx);
 
-          // Same format of message, whether this is sufficient to trigger
-          // recovery or not
-          std::string message = fmt::format(
-            "{}/{} recovery shares successfully submitted",
-            submitted_shares_count,
-            threshold);
+          std::string message;
+          if (full_key_submitted)
+          {
+            message = "Full recovery key successfully submitted";
+          }
+          else
+          {
+            // Same format of message, whether this is sufficient to trigger
+            // recovery or not
+            message = fmt::format(
+              "{}/{} recovery shares successfully submitted",
+              submitted_shares_count,
+              threshold);
+          }
 
-          if (submitted_shares_count >= threshold)
+          if (submitted_shares_count >= threshold || full_key_submitted)
           {
             message += "\nEnd of recovery procedure initiated";
             GOV_INFO_FMT("{} - initiating recovery", message);
@@ -180,10 +240,8 @@ namespace ccf::gov::endpoints
             }
           }
 
-          auto response_body = nlohmann::json::object();
-          response_body["message"] = message;
-          response_body["submittedCount"] = submitted_shares_count;
-          response_body["recoveryThreshold"] = threshold;
+          const api::RecoveryResponse response_body{
+            message, submitted_shares_count, threshold, full_key_submitted};
 
           ctx.rpc_ctx->set_response_json(response_body, HTTP_STATUS_OK);
           return;
@@ -195,8 +253,9 @@ namespace ccf::gov::endpoints
         "/recovery/members/{memberId}:recover",
         HTTP_POST,
         api_version_adapter(submit_recovery_share),
-        ccf::no_auth_required)
-      .set_openapi_hidden(true)
+        detail::active_member_sig_only_policies("recovery_share"))
+      .set_auto_schema<ds::openapi::Cose, api::RecoveryResponse>()
+      .set_openapi_summary("Submit a recovery share")
       .install();
   }
 }

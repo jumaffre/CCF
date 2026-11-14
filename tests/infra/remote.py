@@ -1,72 +1,62 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import json
 import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
 import time
 from enum import Enum, auto
-import paramiko
-import subprocess
-from contextlib import contextmanager
-import infra.path
-import ctypes
-import signal
-import re
-import stat
-import shutil
-from jinja2 import Environment, FileSystemLoader, select_autoescape
-import json
-import infra.snp as snp
+from typing import ClassVar
+
 import ccf._versionifier
-from setuptools.extern.packaging.version import (  # type: ignore
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+from loguru import logger as LOG
+from packaging.version import (  # type: ignore
     Version,
 )
 
-from loguru import logger as LOG
+import infra.interfaces
+import infra.path
+import infra.platform_detection
+from infra import snp
 
-DBG = os.getenv("DBG", "cgdb")
+DBG = os.getenv("DBG", "lldb")
 
 # Duration after which unresponsive node is declared as crashed on startup
 REMOTE_STARTUP_TIMEOUT_S = 5
-
-
 FILE_TIMEOUT_S = 60
-
-_libc = ctypes.CDLL("libc.so.6")
-
-
-def _term_on_pdeathsig():
-    # usr/include/linux/prctl.h: #define PR_SET_PDEATHSIG 1
-    _libc.prctl(1, signal.SIGTERM)
+# See doc/overview/performance.rst for the rationale behind these defaults.
+DEFAULT_PERF_RECORD_ARGS = "-m 16 -e task-clock:u -F 99 -g --call-graph dwarf --quiet"
 
 
-def popen(*args, **kwargs):
-    kwargs["preexec_fn"] = _term_on_pdeathsig
-    return subprocess.Popen(*args, **kwargs)
+class CmdMixin:
+    perfable = True
 
-
-@contextmanager
-def sftp_session(hostname):
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(hostname)
-    try:
-        session = client.open_sftp()
-        try:
-            yield session
-        finally:
-            session.close()
-    finally:
-        client.close()
-
-
-class CmdMixin(object):
-    def set_perf(self):
-        self.cmd = [
-            "perf",
-            "record",
-            "--freq=1000",
-            "--call-graph=dwarf",
-            "-s",
-        ] + self.cmd
+    @property
+    def cmd(self):
+        if self.perfable and os.getenv("CCF_PERF"):
+            perf_args = os.getenv("CCF_PERF_ARGS", DEFAULT_PERF_RECORD_ARGS)
+            try:
+                parsed_perf_args = shlex.split(perf_args)
+            except ValueError as e:
+                raise ValueError(
+                    f"Invalid CCF_PERF_ARGS {perf_args!r}; expected a shell-style "
+                    "argument string"
+                ) from e
+            return [
+                "perf",
+                "record",
+                *parsed_perf_args,
+                "-o",
+                "perf.data",
+                "--",
+                *self._cmd,
+            ]
+        else:
+            return self._cmd
 
     def _get_perf(self, lines):
         pattern = "=> (.*)tx/s"
@@ -76,278 +66,6 @@ class CmdMixin(object):
             if res:
                 return float(res.group(1))
         raise ValueError(f"No performance result found (pattern is {pattern})")
-
-
-class SSHRemote(CmdMixin):
-    def __init__(
-        self,
-        name,
-        hostname,
-        exe_files,
-        data_files,
-        cmd,
-        workspace,
-        common_dir,
-        env=None,
-        pid_file="pid.file",
-        **kwargs,
-    ):
-        """
-        Runs a command on a remote host, through an SSH connection. A temporary
-        directory is created, and some files can be shipped over. The command is
-        run out of that directory.
-
-        Note that the name matters, since the temporary directory that will be first
-        deleted, then created and populated is workspace/name. There is deliberately no
-        cleanup on shutdown, to make debugging/inspection possible.
-
-        setup() connects, creates the directory and ships over the files
-        start() runs the specified command
-        stop()  disconnects, which shuts down the command via SIGHUP
-        """
-        self.hostname = hostname
-        self.exe_files = exe_files
-        self.data_files = data_files
-        self.cmd = cmd
-        self.client = paramiko.SSHClient()
-        # this client (proc_client) is used to execute commands on the remote host since the main client uses pty
-        self.proc_client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.proc_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self.common_dir = common_dir
-        self.root = os.path.join(workspace, name)
-        self.name = name
-        self.env = env or {}
-        self.out = os.path.join(self.root, "out")
-        self.err = os.path.join(self.root, "err")
-        self.suspension_proc = None
-        self.pid_file = pid_file
-        self._pid = None
-
-    @staticmethod
-    def make_host(host):
-        return host
-
-    @staticmethod
-    def get_node_address(addr):
-        return addr
-
-    def _rc(self, cmd):
-        LOG.info("[{}] {}".format(self.hostname, cmd))
-        _, stdout, _ = self.client.exec_command(cmd)
-        return stdout.channel.recv_exit_status()
-
-    def _connect(self):
-        LOG.debug("[{}] connect".format(self.hostname))
-        self.client.connect(self.hostname)
-        self.proc_client.connect(self.hostname)
-
-    def _setup_files(self):
-        assert self._rc("rm -rf {}".format(self.root)) == 0
-        assert self._rc("mkdir -p {}".format(self.root)) == 0
-        # For SSHRemote, both executable files (host and enclave) and data
-        # files (ledger, secrets) are copied to the remote
-        session = self.client.open_sftp()
-        for path in self.exe_files:
-            tgt_path = os.path.join(self.root, os.path.basename(path))
-            LOG.info("[{}] copy {} from {}".format(self.hostname, tgt_path, path))
-            session.put(path, tgt_path)
-            stat = os.stat(path)
-            session.chmod(tgt_path, stat.st_mode)
-        for path in self.data_files:
-            tgt_path = os.path.join(self.root, os.path.basename(path))
-            if os.path.isdir(path):
-                session.mkdir(tgt_path)
-                for f in os.listdir(path):
-                    session.put(os.path.join(path, f), os.path.join(tgt_path, f))
-            else:
-                session.put(path, tgt_path)
-            LOG.info("[{}] copy {} from {}".format(self.hostname, tgt_path, path))
-        session.close()
-
-    def get(
-        self,
-        file_name,
-        dst_path,
-        timeout=FILE_TIMEOUT_S,
-        target_name=None,
-        pre_condition_func=lambda src_dir, _: True,
-    ):
-        """
-        Get file called `file_name` under the root of the remote. If the
-        file is missing, wait for timeout, and raise an exception.
-
-        If the file is present, it is copied to the CWD on the caller's
-        host, as `target_name` if it is set.
-
-        This call spins up a separate client because we don't want to interrupt
-        the main cmd that may be running.
-        """
-        with sftp_session(self.hostname) as session:
-            end_time = time.time() + timeout
-            start_time = time.time()
-            while time.time() < end_time:
-                try:
-                    target_name = target_name or file_name
-                    fileattr = session.lstat(os.path.join(self.root, file_name))
-                    if stat.S_ISDIR(fileattr.st_mode):
-                        src_dir = os.path.join(self.root, file_name)
-                        dst_dir = os.path.join(dst_path, file_name)
-                        if os.path.exists(dst_dir):
-                            shutil.rmtree(dst_dir)
-                        os.makedirs(dst_dir)
-                        if not pre_condition_func(src_dir, session.listdir):
-                            raise RuntimeError(
-                                "Pre-condition for getting remote files failed"
-                            )
-                        for f in session.listdir(src_dir):
-                            session.get(
-                                os.path.join(src_dir, f), os.path.join(dst_dir, f)
-                            )
-                    else:
-                        session.get(
-                            os.path.join(self.root, file_name),
-                            os.path.join(dst_path, target_name),
-                        )
-                    LOG.debug(
-                        "[{}] found {} after {}s".format(
-                            self.hostname, file_name, int(time.time() - start_time)
-                        )
-                    )
-                    break
-                except FileNotFoundError:
-                    time.sleep(0.1)
-            else:
-                raise ValueError(file_name)
-
-    def list_files(self, timeout=FILE_TIMEOUT_S):
-        files = []
-        with sftp_session(self.hostname) as session:
-            end_time = time.time() + timeout
-            while time.time() < end_time:
-                try:
-                    files = session.listdir(self.root)
-
-                    break
-                except Exception:
-                    time.sleep(0.1)
-
-            else:
-                raise ValueError(self.root)
-        return files
-
-    def get_logs(self):
-        with sftp_session(self.hostname) as session:
-            for filepath in (self.err, self.out):
-                try:
-                    local_file_name = "{}_{}_{}".format(
-                        self.hostname, self.name, os.path.basename(filepath)
-                    )
-                    dst_path = os.path.join(self.common_dir, local_file_name)
-                    session.get(filepath, dst_path)
-                    LOG.info("Downloaded {}".format(dst_path))
-                except FileNotFoundError:
-                    LOG.warning(
-                        "Failed to download {} to {} (host: {})".format(
-                            filepath, dst_path, self.hostname
-                        )
-                    )
-        return os.path.join(
-            self.common_dir, "{}_{}_out".format(self.hostname, self.name)
-        ), os.path.join(self.common_dir, "{}_{}_err".format(self.hostname, self.name))
-
-    def start(self):
-        """
-        Start cmd on the remote host. stdout and err are captured to file locally.
-
-        We create a pty on the remote host under which to run the command, so as to
-        get a SIGHUP on disconnection.
-        """
-        cmd = self.get_cmd()
-        LOG.info("[{}] {}".format(self.hostname, cmd))
-        self.client.exec_command(cmd, get_pty=True)
-        self.pid()
-
-    def pid(self):
-        if self._pid is None:
-            pid_path = os.path.join(self.root, self.pid_file)
-            time_left = 3
-            while time_left > 0:
-                _, stdout, _ = self.proc_client.exec_command(f'cat "{pid_path}"')
-                res = stdout.read().strip()
-                if res:
-                    self._pid = int(res)
-                    break
-                time_left = max(time_left - 0.1, 0)
-                if not time_left:
-                    raise TimeoutError("Failed to read PID from file")
-                time.sleep(0.1)
-        return self._pid
-
-    def suspend(self):
-        _, stdout, _ = self.proc_client.exec_command(f"kill -STOP {self.pid()}")
-        if stdout.channel.recv_exit_status() != 0:
-            raise RuntimeError(f"Remote {self.name} could not be suspended")
-
-    def resume(self):
-        _, stdout, _ = self.proc_client.exec_command(f"kill -CONT {self.pid()}")
-        if stdout.channel.recv_exit_status() != 0:
-            raise RuntimeError(f"Could not resume remote {self.name} from suspension!")
-
-    def sigterm(self):
-        _, stdout, _ = self.proc_client.exec_command(f"kill {self.pid()}")
-        if stdout.channel.recv_exit_status() != 0:
-            raise RuntimeError(f"Remote {self.name} could not deliver SIGTERM")
-
-    def stop(self):
-        """
-        Disconnect the client, and therefore shut down the command as well.
-        """
-        LOG.info("[{}] closing".format(self.hostname))
-        self.client.close()
-        self.proc_client.close()
-
-    def setup(self, **kwargs):
-        """
-        Connect to the remote host, empty the temporary directory if it exsits,
-        and populate it with the initial set of files.
-        """
-        self._connect()
-        self._setup_files()
-
-    def get_cmd(self):
-        env = " ".join(f"{key}={value}" for key, value in self.env.items())
-        cmd = " ".join(self.cmd)
-        return f"cd {self.root} && {env} {cmd} 1> {self.out} 2> {self.err} 0< /dev/null"
-
-    def debug_node_cmd(self):
-        cmd = " ".join(self.cmd)
-        return f"cd {self.root} && {DBG} --args {cmd}"
-
-    def _connect_new(self):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(self.hostname)
-        return client
-
-    def check_done(self):
-        client = self._connect_new()
-        try:
-            _, stdout, _ = client.exec_command(f"ps -p {self.pid()}")
-            return stdout.channel.recv_exit_status() == 1
-        finally:
-            client.close()
-
-    def get_result(self, line_count):
-        client = self._connect_new()
-        try:
-            _, stdout, _ = client.exec_command(f"tail -{line_count} {self.out}")
-            if stdout.channel.recv_exit_status() == 0:
-                lines = stdout.read().splitlines()
-                result = lines[-line_count:]
-                return self._get_perf(result)
-        finally:
-            client.close()
 
 
 class LocalRemote(CmdMixin):
@@ -363,13 +81,10 @@ class LocalRemote(CmdMixin):
         env=None,
         **kwargs,
     ):
-        """
-        Local Equivalent to the SSHRemote
-        """
         self.hostname = hostname
-        self.exe_files = exe_files
+        self.exe_files = set(exe_files)
         self.data_files = data_files
-        self.cmd = cmd
+        self._cmd = cmd
         self.root = os.path.join(workspace, name)
         self.common_dir = common_dir
         self.proc = None
@@ -379,6 +94,21 @@ class LocalRemote(CmdMixin):
         self.name = name
         self.out = os.path.join(self.root, "out")
         self.err = os.path.join(self.root, "err")
+        self.stack_trace = os.path.join(self.root, "stack_trace")
+        self._shutdown_timeout = 10
+        self.pid_file = kwargs.get("pid_file")
+        self.node_container_image = kwargs.get("node_container_image")
+        self.container_name = None
+        self.profiled_pid = None
+        self.profiled_pidfd = None
+
+    @property
+    def shutdown_timeout(self):
+        return self._shutdown_timeout
+
+    @shutdown_timeout.setter
+    def shutdown_timeout(self, value):
+        self._shutdown_timeout = value
 
     @staticmethod
     def make_host(host):
@@ -389,26 +119,26 @@ class LocalRemote(CmdMixin):
         return addr
 
     def _rc(self, cmd):
-        LOG.info("[{}] {}".format(self.hostname, cmd))
+        LOG.info(f"[{self.hostname}] {cmd}")
         return subprocess.call(cmd, shell=True)
 
     def cp(self, src_path, dst_path):
         if os.path.isdir(src_path):
-            assert self._rc("rm -rf {}".format(os.path.join(dst_path))) == 0
-            assert self._rc("cp -r {} {}".format(src_path, dst_path)) == 0
+            assert self._rc(f"rm -rf {os.path.join(dst_path)}") == 0
+            assert self._rc(f"cp -r {src_path} {dst_path}") == 0
         else:
-            assert self._rc("cp {} {}".format(src_path, dst_path)) == 0
+            assert self._rc(f"cp {src_path} {dst_path}") == 0
 
     def _setup_files(self, use_links: bool):
-        assert self._rc("rm -rf {}".format(self.root)) == 0
-        assert self._rc("mkdir -p {}".format(self.root)) == 0
+        assert self._rc(f"rm -rf {self.root}") == 0
+        assert self._rc(f"mkdir -p {self.root}") == 0
         for path in self.exe_files:
             dst_path = os.path.normpath(os.path.join(self.root, os.path.basename(path)))
             src_path = os.path.normpath(os.path.join(os.getcwd(), path))
             if use_links:
-                assert self._rc("ln -s {} {}".format(src_path, dst_path)) == 0
+                assert self._rc(f"ln -s {src_path} {dst_path}") == 0
             else:
-                assert self._rc("cp {} {}".format(src_path, dst_path)) == 0
+                assert self._rc(f"cp {src_path} {dst_path}") == 0
         for path in self.data_files:
             if len(path) > 0:
                 dst_path = os.path.join(self.root, os.path.basename(path))
@@ -429,7 +159,13 @@ class LocalRemote(CmdMixin):
                 break
             time.sleep(0.1)
         else:
-            raise ValueError(path)
+            status = "not started"
+            if self.proc is not None:
+                if self.proc.poll() is None:
+                    status = "running"
+                else:
+                    status = f"stopped (rc: {self.proc.poll()})"
+            raise ValueError(f"{path} not found after {timeout} seconds, {status}")
         if not pre_condition_func(path, os.listdir):
             raise RuntimeError("Pre-condition for getting remote files failed")
         target_name = target_name or os.path.basename(src_path)
@@ -444,39 +180,144 @@ class LocalRemote(CmdMixin):
         """
         cmd = self.get_cmd()
         LOG.info(f"[{self.hostname}] {cmd} (env: {self.env.keys()})")
-        self.stdout = open(self.out, "wb")
-        self.stderr = open(self.err, "wb")
-        self.proc = popen(
-            self.cmd,
+        docker = None
+        if self.node_container_image:
+            docker = shutil.which("docker")
+            if docker is None:
+                raise RuntimeError(
+                    "docker is required when a node container image is specified"
+                )
+        self.stdout = open(self.out, "wb")  # noqa: SIM115 - closed in stop()
+        self.stderr = open(self.err, "wb")  # noqa: SIM115 - closed in stop()
+        launch_cmd = self.cmd
+        launch_env = self.env
+        if self.node_container_image:
+            container_suffix = re.sub(r"[^a-zA-Z0-9_.-]", "-", self.name)
+            self.container_name = f"ccf-{os.getpid()}-{container_suffix}"
+            root = os.path.abspath(self.root)
+            launch_cmd = [
+                docker,
+                "run",
+                "--rm",
+                "--name",
+                self.container_name,
+                "--network",
+                "host",
+                "--user",
+                f"{os.getuid()}:{os.getgid()}",
+                "--volume",
+                f"{root}:{root}",
+                "--workdir",
+                root,
+            ]
+            for key, value in self.env.items():
+                launch_cmd.extend(["--env", f"{key}={value}"])
+            launch_cmd.extend([self.node_container_image, *self.cmd])
+            launch_env = os.environ.copy()
+        self.proc = subprocess.Popen(
+            launch_cmd,
             cwd=self.root,
             stdout=self.stdout,
             stderr=self.stderr,
-            env=self.env,
+            env=launch_env,
         )
 
     def suspend(self):
-        self.proc.send_signal(signal.SIGSTOP)
+        self._send_signal(signal.SIGSTOP)
 
     def resume(self):
-        self.proc.send_signal(signal.SIGCONT)
+        self._send_signal(signal.SIGCONT)
 
     def hangup(self):
-        self.proc.send_signal(signal.SIGHUP)
+        self._send_signal(signal.SIGHUP)
+
+    def _profiling_enabled(self):
+        return self.perfable and os.getenv("CCF_PERF")
+
+    def _open_profiled_pidfd(self):
+        if self.profiled_pidfd is not None:
+            return self.profiled_pidfd
+
+        pid_path = os.path.join(self.root, self.pid_file)
+        deadline = time.monotonic() + REMOTE_STARTUP_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                with open(pid_path, encoding="utf-8") as f:
+                    self.profiled_pid = int(f.read())
+                self.profiled_pidfd = os.pidfd_open(self.profiled_pid)
+                return self.profiled_pidfd
+            except (OSError, ValueError):
+                if self.proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+
+        raise RuntimeError(f"Unable to open profiled process from {pid_path}")
+
+    def _target_pid(self):
+        if self._profiling_enabled() and self.pid_file:
+            self._open_profiled_pidfd()
+            return self.profiled_pid
+
+        return self.proc.pid
+
+    def _send_signal(self, sig):
+        if self.node_container_image:
+            if self.proc is None or self.proc.poll() is not None:
+                return
+            docker = shutil.which("docker")
+            if docker is None:
+                raise RuntimeError(
+                    "docker is required when a node container image is specified"
+                )
+            result = subprocess.run(
+                [
+                    docker,
+                    "kill",
+                    "--signal",
+                    signal.Signals(sig).name,
+                    self.container_name,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0 and self.proc.poll() is None:
+                raise RuntimeError(
+                    f"Unable to signal container {self.container_name}: "
+                    f"{result.stderr.strip()}"
+                )
+            return
+        try:
+            if self._profiling_enabled() and self.pid_file:
+                try:
+                    profiled_pidfd = self._open_profiled_pidfd()
+                except RuntimeError:
+                    if self.proc.poll() is None:
+                        self.proc.send_signal(sig)
+                else:
+                    signal.pidfd_send_signal(profiled_pidfd, sig)
+            else:
+                self.proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
 
     def get_logs(self):
         return self.out, self.err
 
-    def _print_stack_trace(self):
+    def get_stack_trace(self, timeout=20):
+        if self.node_container_image:
+            LOG.info("Stack traces are not available for containerised nodes")
+            return None
         if shutil.which("lldb") != "":
             # To avoid errors on decoding lldb output as utf-8.
             # We shoud find a way to force lldb to use utf-8.
             errors = "ignore"
-            lldb_timeout = 20
             try:
                 command = [
                     "lldb",
-                    "--one-line",
-                    f"process attach --pid {self.proc.pid}",
+                    "--batch",  # Ensure non-interactive
+                    "-p",
+                    f"{self._target_pid()}",
                     "--one-line",
                     "thread backtrace all",
                     "--one-line",
@@ -489,13 +330,12 @@ class LocalRemote(CmdMixin):
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    universal_newlines=True,
                     errors=errors,
                     text=True,
-                    timeout=lldb_timeout,
+                    timeout=timeout,
                     check=True,
                 )
-                LOG.info(f"stack trace: {completed_lldb_process.stdout}")
+                return completed_lldb_process.stdout
             except subprocess.TimeoutExpired:
                 LOG.info(
                     "Failed to get stack trace. lldb did not finish within {lldb_timeout} seconds."
@@ -505,56 +345,107 @@ class LocalRemote(CmdMixin):
         else:
             LOG.info("Couldn't find lldb installed")
 
+    def log_stack_trace(self, timeout=20):
+        st = self.get_stack_trace(timeout=timeout)
+        if st:
+            with open(self.stack_trace, "w", encoding="utf-8") as f:
+                f.write(st)
+            LOG.error(
+                f"Stack trace of process {self.proc.pid} written to {self.stack_trace}"
+            )
+
     def sigterm(self):
-        self.proc.terminate()
+        self._send_signal(signal.SIGTERM)
+
+    def sigkill(self):
+        self._send_signal(signal.SIGKILL)
 
     def stop(self):
         """
         Disconnect the client, and therefore shut down the command as well.
         """
-        LOG.info("[{}] closing".format(self.hostname))
+        LOG.info(f"[{self.hostname}] closing")
         if self.proc:
-            self.proc.terminate()
-            timeout = 10
+            self.sigterm()
             try:
-                self.proc.wait(timeout)
+                self.proc.wait(self._shutdown_timeout)
             except subprocess.TimeoutExpired:
                 LOG.exception(
-                    f"Process didn't finish within {timeout} seconds. Trying to get stack trace..."
+                    f"Process didn't finish within {self._shutdown_timeout} seconds. Trying to get stack trace..."
                 )
-                self._print_stack_trace()
+                st = self.get_stack_trace()
+                if st:
+                    LOG.error(f"Stack trace of process {self.proc.pid}:\n{st}")
                 raise
 
             exit_code = self.proc.returncode
             if exit_code is not None and exit_code < 0:
                 signal_str = signal.strsignal(-exit_code)
                 LOG.error(f"{self.hostname} exited with signal: {signal_str}")
+            profile_error = None
+            if self._profiling_enabled():
+                if exit_code != 0:
+                    profile_error = f"perf record exited with code {exit_code}"
+                perf_data = os.path.join(self.root, "perf.data")
+                if not os.path.isfile(perf_data) or os.path.getsize(perf_data) == 0:
+                    profile_error = f"perf record did not produce {perf_data}"
             if self.stdout:
                 self.stdout.close()
             if self.stderr:
                 self.stderr.close()
+            if self.profiled_pidfd is not None:
+                os.close(self.profiled_pidfd)
+                self.profiled_pidfd = None
+            if profile_error:
+                raise RuntimeError(profile_error)
 
     def setup(self, use_links=True):
         """
         Empty the temporary directory if it exists,
         and populate it with the initial set of files.
         """
-        # SNP Testing currently runs on a fileshare which does not support symlinks
-        if snp.IS_SNP:
-            use_links = False
-        self._setup_files(use_links)
+        self._setup_files(use_links and self.node_container_image is None)
 
     def get_cmd(self, include_dir=True):
         cmd = f"cd {self.root} && " if include_dir else ""
+        if self.node_container_image:
+            root = os.path.abspath(self.root)
+            cmd += (
+                "docker run --rm --network host "
+                f"--volume {root}:{root} --workdir {root} "
+                f"{self.node_container_image} "
+            )
         cmd += f'{" ".join(self.cmd)} 1> {self.out} 2> {self.err}'
         return cmd
 
     def debug_node_cmd(self):
         cmd = " ".join(self.cmd)
-        return f"cd {self.root} && {DBG} --args {cmd}"
+        if self.node_container_image:
+            root = os.path.abspath(self.root)
+            return (
+                "docker run --rm --network host "
+                f"--volume {root}:{root} --workdir {root} "
+                f"{self.node_container_image} {DBG} -- {cmd}"
+            )
+        return f"cd {self.root} && {DBG} -- {cmd}"
 
-    def check_done(self):
-        return self.proc is not None and self.proc.poll() is not None
+    def check_done(self, timeout=5, interval=0.2):
+        if self.proc is None:
+            return False
+
+        if self.proc.poll() is not None:
+            return True
+
+        if timeout <= 0:
+            return False
+
+        done_deadline = time.monotonic() + timeout
+        while time.monotonic() < done_deadline:
+            time.sleep(interval)
+            if self.proc.poll() is not None:
+                return True
+
+        return self.proc.poll() is not None
 
     def get_result(self, line_count):
         with open(self.out, "rb") as out:
@@ -563,28 +454,17 @@ class LocalRemote(CmdMixin):
             return self._get_perf(result)
 
 
-CCF_TO_OE_LOG_LEVEL = {
-    "trace": "VERBOSE",
-    "debug": "INFO",
-    "info": "WARNING",
-    "fail": "ERROR",
-    "fatal": "FATAL",
-}
-
-
-class CCFRemote(object):
-    BIN = "cchost"
+class CCFRemote:
     TEMPLATE_CONFIGURATION_FILE = "config.jinja"
-    DEPS = []
+    DEPS: ClassVar[list[str]] = []
 
     def __init__(
         self,
         start_type,
         enclave_file,
-        enclave_type,
-        remote_class,
         workspace,
         common_dir,
+        binary_name=None,
         label="",
         binary_dir=".",
         local_node_id=None,
@@ -597,14 +477,15 @@ class CCFRemote(object):
         constitution=None,
         curve_id=None,
         version=None,
-        host_log_level="Info",
-        enclave_log_level="Info",
+        log_level="Info",
         major_version=None,
         node_address=None,
         config_file=None,
         join_timer_s=None,
+        pending_node_timeout=None,
         sig_ms_interval=None,
         jwt_key_refresh_interval_s=None,
+        jwt_key_refresh_max_response_size="1MB",
         election_timeout_ms=None,
         consensus_update_timeout_ms=None,
         node_data_json_file=None,
@@ -612,13 +493,30 @@ class CCFRemote(object):
         service_data_json_file=None,
         snp_endorsements_servers=None,
         node_pid_file="node.pid",
-        enclave_platform="sgx",
         snp_uvm_security_context_dir=None,
         set_snp_uvm_security_context_dir_envvar=True,
         ignore_first_sigterm=False,
         node_container_image=None,
         follow_redirect=True,
+        fetch_recent_snapshot=True,
         max_uncommitted_tx_count=0,
+        snp_security_policy_file=None,
+        snp_uvm_endorsements_file=None,
+        snp_endorsements_file=None,
+        service_subject_name="CN=CCF Test Service",
+        historical_cache_soft_limit=None,
+        cose_signatures_issuer="service.example.com",
+        cose_signatures_subject="ledger.signature",
+        sealing_recovery_location=None,
+        recovery_decision_protocol_expected_locations=None,
+        backup_snapshot_fetch_enabled=False,
+        backup_snapshot_fetch_max_attempts=None,
+        backup_snapshot_fetch_retry_interval=None,
+        backup_snapshot_fetch_target_rpc_interface=None,
+        backup_snapshot_fetch_max_size=None,
+        identity_history_fetch_max_attempts=None,
+        identity_history_fetch_retry_interval=None,
+        host_data_transparent_statement_path=None,
         **kwargs,
     ):
         """
@@ -627,50 +525,48 @@ class CCFRemote(object):
 
         snp_security_context_directory_envvar = None
 
-        if "env" in kwargs:
-            env = kwargs["env"]
-        else:
-            env = {}
-            if enclave_platform == "virtual":
-                env["UBSAN_OPTIONS"] = "print_stacktrace=1"
-                ubsan_opts = kwargs.get("ubsan_options")
-                if ubsan_opts:
-                    env["UBSAN_OPTIONS"] += ":" + ubsan_opts
-                env["TSAN_OPTIONS"] = os.environ.get("TSAN_OPTIONS", "")
-                # https://github.com/microsoft/CCF/issues/5198
-                env["ASAN_OPTIONS"] = os.environ.get(
-                    "ASAN_OPTIONS", "alloc_dealloc_mismatch=0"
-                )
-            elif enclave_platform == "snp":
-                env = snp.get_aci_env()
-                snp_security_context_directory_envvar = (
-                    snp.ACI_SEV_SNP_ENVVAR_UVM_SECURITY_CONTEXT_DIR
-                    if set_snp_uvm_security_context_dir_envvar
-                    and snp.ACI_SEV_SNP_ENVVAR_UVM_SECURITY_CONTEXT_DIR in env
-                    else None
-                )
-                if snp_uvm_security_context_dir is not None:
-                    env[
-                        snp_security_context_directory_envvar
-                    ] = snp_uvm_security_context_dir
+        env = kwargs.get("env", {})
 
-        oe_log_level = CCF_TO_OE_LOG_LEVEL.get(kwargs.get("host_log_level"))
-        if oe_log_level:
-            env["OE_LOG_LEVEL"] = oe_log_level
+        if infra.platform_detection.is_snp():
+            env.update(snp.get_aci_env())
+            snp_security_context_directory_envvar = (
+                snp.ACI_SEV_SNP_ENVVAR_UVM_SECURITY_CONTEXT_DIR
+                if set_snp_uvm_security_context_dir_envvar
+                and snp.ACI_SEV_SNP_ENVVAR_UVM_SECURITY_CONTEXT_DIR in env
+                else None
+            )
+            if snp_uvm_security_context_dir is not None:
+                env[snp_security_context_directory_envvar] = (
+                    snp_uvm_security_context_dir
+                )
+        env["UBSAN_OPTIONS"] = "print_stacktrace=1"
+        ubsan_opts = kwargs.get("ubsan_options")
+        if ubsan_opts:
+            env["UBSAN_OPTIONS"] += ":" + ubsan_opts
+        env["TSAN_OPTIONS"] = os.environ.get("TSAN_OPTIONS", "")
+        env["ASAN_OPTIONS"] = os.environ.get("ASAN_OPTIONS", "")
+        env["ASAN_SYMBOLIZER_PATH"] = os.environ.get("ASAN_SYMBOLIZER_PATH", "")
+        env["TSAN_SYMBOLIZER_PATH"] = os.environ.get("TSAN_SYMBOLIZER_PATH", "")
+        if "LLVM_PROFILE_FILE" in os.environ:
+            env["LLVM_PROFILE_FILE"] = os.environ["LLVM_PROFILE_FILE"]
+        if "CCF_RECOVERY_TRACE" in os.environ:
+            env["CCF_RECOVERY_TRACE"] = os.environ["CCF_RECOVERY_TRACE"]
 
         self.name = f"{label}_{local_node_id}"
         self.start_type = start_type
         self.local_node_id = local_node_id
         self.pem = f"{local_node_id}.pem"
+        self.pq_service_cert_file = "pq_service_cert.pem"
         self.node_address_file = f"{local_node_id}.node_address"
         self.rpc_addresses_file = f"{local_node_id}.rpc_addresses"
 
-        # 1.x releases have a separate cchost.virtual binary for virtual enclaves
-        if enclave_type == "virtual" and (
-            major_version is not None and major_version <= 1
-        ):
-            self.BIN = "cchost.virtual"
-        self.BIN = infra.path.build_bin_path(self.BIN, binary_dir=binary_dir)
+        # 7.x releases combined binaries and removed the separate cchost entry-point
+        if major_version is None or major_version >= 7:
+            self.BIN = enclave_file
+        else:
+            assert binary_name, "binary_name must be provided when major_version < 7"
+            self.BIN = infra.path.build_bin_path(binary_name, binary_dir=binary_dir)
+
         self.common_dir = common_dir
         self.pub_host = host.get_primary_interface().public_host
         self.enclave_file = os.path.join(".", os.path.basename(enclave_file))
@@ -693,6 +589,11 @@ class CCFRemote(object):
         if common_read_only_ledger_dir is not None:
             self.read_only_ledger_dirs_names.append(common_read_only_ledger_dir)
 
+        if self.ledger_dir_name in self.read_only_ledger_dirs_names:
+            raise RuntimeError(
+                f"Ledger directory named '{self.ledger_dir_name}' already appears in this node's read-only ledger directories, it cannot also be the node's main writeable directory"
+            )
+
         # Snapshots
         self.snapshots_dir = os.path.normpath(snapshots_dir) if snapshots_dir else None
         self.snapshots_dir_name = (
@@ -713,19 +614,16 @@ class CCFRemote(object):
 
         # Constitution
         constitution = [os.path.basename(f) for f in constitution]
-
-        # ACME
-        if "acme" in kwargs and host.acme_challenge_server_interface:
-            kwargs["acme"][
-                "challenge_server_interface"
-            ] = host.acme_challenge_server_interface
+        assert len(set(constitution)) == len(
+            constitution
+        ), f"Constitution contains files with duplicate names, which is not going to do what you want. Recommend renaming one of them, or improving this infra to copy them to unique names. {constitution=}"
 
         # SNP endorsements servers
         snp_endorsements_servers = snp_endorsements_servers or []
         snp_endorsements_servers_list = []
         for s in snp_endorsements_servers:
             try:
-                server_type, url = s.split(":")
+                server_type, url = s.split(":", 1)
             except ValueError as e:
                 raise ValueError(
                     "SNP endorsements servers should be in the format type:url"
@@ -733,7 +631,24 @@ class CCFRemote(object):
             s = {}
             s["type"] = server_type
             s["url"] = url
+            s["max_retries_count"] = 4
             snp_endorsements_servers_list.append(s)
+
+        # Default snp_security_policy_file if not set
+        if snp_security_policy_file is None:
+            snp_security_policy_file = (
+                "$UVM_SECURITY_CONTEXT_DIR/security-policy-base64"
+            )
+
+        # Default snp_uvm_endorsements_file if not set
+        if snp_uvm_endorsements_file is None:
+            snp_uvm_endorsements_file = (
+                "$UVM_SECURITY_CONTEXT_DIR/reference-info-base64"
+            )
+
+        # Default snp_endorsements_file if not set
+        if snp_endorsements_file is None:
+            snp_endorsements_file = "$UVM_SECURITY_CONTEXT_DIR/host-amd-cert-base64"
 
         # Validate consensus timers
         if (
@@ -746,6 +661,11 @@ class CCFRemote(object):
             )
 
         # Configuration file
+        v = (
+            ccf._versionifier.to_python_version(version)
+            if version is not None
+            else None
+        )
         if config_file:
             LOG.info(
                 f"Node {self.local_node_id}: Using configuration file {config_file}"
@@ -755,20 +675,29 @@ class CCFRemote(object):
             self.pem = config.get("node_certificate_file", "nodecert.pem")
             self.node_address_file = config.get("node_address_file")
             self.rpc_addresses_file = config.get("rpc_addresses_file")
+            self.pq_service_cert_file = config.get("command", {}).get(
+                "pq_service_certificate_file", self.pq_service_cert_file
+            )
 
         elif major_version is None or major_version > 1:
             loader = FileSystemLoader(binary_dir)
             t_env = Environment(loader=loader, autoescape=select_autoescape())
             t = t_env.get_template(self.TEMPLATE_CONFIGURATION_FILE)
+
+            # Older binaries ship their own template with only the shared limit.
+            legacy_max_message_size = kwargs.get("max_msg_size_bytes") or "64MB"
+            ledger_read_size = (
+                kwargs.get("ledger_max_read_bytes") or legacy_max_message_size
+            )
+            node_frame_size = (
+                kwargs.get("node_to_node_max_message_bytes") or legacy_max_message_size
+            )
+            kwargs["max_msg_size_bytes"] = legacy_max_message_size
+
             output = t.render(
                 start_type=start_type.name.title(),
-                enclave_file=self.enclave_file,  # Ignored by current jinja, but passed for LTS compat
-                enclave_type=enclave_type.title(),
-                enclave_platform=enclave_platform.title()
-                if enclave_platform == "virtual"
-                else enclave_platform.upper(),
                 rpc_interfaces=infra.interfaces.HostSpec.to_json(
-                    remote_class.make_host(host)
+                    LocalRemote.make_host(host)
                 ),
                 node_certificate_file=self.pem,
                 node_address_file=self.node_address_file,
@@ -779,10 +708,12 @@ class CCFRemote(object):
                 read_only_snapshots_dir=self.read_only_snapshots_dir_name,
                 constitution=constitution,
                 curve_id=curve_id.name.title(),
-                host_log_level=host_log_level.title(),
+                host_log_level=log_level.title(),
                 join_timer=f"{join_timer_s}s" if join_timer_s else None,
+                pending_node_timeout=pending_node_timeout,
                 signature_interval_duration=f"{sig_ms_interval}ms",
                 jwt_key_refresh_interval=f"{jwt_key_refresh_interval_s}s",
+                jwt_key_refresh_max_response_size=jwt_key_refresh_max_response_size,
                 election_timeout=f"{election_timeout_ms}ms",
                 message_timeout=f"{consensus_update_timeout_ms}ms",
                 node_data_json_file=node_data_json_file,
@@ -792,9 +723,28 @@ class CCFRemote(object):
                 node_pid_file=node_pid_file,
                 snp_security_context_directory_envvar=snp_security_context_directory_envvar,  # Ignored by current jinja, but passed for LTS compat
                 ignore_first_sigterm=ignore_first_sigterm,
-                node_address=remote_class.get_node_address(node_address),
+                node_address=LocalRemote.get_node_address(node_address),
                 follow_redirect=follow_redirect,
+                fetch_recent_snapshot=fetch_recent_snapshot,
                 max_uncommitted_tx_count=max_uncommitted_tx_count,
+                snp_security_policy_file=snp_security_policy_file,
+                snp_uvm_endorsements_file=snp_uvm_endorsements_file,
+                snp_endorsements_file=snp_endorsements_file,
+                service_subject_name=service_subject_name,
+                historical_cache_soft_limit=historical_cache_soft_limit,
+                cose_signatures_issuer=cose_signatures_issuer,
+                cose_signatures_subject=cose_signatures_subject,
+                sealing_recovery_location=sealing_recovery_location,
+                recovery_decision_protocol_expected_locations=recovery_decision_protocol_expected_locations,
+                backup_snapshot_fetch_enabled=backup_snapshot_fetch_enabled,
+                backup_snapshot_fetch_max_attempts=backup_snapshot_fetch_max_attempts,
+                backup_snapshot_fetch_retry_interval=backup_snapshot_fetch_retry_interval,
+                backup_snapshot_fetch_target_rpc_interface=backup_snapshot_fetch_target_rpc_interface
+                or infra.interfaces.FILE_SERVING_RPC_INTERFACE,
+                backup_snapshot_fetch_max_size=backup_snapshot_fetch_max_size,
+                identity_history_fetch_max_attempts=identity_history_fetch_max_attempts,
+                identity_history_fetch_retry_interval=identity_history_fetch_retry_interval,
+                host_data_transparent_statement_path=host_data_transparent_statement_path,
                 **kwargs,
             )
 
@@ -806,6 +756,45 @@ class CCFRemote(object):
                 # Parse and re-emit output to produce consistently formatted (indented) JSON.
                 # This will also ensure the render produced valid JSON
                 j = json.loads(output)
+                self.pq_service_cert_file = j["command"].get(
+                    "pq_service_certificate_file", self.pq_service_cert_file
+                )
+
+                if "memory" in j and "max_read_size" not in j.get("ledger", {}):
+                    from infra.e2e_args import _convert_size_string_to_bytes
+
+                    if _convert_size_string_to_bytes(
+                        ledger_read_size
+                    ) != _convert_size_string_to_bytes(node_frame_size):
+                        raise ValueError(
+                            "This binary's configuration template cannot represent "
+                            "independent ledger and node-to-node size limits"
+                        )
+                    j["memory"]["circuit_size"] = (
+                        kwargs.get("ledger_max_pending_append_bytes") or "16MB"
+                    )
+                    j["memory"]["max_msg_size"] = ledger_read_size
+
+                # Releases before 7.0.16 reject this unknown HTTP configuration field.
+                if v is not None and v < Version("7.0.16"):
+                    for interface in j["network"]["rpc_interfaces"].values():
+                        interface["http_configuration"].pop(
+                            "max_request_target_size", None
+                        )
+
+                # Enclave config removed from 7.x onwards.
+                if major_version is not None and major_version < 7:
+                    enclave_platform = infra.platform_detection.get_platform()
+                    enclave_platform = (
+                        "Virtual"
+                        if enclave_platform.lower() == "virtual"
+                        else enclave_platform.upper()
+                    )
+                    j["enclave"] = {
+                        "type": "Release",
+                        "platform": enclave_platform,
+                    }
+
                 json.dump(j, f, indent=2)
 
         exe_files += [self.BIN, enclave_file] + self.DEPS
@@ -831,29 +820,22 @@ class CCFRemote(object):
             os.path.basename(config_file),
         ]
 
-        v = (
-            ccf._versionifier.to_python_version(version)
-            if version is not None
-            else None
-        )
-        if v is None or v >= Version("4.0.5"):
-            # Avoid passing too-low level to debug SGX nodes
-            if not (enclave_type == "debug" and enclave_platform == "sgx"):
-                cmd += [
-                    "--enclave-log-level",
-                    enclave_log_level,
-                ]
+        if v is None or v >= Version("7.0.0.dev0"):
+            cmd += [
+                "--log-level",
+                log_level,
+            ]
+        elif v >= Version("4.0.5"):
+            cmd += [
+                "--enclave-log-level",
+                log_level,
+            ]
 
-        if v is None or v >= Version("4.0.10"):
+        if v is not None and v >= Version("4.0.11") and v <= Version("7.0.0-dev1"):
             cmd += [
                 "--enclave-file",
                 self.enclave_file,
             ]
-            if snp_security_context_directory_envvar is not None:
-                cmd += [
-                    "--snp-security-context-dir-var",
-                    snp_security_context_directory_envvar,
-                ]
 
         if start_type == StartType.start:
             members_info = kwargs.get("members_info")
@@ -874,7 +856,7 @@ class CCFRemote(object):
         if start_type == StartType.join:
             data_files += [os.path.join(self.common_dir, "service_cert.pem")]
 
-        self.remote = remote_class(
+        self.remote = LocalRemote(
             self.name,
             self.pub_host,
             exe_files,
@@ -913,23 +895,29 @@ class CCFRemote(object):
         if self.start_type in {StartType.start, StartType.recover}:
             self.remote.get("service_cert.pem", dst_path, timeout=timeout)
 
+    def get_pq_service_certificate_file(self, dst_path, timeout=FILE_TIMEOUT_S):
+        self.remote.get(self.pq_service_cert_file, dst_path, timeout=timeout)
+
     def debug_node_cmd(self):
         return self.remote.debug_node_cmd()
 
     def sigterm(self):
         self.remote.sigterm()
 
+    def sigkill(self):
+        self.remote.sigkill()
+
+    def log_stack_trace(self, timeout=20):
+        self.remote.log_stack_trace(timeout=timeout)
+
     def stop(self):
         try:
             self.remote.stop()
         except Exception:
-            LOG.exception("Failed to shut down {} cleanly".format(self.local_node_id))
+            LOG.exception(f"Failed to shut down {self.local_node_id} cleanly")
 
-    def check_done(self):
-        return self.remote.check_done()
-
-    def set_perf(self):
-        self.remote.set_perf()
+    def check_done(self, timeout=5, interval=0.2):
+        return self.remote.check_done(timeout=timeout, interval=interval)
 
     def _resilient_copy(
         self,
@@ -991,14 +979,30 @@ class CCFRemote(object):
     def log_path(self):
         return self.remote.out
 
-    def ledger_paths(self):
-        paths = [os.path.join(self.remote.root, self.ledger_dir_name)]
+    def read_only_ledger_paths(self):
+        paths = []
         for read_only_ledger_dir_name in self.read_only_ledger_dirs_names:
             paths += [os.path.join(self.remote.root, read_only_ledger_dir_name)]
-        return paths
+        return [path for path in paths if os.path.exists(path)]
+
+    def current_ledger_path(self):
+        return os.path.join(self.remote.root, self.ledger_dir_name)
+
+    def ledger_paths(self):
+        return [
+            path
+            for path in [self.current_ledger_path(), *self.read_only_ledger_paths()]
+            if os.path.exists(path)
+        ]
 
     def get_logs(self):
         return self.remote.get_logs()
+
+    def get_main_ledger_dir(self):
+        """
+        Get the main ledger directory
+        """
+        return os.path.join(self.remote.root, self.ledger_dir_name)
 
 
 class StartType(Enum):

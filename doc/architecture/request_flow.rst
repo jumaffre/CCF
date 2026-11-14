@@ -12,6 +12,8 @@ Normal flow
 
 This is the simple, usual flow, where the request is submitted to a primary node capable of writing to the KV. Only the receiving node interacts with the request. The entire execution is synchronous, writing the response back to the client before proceeding with any other work.
 
+HTTP/1.x requests may use ``Transfer-Encoding: chunked``. CCF buffers and decodes the chunks across input fragments before dispatching a complete request, so applications receive the reconstructed body rather than chunk framing. The ``max_body_size`` limit applies to the total decoded body; a body exactly at the limit is accepted. Malformed framing is rejected, and incomplete requests are not dispatched.
+
 .. mermaid::
 
   sequenceDiagram
@@ -28,8 +30,9 @@ This is the simple, usual flow, where the request is submitted to a primary node
       NetStack->>NetStack: TLS decrypt request
       NetStack->>NetStack: HTTP parse request
       NetStack->>+Frontend: Frontend Dispatch
+      Frontend->>Frontend: is_open()
+      Frontend->>Frontend: Store is Ready
       note left of Frontend: Tx is created here
-      Frontend->>Frontend: is_open(tx)
       Frontend->>App: find_endpoint(tx, ctx)
       App->>App: h = find_handler_for(tx, ctx)
       App-->>Frontend: return h
@@ -56,11 +59,21 @@ This is the simple, usual flow, where the request is submitted to a primary node
 Forwarding flow
 ---------------
 
+.. note::
+    Forwarding is deprecated and will be removed in CCF 8.0. This compatibility path is still available in CCF 7.x on RPC interfaces without a ``redirections`` configuration. First-party tools default to redirects.
+    See :doc:`/releases/fwd_to_redirect`.
+
 When write request are submitted to a follower node, they must be forwarded to the primary for execution. This diagram shows how that is done, between a follower node A and a primary B. Decryption and some dispatch still occurs on the follower, as it must lookup the correct endpoint's metadata to determine whether this request should be forwarded. When A establishes that the request should be forwarded, it queues a node-to-node (N2N) forwarding message to the primary describing the original request. The synchronous execution the follower A now completes without writing any response to the user, but maintaining an open TLS session and some local state that a response is pending.
+
+.. note::
+
+    The deprecated forwarding path does not support chunked request bodies; send chunked writes directly to the primary. See :doc:`/releases/fwd_to_redirect` for redirection guidance.
 
 When the primary B receives the forwarded command, it executes the same dispatch and execution that it would if it had directly received the request, but with a different stack at the top level. Specifically, it will eventually write its response back over the encrypted node-to-node channel to A, rather than the original caller.
 
 When follower A receives the forwarded response, it writes this to the TLS session that was maintained earlier, and marks the pending response as completed.
+
+If no response arrives within the RPC interface's ``forwarding_timeout_ms``, the follower returns HTTP ``504 Gateway Timeout`` with ``Content-Type: application/json`` and the standard CCF error envelope. The error code is ``ForwardingTimeout``, and the message identifies the target node and timeout duration. This does not imply that the primary failed to execute the request: the request may have succeeded but its response was delayed or lost.
 
 .. mermaid::
 
@@ -82,8 +95,9 @@ When follower A receives the forwarded response, it writes this to the TLS sessi
       NetStackA->>NetStackA: TLS decrypt request
       NetStackA->>NetStackA: HTTP parse request
       NetStackA->>+FrontendA: Frontend Dispatch
+      FrontendA->>FrontendA: is_open()
+      FrontendA->>FrontendA: Store is Ready
       note left of FrontendA: Tx is created here
-      FrontendA->>FrontendA: is_open(tx)
       FrontendA->>FrontendA: find_endpoint(tx, ctx)
       FrontendA->>FrontendA: get_authenticated_identity(tx, ctx)
       FrontendA->>-FrontendA: forward?
@@ -101,8 +115,9 @@ When follower A receives the forwarded response, it writes this to the TLS sessi
       note over N2NB,KV: Inside CCF node B
       N2NB->>N2NB: N2N parse
       N2NB->>+FrontendB: Frontend Dispatch
+      FrontendB->>FrontendB: is_open()
+      FrontendB->>FrontendB: Store is Ready
       note left of FrontendB: Tx is created here
-      FrontendB->>FrontendB: is_open(tx)
       FrontendB->>App: find_endpoint(tx, ctx)
       App->>App: h = find_handler_for(tx, ctx)
       App-->>FrontendB: return h
@@ -130,129 +145,61 @@ When follower A receives the forwarded response, it writes this to the TLS sessi
 
       NetStackA-->>User: 200 OK "Copied {a} from {A} to {B}"
 
-External executor flow
-----------------------
+Redirection flow
+----------------
 
-This shows the flow for the in-development external executor app, where implementation of the user endpoints is offloaded to an external trusted executor. This is achieved by providing a remote KV API over which the executor can invoke actions of the local KV, using a persistent ``Tx`` object shared between multiple requests.
+CCF supports HTTP redirections as an alternative to forwarding. When a request arrives that cannot be executed locally, rather than forwarding it to an appropriate node over the node-to-node channels, the node can return a HTTP redirect response advising the caller to resubmit the request directly to that node. This uses standard HTTP semantics, reporting the redirect target in a ``Location`` header. Most HTTP clients will have an option to follow this redirect automatically, and all should have an option to enable this behaviour if desired. Alternatively, client applications may choose to intercept this redirect response and manually interpret it, perhaps to alter the resubmitted request or to update the target node for future requests.
 
-The result is that the user's interaction is unchanged - they send a HTTPS request to a single CCF node and get the same format of response, but the app logic can be decoupled from the CCF enclave.
+.. warning:: Many HTTP clients will strip out ``Authorization`` headers when following Cross-Origin redirects. This means that if your client is automatically following redirects, and you submit a request with a JWT token as authorization, if you are redirected you may see a surprising authorization failure. In this scenario we recommend intercepting the redirect responses manually, so that the request can be resubmitted without stripping headers.
 
-.. note:: Some steps are elided/abbreviated for clarity. This diagram does not show the registration of executors.
+Similar to forwarding, the redirect behaviour is partly controlled by per-endpoint metadata, so the initially receiving node must parse the request and go through endpoint dispatch before making a forwarding decision.
+
+There are currently 2 supported modes for redirections. In the first, the response sends the user directly to the suggested node. This will only work if that node has an accessible name, which can be included in the ``Location`` header and accessed by the user.
 
 .. mermaid::
 
   sequenceDiagram
-      participant User
-      participant Executor
-      participant NetStack
-      participant Frontend
-      participant App
-      participant KV
+      autonumber
+      participant U as User
+      participant B as Backup (nodeA.ccf.com)
+      participant P as Primary (nodeB.ccf.com)
 
-      User->>NetStack: POST /copy/A/B
+      U->>B: POST /copy/A/B
+      B->>B: Lookup endpoint
+      B->>B: Decide request should be redirected
+      B->>B: Build redirect response
+      B-->>U: 307 REDIRECT Location: nodeB.ccf.com/copy/A/B
 
-      rect rgba(191, 223, 255, 0.5)
-      note over NetStack,App: Inside single CCF node
-      NetStack->>NetStack: TLS decrypt request
-      NetStack->>NetStack: HTTP parse request
-      NetStack->>Frontend: Frontend Dispatch
-      activate Frontend
-      note left of Frontend: tx1 is created here
-      Frontend->>Frontend: is_open(tx1)
-      Frontend->>App: find_endpoint(tx1, ctx)
-      App->>App: e = find_executor_for(ctx)
-      App-->>Frontend: return e
-      Frontend->>Frontend: get_authenticated_identity(tx1, ctx)
-      Frontend->>Frontend: forward?
-      Frontend->>App: execute_endpoint(tx1, ctx, e)
-      note over Frontend,App: tx1 is stolen here
-      deactivate Frontend
-      activate App
-      App->>App: pending_reqs[e].append(tx1, ctx)
-      App->>App: ctx.pending_response = true
-      App-->>Frontend: return
-      Frontend-->>NetStack: return
-      end
+      U->>P: POST /copy/A/B
+      P->>P: Lookup endpoint
+      P->>P: Decide request can be executed
+      P->>P: Execute request
+      P-->>U: 200 OK "Copied {a} from {A} to {B}"
 
-      Executor->>NetStack: POST /StartTx
+For deployments where nodes are not directly accessible, redirections can still be supported via multiple load balancers. All that is required is `a` public name for each redirect purpose, with up-to-date balancing to the correct nodes. More simply, that currently means maintaining a `write` load balancer which can direct external traffic to a primary.
 
-      rect rgba(191, 223, 255, 0.5)
-      NetStack->>NetStack: TLS decrypt request
-      NetStack->>NetStack: HTTP parse request
-      NetStack->>Frontend: Frontend Dispatch
-      activate Frontend
-      Frontend->>Frontend: is_open(tx2)
-      Frontend->>App: find_endpoint(tx2, ctx)
-      App->>App: h = find_handler_for(tx2, ctx)
-      App-->>Frontend: return h
-      Frontend->>Frontend: get_authenticated_identity(tx2, ctx)
-      Frontend->>Frontend: forward?
-      Frontend->>App: execute_endpoint(tx2, ctx, h)
-      App->>App: active_reqs[e] = pending_reqs.pop(e)
-      App->>App: ctx.set_response(OK, describe_request(active_reqs[e]))
-      App-->>Frontend: return
-      Frontend->>Frontend: tx.commit()
-      Frontend->>Frontend: response.set_header(TX_HEADER, tx.commit_id())
-      Frontend-->>NetStack: return
-      deactivate Frontend
-      NetStack->>NetStack: HTTP serialise response
-      NetStack->>NetStack: TLS encrypt response
-      end
+.. mermaid::
 
-      NetStack-->>Executor: 200 OK {RequestDescription}
+  sequenceDiagram
+      autonumber
+      participant U as User
+      participant LB as General LB (service.ccf.com)
+      participant B as Backup
+      participant WLB as Write LB (write.service.ccf.com)
+      participant P as Primary
 
-      activate Executor
-      Executor->>Executor: Process RequestDescription
+      U->>LB: POST /copy/A/B
+      LB->>B: POST /copy/A/B
+      B->>B: Lookup endpoint
+      B->>B: Decide request should be redirected
+      B->>B: Build redirect response
+      B-->>U: 307 REDIRECT Location: write.service.ccf.com/copy/A/B
 
-      Executor->>NetStack: POST /KV.Get {key=A}
-      rect rgba(191, 223, 255, 0.5)
-      note over NetStack,App: ...
-      Frontend->>App: execute_endpoint(tx3, ctx, h)
-      App->>App: tx = active_reqs[e].tx
-      Note right of App: // Gets tx1
-      App->>KV: tx1.get(A)
-      KV-->>App: return a
-      App->>App: ctx.set_response(OK, {value=a})
-      App-->>Frontend: return
-      note over NetStack,Frontend: ...
-      end
-      NetStack-->>Executor: 200 OK {value=a}
+      U->>WLB: POST /copy/A/B
+      WLB->>P: POST /copy/A/B
+      P->>P: Lookup endpoint
+      P->>P: Decide request can be executed
+      P->>P: Execute request
+      P-->>U: 200 OK "Copied {a} from {A} to {B}"
 
-      Executor->>NetStack: POST /KV.Put {key=B, value=a}
-      rect rgba(191, 223, 255, 0.5)
-      note over NetStack,App: ...
-      Frontend->>App: execute_endpoint(tx4, ctx, h)
-      App->>App: tx = active_reqs[e].tx
-      Note right of App: // Gets tx1
-      App->>KV: tx1.put(B, a)
-      KV-->>App: return
-      App->>App: ctx.set_response(OK)
-      App-->>Frontend: return
-      note over NetStack,Frontend: ...
-      end
-      NetStack-->>Executor: 200 OK
-
-      Executor->>NetStack: POST /EndTx {code=200, body="Copied {a} from {A} to {B}"}
-      rect rgba(191, 223, 255, 0.5)
-      note over NetStack,App: ...
-      Frontend->>App: execute_endpoint(tx5, ctx, h)
-      App->>App: tx = active_reqs[e].tx
-      Note right of App: // Gets tx1
-      App->>App: result = tx1.commit()
-      App->>App: response = (result, code, body)
-      App->>App: HTTP serialise response
-      App->>NetStack: reply_async(active_reqs[e].ctx.session, response)
-      App->>App: ctx.set_response(OK)
-      App->>App: active_reqs.pop(e)
-      note over App: tx1 is destroyed here
-      deactivate App
-      App-->>Frontend: return
-      note over NetStack,Frontend: ...
-      end
-      NetStack-->>Executor: 200 OK
-
-      deactivate Executor
-
-      NetStack->>NetStack: TLS encrypt response
-      
-      NetStack-->>User: 200 OK "Copied {a} from {A} to {B}"
+To use redirection behaviour, and choose whether to redirect to a node or a load balancer, set the ``redirections`` field in the :doc:`launch configuration </operations/configuration>`.

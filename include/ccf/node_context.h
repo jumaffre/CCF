@@ -6,7 +6,7 @@
 #include "ccf/indexing/indexer_interface.h"
 #include "ccf/node_subsystem_interface.h"
 
-namespace ccfapp
+namespace ccf
 {
   struct AbstractNodeContext
   {
@@ -14,7 +14,7 @@ namespace ccfapp
     std::map<std::string, std::shared_ptr<ccf::AbstractNodeSubSystem>>
       subsystems;
 
-    void install_subsystem(
+    void install_subsystem_by_name(
       const std::shared_ptr<ccf::AbstractNodeSubSystem>& subsystem,
       const std::string& name)
     {
@@ -33,8 +33,9 @@ namespace ccfapp
       subsystems.emplace_hint(it, name, subsystem);
     }
 
-    template <typename T>
-    std::shared_ptr<T> get_subsystem(const std::string& name) const
+    template <SubsystemType T>
+    [[nodiscard]] std::shared_ptr<T> get_subsystem_by_name(
+      const std::string& name) const
     {
       const auto it = subsystems.find(name);
       if (it != subsystems.end())
@@ -49,29 +50,30 @@ namespace ccfapp
   public:
     virtual ~AbstractNodeContext() = default;
 
-    template <typename T>
+    template <SubsystemType T>
     void install_subsystem(const std::shared_ptr<T>& subsystem)
     {
-      install_subsystem(subsystem, T::get_subsystem_name());
+      install_subsystem_by_name(subsystem, T::get_subsystem_name());
     }
 
-    template <typename T>
-    std::shared_ptr<T> get_subsystem() const
+    template <SubsystemType T>
+    [[nodiscard]] std::shared_ptr<T> get_subsystem() const
     {
-      return get_subsystem<T>(T::get_subsystem_name());
+      return get_subsystem_by_name<T>(T::get_subsystem_name());
     }
 
-    virtual ccf::NodeId get_node_id() const
-    {
-      return {};
-    }
-
-    virtual crypto::Pem get_self_signed_certificate() const
+    [[nodiscard]] virtual ccf::NodeId get_node_id() const
     {
       return {};
     }
 
-    ccf::historical::AbstractStateCache& get_historical_state()
+    [[nodiscard]] virtual ccf::crypto::Pem get_self_signed_certificate() const
+    {
+      return {};
+    }
+
+    [[nodiscard]] ccf::historical::AbstractStateCache& get_historical_state()
+      const
     {
       auto historical_state_cache =
         get_subsystem<ccf::historical::AbstractStateCache>();
@@ -83,7 +85,8 @@ namespace ccfapp
       return *historical_state_cache;
     }
 
-    ccf::indexing::IndexingStrategies& get_indexing_strategies()
+    [[nodiscard]] ccf::indexing::IndexingStrategies& get_indexing_strategies()
+      const
     {
       auto indexer = get_subsystem<ccf::indexing::IndexingStrategies>();
       if (indexer == nullptr)

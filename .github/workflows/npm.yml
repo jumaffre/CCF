@@ -4,16 +4,23 @@ on:
   release:
     types: [published]
 
+permissions: read-all
+
 jobs:
   build_and_publish:
     name: "Publish ccf-app package to NPM"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 16
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
 
       - name: Get release number from git tag (release) or latest (branch)
         run: |
@@ -22,12 +29,11 @@ jobs:
 
       - name: Fetch NPM Package from release
         run: |
-          cd js/ccf-app
+          set -ex
           wget https://github.com/microsoft/CCF/releases/download/ccf-${{steps.tref.outputs.version}}/microsoft-ccf-app-${{steps.tref.outputs.version}}.tgz
+          echo "registry=https://registry.npmjs.org/" > .npmrc
+        working-directory: js/ccf-app
 
       - name: Publish NPM Package to https://www.npmjs.com/package/@microsoft/ccf-app
-        run: |
-          set -ex
-          cd js/ccf-app
-          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" > .npmrc
-          npm publish microsoft-ccf-app*.tgz --access public
+        run: npm publish microsoft-ccf-app*.tgz --access public --tag ${{ github.event.release.prerelease && 'dev' || 'latest' }}
+        working-directory: js/ccf-app

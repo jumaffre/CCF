@@ -2,10 +2,9 @@
 // Licensed under the Apache 2.0 License.
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "ccf/byte_vector.h"
-#include "ccf/ds/logger.h"
 #include "ccf/kv/serialisers/serialised_entry.h"
 #include "ds/champ_map.h"
-#include "ds/rb_map.h"
+#include "ds/internal_logger.h"
 #include "ds/std_formatters.h"
 #include "kv/untyped_change_set.h"
 
@@ -22,8 +21,8 @@ struct CollisionHash
   }
 };
 
-using K = kv::serialisers::SerialisedEntry;
-using V = kv::serialisers::SerialisedEntry;
+using K = ccf::kv::serialisers::SerialisedEntry;
+using V = ccf::kv::serialisers::SerialisedEntry;
 constexpr static size_t max_key_value_size = 128;
 
 namespace map
@@ -50,10 +49,6 @@ using H = CollisionHash<K>;
 template <typename Key, typename Value>
 using UntypedChampMap = champ::Map<Key, Value, H<Key>>;
 using ChampMap = UntypedChampMap<K, V>;
-
-template <typename Key, typename Value>
-using UntypedRBMap = rb::Map<Key, Value>;
-using RBMap = UntypedRBMap<K, V>;
 
 class Model
 {
@@ -138,7 +133,7 @@ std::vector<std::unique_ptr<Op<M>>> gen_ops(size_t n)
 {
   std::random_device rand_dev;
   auto seed = rand_dev();
-  LOG_INFO_FMT("Seed: {}", seed);
+  CCF_APP_INFO("Seed: {}", seed);
   std::mt19937 gen(seed);
   std::uniform_int_distribution<> gen_op(0, 3);
 
@@ -171,14 +166,16 @@ std::vector<std::unique_ptr<Op<M>>> gen_ops(size_t n)
       case 3: // remove
       {
         std::uniform_int_distribution<> gen_idx(0, keys.size() - 1);
-        auto i = gen_idx(gen);
-        auto k = keys[i];
-        keys.erase(keys.begin() + i);
+        auto idx = gen_idx(gen);
+        auto k = keys[idx];
+        keys.erase(keys.begin() + idx);
         op = std::make_unique<Remove<M>>(k);
         break;
       }
       default:
+      {
         throw std::logic_error("bad op number");
+      }
     }
     ops.push_back(std::move(op));
   }
@@ -186,7 +183,7 @@ std::vector<std::unique_ptr<Op<M>>> gen_ops(size_t n)
   return ops;
 }
 
-TEST_CASE_TEMPLATE("Persistent map operations", M, RBMap, ChampMap)
+TEST_CASE_TEMPLATE("Persistent map operations", M, ChampMap)
 {
   Model model;
   M map;
@@ -194,7 +191,7 @@ TEST_CASE_TEMPLATE("Persistent map operations", M, RBMap, ChampMap)
   auto ops = gen_ops<M>(500);
   for (auto& op : ops)
   {
-    LOG_DEBUG_FMT("{}", op->str());
+    CCF_APP_DEBUG("{}", op->str());
     auto r = op->apply(model, map);
     auto model_new = r.first;
     auto map_new = r.second;
@@ -246,7 +243,7 @@ static const M gen_map(size_t size)
   return map;
 }
 
-TEST_CASE_TEMPLATE("Snapshot map", M, ChampMap, RBMap)
+TEST_CASE_TEMPLATE("Snapshot map", M, ChampMap)
 {
   size_t ops_count = 2048;
   auto map = gen_map<M>(ops_count);
@@ -317,7 +314,7 @@ std::map<K, V> get_all_entries(const M& map)
   return entries;
 }
 
-TEST_CASE_TEMPLATE("Snapshot is immutable", M, ChampMap, RBMap)
+TEST_CASE_TEMPLATE("Snapshot is immutable", M, ChampMap)
 {
   size_t ops_count = 2048;
   auto map = gen_map<M>(ops_count);
@@ -386,18 +383,11 @@ TEST_CASE("Snapshot compatibility")
 {
   size_t size = 100;
 
-  INFO("CHAMP -> RB");
+  INFO("CHAMP -> CHAMP");
   {
-    auto champ_map = gen_map<ChampMap>(size);
-    RBMap rb_map;
-    verify_snapshot_compatibility<ChampMap, RBMap>(champ_map, rb_map);
-  }
-
-  INFO("RB -> CHAMP");
-  {
-    auto rb_map = gen_map<RBMap>(size);
-    ChampMap champ_map;
-    verify_snapshot_compatibility<RBMap, ChampMap>(rb_map, champ_map);
+    auto source_map = gen_map<ChampMap>(size);
+    ChampMap target_map;
+    verify_snapshot_compatibility<ChampMap, ChampMap>(source_map, target_map);
   }
 }
 
@@ -416,7 +406,7 @@ void forall_threshold(const M& map, size_t threshold)
   REQUIRE(iterations_count == threshold);
 }
 
-TEST_CASE_TEMPLATE("Foreach", M, RBMap, ChampMap)
+TEST_CASE_TEMPLATE("Foreach", M, ChampMap)
 {
   size_t size = 100;
   auto map = gen_map<M>(size);

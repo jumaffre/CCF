@@ -1,31 +1,77 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.path
-import hashlib
 import os
-import subprocess
+from hashlib import sha256
+
+import ccf
+import ccf.ledger
+import ccf.split_ledger
+from loguru import logger as LOG
+from packaging.version import Version  # type: ignore
+
+import infra.path
+from infra import snp
+from infra.node import strip_version
 
 
-def get_code_id(
-    enclave_type, enclave_platform, oe_binary_dir, package, library_dir="."
-):
-    lib_path = infra.path.build_lib_path(
-        package, enclave_type, enclave_platform, library_dir
-    )
+def get_measurement(enclave_platform, package, library_dir="."):
+    if enclave_platform == "virtual":
+        return "Insecure hard-coded virtual measurement v1"
 
-    if enclave_platform == "sgx":
-        res = subprocess.run(
-            [os.path.join(oe_binary_dir, "oesign"), "dump", "-e", lib_path],
-            capture_output=True,
-            check=True,
-        )
-        lines = [
-            line
-            for line in res.stdout.decode().split(os.linesep)
-            if line.startswith("mrenclave=")
-        ]
-
-        return lines[0].split("=")[1]
     else:
-        # Virtual and SNP
-        return hashlib.sha256(lib_path.encode()).hexdigest()
+        raise ValueError(f"Cannot get measurement on {enclave_platform}")
+
+
+def get_host_data_and_security_policy(
+    enclave_platform, package, *, library_dir=".", binary_dir=".", version=None
+):
+    if enclave_platform == "snp":
+        security_policy = snp.get_container_group_security_policy()
+        host_data = sha256(security_policy.encode()).hexdigest()
+        return host_data, security_policy
+    elif enclave_platform == "virtual":
+        if version is None or Version(strip_version(version)) > Version("7.0.0-dev1"):
+            lib_path = os.path.join(binary_dir, package)
+        else:
+            lib_path = infra.path.build_lib_path(package, library_dir, version=version)
+        with open(lib_path, "rb") as lib:
+            hash = sha256(lib.read())
+        return hash.hexdigest(), None
+    else:
+        raise ValueError(f"Cannot get security policy on {enclave_platform}")
+
+
+def write_ledger_chunk(outdir, entries, end_seqno, complete):
+    os.makedirs(outdir, exist_ok=True)
+    selected_entries = [(s, raw) for s, raw in entries if s <= end_seqno]
+    assert selected_entries, f"No entries selected up to {end_seqno}"
+
+    ledger_file = ccf.split_ledger.create_new_ledger_file(outdir)
+    if complete:
+        final_seqno, final_raw_tx = selected_entries[-1]
+        flagged_final_raw_tx = bytearray(final_raw_tx)
+        flagged_final_raw_tx[
+            ccf.ledger.TransactionHeader.VERSION_LENGTH
+        ] |= ccf.ledger.TransactionFlags.FORCE_CHUNK_AFTER.value
+        selected_entries[-1] = (final_seqno, bytes(flagged_final_raw_tx))
+
+    entry_positions = []
+    for _, raw_tx in selected_entries:
+        entry_positions.append(ledger_file.tell())
+        ledger_file.write(raw_tx)
+
+    start_seqno = selected_entries[0][0]
+    final_seqno = selected_entries[-1][0]
+    final_file_name = ccf.split_ledger.make_final_ledger_file_name(
+        start_seqno,
+        final_seqno,
+        is_complete=complete,
+        is_committed=False,
+    )
+    ccf.split_ledger.close_ledger_file(
+        ledger_file, entry_positions, final_file_name, complete_file=complete
+    )
+    LOG.info(
+        f"Created recovery ledger variant {outdir}: {final_file_name} "
+        f"complete={complete}"
+    )

@@ -4,9 +4,13 @@
 #include "ccf/endpoint_registry.h"
 
 #include "ccf/common_auth_policies.h"
-#include "ccf/pal/locking.h"
+#include "ccf/ds/locking.h"
+#include "ds/nonstd.h"
+#include "endpoint_utils.h"
+#include "endpoints/rpc_context_impl.h"
 #include "http/http_parser.h"
-#include "node/rpc/rpc_context_impl.h"
+
+#include <tuple>
 
 namespace ccf::endpoints
 {
@@ -34,30 +38,59 @@ namespace ccf::endpoints
         ds::openapi::path(document, endpoint->full_uri_path),
         http_verb.value());
 
+      // Add what appears a *mandatory* operationId, which is expected to be
+      // unique across the spec.
+      // A1) Eliminate '{' and '}' from the path but keep the string inbetween.
+      std::string p =
+        std::regex_replace(endpoint->full_uri_path, std::regex("[{}]"), "");
+      // A2) Camel-Case what remains at the path separator.
+      p = ccf::endpoints::camel_case(p);
+
+      // B1) Get the HTTP verb as a string (it's all caps).
+      std::string s = llhttp_method_name(http_verb.value());
+      // B2) Lowercase it.
+      ccf::nonstd::to_lower(s);
+      // B3) Camel-Case it, i.e., the first char.
+      s = ccf::endpoints::camel_case(s, true);
+
+      // C) Concatenate the camel-cased verb and path. For example, this gives
+      // us "PostAppLogPrivateRawTextId" for the verb POST and the path
+      // "/app/log/private/raw_text/{id}".
+      path_op["operationId"] = fmt::format("{}{}", s, p);
+
       // Path Operation must contain at least one response - if none has been
       // defined, assume this can return 200
       if (ds::openapi::responses(path_op).empty())
       {
-        ds::openapi::response(path_op, endpoint->success_status);
+        std::ignore = ds::openapi::response(path_op, HTTP_STATUS_OK);
       }
 
       // Add a default error response
-      ds::openapi::error_response_default(path_op);
+      std::ignore = ds::openapi::error_response_default(path_op);
 
       // Add summary and description if set
-      if (endpoint->openapi_summary.has_value())
       {
-        path_op["summary"] = endpoint->openapi_summary.value();
+        const auto& summary = endpoint->openapi_summary;
+        if (summary.has_value())
+        {
+          path_op["summary"] = summary.value();
+        }
       }
 
-      if (endpoint->openapi_deprecated.has_value())
       {
-        path_op["deprecated"] = endpoint->openapi_deprecated.value();
+        const auto& deprecated = endpoint->openapi_deprecated;
+        if (deprecated.has_value())
+        {
+          path_op["deprecated"] = deprecated.value();
+        }
       }
 
-      if (endpoint->openapi_description.has_value())
       {
-        path_op["description"] = endpoint->openapi_description.value();
+        const auto& description = endpoint->openapi_description;
+        if (description.has_value())
+        {
+          path_op["description"] = description.value();
+        }
       }
 
       if (!endpoint->authn_policies.empty())
@@ -109,49 +142,40 @@ namespace ccf::endpoints
 
     PathTemplateSpec spec;
 
-    const std::string allowed_delimiters = "/:";
-
     std::string regex_s(uri);
     template_start = regex_s.find_first_of('{');
+    size_t template_end = 0;
     while (template_start != std::string::npos)
     {
-      if (template_start != 0)
-      {
-        const auto prev_char = regex_s[template_start - 1];
-        if (allowed_delimiters.find(prev_char) == std::string::npos)
-        {
-          throw std::logic_error(fmt::format(
-            "Invalid templated path - illegal character ({}) preceding "
-            "template: {}",
-            prev_char,
-            uri));
-        }
-      }
-
-      const auto template_end = regex_s.find_first_of('}', template_start);
+      template_end = regex_s.find_first_of('}', template_start);
       if (template_end == std::string::npos)
       {
         throw std::logic_error(fmt::format(
           "Invalid templated path - missing closing curly bracket: {}", uri));
       }
 
-      if (template_end + 1 != regex_s.size())
+      // Default regex is "([^/]+)", aka "match everything until the next /"
+      std::string regex_terminator = "/";
+
+      if (template_end < regex_s.size() - 1)
       {
-        const auto next_char = regex_s[template_end + 1];
-        if (allowed_delimiters.find(next_char) == std::string::npos)
+        const auto terminator_candidate = regex_s[template_end + 1];
+        if (terminator_candidate != '/')
         {
-          throw std::logic_error(fmt::format(
-            "Invalid templated path - illegal character ({}) following "
-            "template: {}",
-            next_char,
-            uri));
+          // If there's some other character literal following the template,
+          // treat that as a terminator as well.
+          // eg: "/{foo}:bar" => "/(^[/:]):bar"
+          regex_terminator += terminator_candidate;
         }
       }
 
       spec.template_component_names.push_back(
         regex_s.substr(template_start + 1, template_end - template_start - 1));
       regex_s.replace(
-        template_start, template_end - template_start + 1, "([^/]+)");
+        template_start,
+        template_end - template_start + 1,
+        fmt::format("([^{}]+)", regex_terminator));
+
       template_start = regex_s.find_first_of('{', template_start + 1);
     }
 
@@ -171,18 +195,6 @@ namespace ccf::endpoints
     spec.template_regex = std::regex(regex_s);
 
     return spec;
-  }
-
-  EndpointRegistry::Metrics& EndpointRegistry::get_metrics_for_request(
-    const std::string& method_, const std::string& verb)
-  {
-    auto substr_start = method_.find_first_not_of('/');
-    if (substr_start == std::string::npos)
-    {
-      substr_start = 0;
-    }
-    auto method = method_.substr(substr_start);
-    return metrics[method][verb];
   }
 
   void default_locally_committed_func(
@@ -214,8 +226,10 @@ namespace ccf::endpoints
     endpoint.locally_committed_func = default_locally_committed_func;
 
     endpoint.authn_policies = ap;
-    // By default, all write transactions are forwarded
+    // By default, all transactions are assumed to be writing, and so
+    // forwarded/redirected
     endpoint.properties.forwarding_required = ForwardingRequired::Always;
+    endpoint.properties.redirection_strategy = RedirectionStrategy::ToPrimary;
     endpoint.installer = this;
     return endpoint;
   }
@@ -226,39 +240,17 @@ namespace ccf::endpoints
     const ReadOnlyEndpointFunction& f,
     const AuthnPolicies& ap)
   {
-    return make_endpoint(
-             method,
-             verb,
-             [f](EndpointContext& ctx) {
-               ReadOnlyEndpointContext ro_ctx(ctx.rpc_ctx, ctx.tx);
-               ro_ctx.caller = std::move(ctx.caller);
-               f(ro_ctx);
-             },
-             ap)
-      .set_forwarding_required(ForwardingRequired::Sometimes);
-  }
-
-  Endpoint EndpointRegistry::make_endpoint_with_local_commit_handler(
-    const std::string& method,
-    RESTVerb verb,
-    const EndpointFunction& f,
-    const LocallyCommittedEndpointFunction& l,
-    const AuthnPolicies& ap)
-  {
-    auto endpoint = make_endpoint(method, verb, f, ap);
-    endpoint.locally_committed_func = l;
-    return endpoint;
-  }
-
-  Endpoint EndpointRegistry::make_read_only_endpoint_with_local_commit_handler(
-    const std::string& method,
-    RESTVerb verb,
-    const ReadOnlyEndpointFunction& f,
-    const LocallyCommittedEndpointFunction& l,
-    const AuthnPolicies& ap)
-  {
-    auto endpoint = make_read_only_endpoint(method, verb, f, ap);
-    endpoint.locally_committed_func = l;
+    auto endpoint = make_endpoint(
+      method,
+      verb,
+      [f](EndpointContext& ctx) {
+        ReadOnlyEndpointContext ro_ctx(ctx.rpc_ctx, ctx.tx);
+        ro_ctx.caller = std::move(ctx.caller);
+        f(ro_ctx);
+      },
+      ap);
+    endpoint.set_redirection_strategy(RedirectionStrategy::None);
+    endpoint.properties.forwarding_required = ForwardingRequired::Sometimes;
     return endpoint;
   }
 
@@ -268,9 +260,13 @@ namespace ccf::endpoints
     const CommandEndpointFunction& f,
     const AuthnPolicies& ap)
   {
-    return make_endpoint(
-             method, verb, [f](EndpointContext& ctx) { f(ctx); }, ap)
-      .set_forwarding_required(ForwardingRequired::Sometimes);
+    auto endpoint =
+      make_endpoint(method, verb, [f](EndpointContext& ctx) { f(ctx); }, ap);
+    endpoint.execution_mode = EndpointExecutionMode::Command;
+    endpoint.command_func = f;
+    endpoint.set_redirection_strategy(RedirectionStrategy::None);
+    endpoint.properties.forwarding_required = ForwardingRequired::Sometimes;
+    return endpoint;
   }
 
   void EndpointRegistry::install(Endpoint& endpoint)
@@ -290,7 +286,7 @@ namespace ccf::endpoints
     {
       auto templated_endpoint =
         std::make_shared<PathTemplatedEndpoint>(endpoint);
-      templated_endpoint->spec = std::move(template_spec.value());
+      templated_endpoint->spec = template_spec.value();
       templated_endpoints[endpoint.dispatch.uri_path][endpoint.dispatch.verb] =
         templated_endpoint;
     }
@@ -312,8 +308,10 @@ namespace ccf::endpoints
     default_endpoint = std::move(tmp);
   }
 
-  void EndpointRegistry::build_api(nlohmann::json& document, kv::ReadOnlyTx&)
+  void EndpointRegistry::build_api(
+    nlohmann::json& document, ccf::kv::ReadOnlyTx& tx)
   {
+    (void)tx;
     // Add common components:
     // - Descriptions of each kind of forwarding
     auto& forwarding_component = document["components"]["x-ccf-forwarding"];
@@ -367,7 +365,9 @@ namespace ccf::endpoints
       for (const auto& [verb, endpoint] : verb_endpoints)
       {
         if (endpoint->openapi_hidden)
+        {
           continue;
+        }
         add_endpoint_to_api_document(document, endpoint);
       }
     }
@@ -377,7 +377,9 @@ namespace ccf::endpoints
       for (const auto& [verb, endpoint] : verb_endpoints)
       {
         if (endpoint->openapi_hidden)
+        {
           continue;
+        }
         add_endpoint_to_api_document(document, endpoint);
 
         for (const auto& name : endpoint->spec.template_component_names)
@@ -396,8 +398,8 @@ namespace ccf::endpoints
 
   void EndpointRegistry::init_handlers() {}
 
-  EndpointDefinitionPtr EndpointRegistry::find_endpoint(
-    kv::Tx&, ccf::RpcContext& rpc_ctx)
+  EndpointDefinitionPtr EndpointRegistry::find_endpoint_without_kv(
+    ccf::RpcContext& rpc_ctx)
   {
     auto method = rpc_ctx.get_method();
     auto endpoints_for_exact_method = fully_qualified_endpoints.find(method);
@@ -430,9 +432,9 @@ namespace ccf::endpoints
             // Populate the request_path_params the first-time through. If we
             // get a second match, we're just building up a list for
             // error-reporting
-            if (matches.size() == 0)
+            if (matches.empty())
             {
-              auto ctx_impl = static_cast<ccf::RpcContextImpl*>(&rpc_ctx);
+              auto* ctx_impl = dynamic_cast<ccf::RpcContextImpl*>(&rpc_ctx);
               if (ctx_impl == nullptr)
               {
                 throw std::logic_error("Unexpected type of RpcContext");
@@ -446,7 +448,7 @@ namespace ccf::endpoints
                 const auto& template_name =
                   endpoint->spec.template_component_names[i];
                 const auto& template_value = match[i + 1].str();
-                auto decoded_value = http::url_decode(template_value);
+                auto decoded_value = ::http::url_decode(template_value);
                 path_params[template_name] = template_value;
                 decoded_path_params[template_name] = decoded_value;
               }
@@ -475,10 +477,30 @@ namespace ccf::endpoints
     return nullptr;
   }
 
+  EndpointDefinitionPtr EndpointRegistry::find_endpoint(
+    ccf::kv::Tx& tx, ccf::RpcContext& rpc_ctx)
+  {
+    (void)tx;
+    return find_endpoint_without_kv(rpc_ctx);
+  }
+
+  void EndpointRegistry::execute_command_endpoint(
+    EndpointDefinitionPtr e, CommandEndpointContext& ctx)
+  {
+    const auto* endpoint = dynamic_cast<const Endpoint*>(e.get());
+    if (endpoint == nullptr || !endpoint->command_func)
+    {
+      throw std::logic_error(
+        "Base execute_command_endpoint called on incorrect Endpoint type");
+    }
+
+    endpoint->command_func(ctx);
+  }
+
   void EndpointRegistry::execute_endpoint(
     EndpointDefinitionPtr e, EndpointContext& ctx)
   {
-    auto endpoint = dynamic_cast<const Endpoint*>(e.get());
+    const auto* endpoint = dynamic_cast<const Endpoint*>(e.get());
     if (endpoint == nullptr)
     {
       throw std::logic_error(
@@ -492,7 +514,7 @@ namespace ccf::endpoints
   void EndpointRegistry::execute_endpoint_locally_committed(
     EndpointDefinitionPtr e, CommandEndpointContext& ctx, const TxID& tx_id)
   {
-    auto endpoint = dynamic_cast<const Endpoint*>(e.get());
+    const auto* endpoint = dynamic_cast<const Endpoint*>(e.get());
     if (endpoint == nullptr)
     {
       throw std::logic_error(
@@ -505,8 +527,9 @@ namespace ccf::endpoints
   }
 
   std::set<RESTVerb> EndpointRegistry::get_allowed_verbs(
-    kv::Tx& tx, const ccf::RpcContext& rpc_ctx)
+    ccf::kv::Tx& tx, const ccf::RpcContext& rpc_ctx)
   {
+    (void)tx;
     auto method = rpc_ctx.get_method();
 
     std::set<RESTVerb> verbs;
@@ -537,6 +560,7 @@ namespace ccf::endpoints
 
   bool EndpointRegistry::request_needs_root(const ccf::RpcContext& rpc_ctx)
   {
+    (void)rpc_ctx;
     return false;
   }
 
@@ -561,51 +585,15 @@ namespace ccf::endpoints
   }
 
   // Default implementation does nothing
-  void EndpointRegistry::tick(std::chrono::milliseconds) {}
+  void EndpointRegistry::tick(std::chrono::milliseconds duration) {}
 
-  void EndpointRegistry::set_consensus(kv::Consensus* c)
+  void EndpointRegistry::set_consensus(ccf::kv::Consensus* c)
   {
-    consensus = c;
+    consensus.store(c, std::memory_order_release);
   }
 
-  void EndpointRegistry::set_history(kv::TxHistory* h)
+  void EndpointRegistry::set_history(ccf::kv::TxHistory* h)
   {
-    history = h;
-  }
-
-  void EndpointRegistry::increment_metrics_calls(
-    const endpoints::EndpointDefinitionPtr& endpoint)
-  {
-    std::lock_guard<ccf::pal::Mutex> guard(metrics_lock);
-    get_metrics_for_request(
-      endpoint->dispatch.uri_path, endpoint->dispatch.verb.c_str())
-      .calls++;
-  }
-
-  void EndpointRegistry::increment_metrics_errors(
-    const endpoints::EndpointDefinitionPtr& endpoint)
-  {
-    std::lock_guard<ccf::pal::Mutex> guard(metrics_lock);
-    get_metrics_for_request(
-      endpoint->dispatch.uri_path, endpoint->dispatch.verb.c_str())
-      .errors++;
-  }
-
-  void EndpointRegistry::increment_metrics_failures(
-    const endpoints::EndpointDefinitionPtr& endpoint)
-  {
-    std::lock_guard<ccf::pal::Mutex> guard(metrics_lock);
-    get_metrics_for_request(
-      endpoint->dispatch.uri_path, endpoint->dispatch.verb.c_str())
-      .failures++;
-  }
-
-  void EndpointRegistry::increment_metrics_retries(
-    const endpoints::EndpointDefinitionPtr& endpoint)
-  {
-    std::lock_guard<ccf::pal::Mutex> guard(metrics_lock);
-    get_metrics_for_request(
-      endpoint->dispatch.uri_path, endpoint->dispatch.verb.c_str())
-      .retries++;
+    history.store(h, std::memory_order_release);
   }
 }

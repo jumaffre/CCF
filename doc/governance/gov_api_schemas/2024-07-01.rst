@@ -1,0 +1,6 @@
+2024-07-01
+==========
+
+This API is available by passing the query parameter ``api-version=2024-07-01`` to endpoints under the ``/gov`` prefix.
+
+.. openapi:: ../../schemas/gov/2024-07-01/gov.json

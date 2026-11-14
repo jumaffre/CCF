@@ -1,9 +1,4 @@
 {
-  "enclave": {
-    "file": "libjs_generic.enclave.so.signed",
-    "platform": "SGX",
-    "type": "Release"
-  },
   "network": {
     "node_to_node_interface": { "bind_address": "127.0.0.1:8081" },
     "rpc_interfaces": {
@@ -32,14 +27,15 @@
   "ledger": {
     "directory": "ledger",
     "read_only_directories": [],
-    "chunk_size": "5MB"
+    "chunk_size": "5MB",
+    "max_read_size": "64MB",
+    "max_pending_append_bytes": "16MB"
   },
   "snapshots": {
     "directory": "snapshots",
     "tx_count": 10000
   },
   "logging": {
-    "host_level": "Info",
     "format": "Text"
   },
   "consensus": {
@@ -51,7 +47,8 @@
     "delay": "1s"
   },
   "jwt": {
-    "key_refresh_interval": "30min"
+    "key_refresh_interval": "30min",
+    "key_refresh_max_response_size": "1MB"
   },
   "output_files": {
     "node_certificate_file": "node.pem",
@@ -62,10 +59,8 @@
   "tick_interval": "1ms",
   "slow_io_logging_threshold": "10000us",
   "client_connection_timeout": "2000ms",
-  "worker_threads": 0,
-  "memory": {
-    "circuit_size": "4MB",
-    "max_msg_size": "16MB",
-    "max_fragment_size": "64KB"
+  "worker_threads": 1,
+  "node_to_node": {
+    "max_message_size": "64MB"
   }
 }

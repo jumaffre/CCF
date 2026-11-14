@@ -2,7 +2,9 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-namespace kv
+#include <cstdint>
+
+namespace ccf::kv
 {
   // Version indexes modifications to the local kv store.
   using Version = uint64_t;

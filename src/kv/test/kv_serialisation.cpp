@@ -1,23 +1,173 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
-#include "ccf/ds/logger.h"
+#include "ds/internal_logger.h"
 #include "kv/kv_serialiser.h"
+#include "kv/null_encryptor.h"
+#include "kv/raw_serialise.h"
 #include "kv/store.h"
-#include "kv/test/null_encryptor.h"
 #include "kv/test/stub_consensus.h"
+#include "node/encryptor.h"
 
 #include <doctest/doctest.h>
 #undef FAIL
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <limits>
+#include <numeric>
+#include <span>
 #include <string>
+#include <tuple>
 #include <vector>
 
 struct MapTypes
 {
-  using StringString = kv::Map<std::string, std::string>;
-  using NumNum = kv::Map<size_t, size_t>;
-  using NumString = kv::Map<size_t, std::string>;
-  using StringNum = kv::Map<std::string, size_t>;
+  using StringString = ccf::kv::Map<std::string, std::string>;
+  using NumNum = ccf::kv::Map<size_t, size_t>;
+  using NumString = ccf::kv::Map<size_t, std::string>;
+  using StringNum = ccf::kv::Map<std::string, size_t>;
 };
+
+static std::vector<uint8_t> make_size_prefixed_bytes(
+  size_t declared_size, size_t actual_size)
+{
+  std::vector<uint8_t> bytes(sizeof(size_t) + actual_size);
+  std::memcpy(bytes.data(), &declared_size, sizeof(declared_size));
+  return bytes;
+}
+
+TEST_CASE(
+  "Raw reader rejects truncated entries" * doctest::test_suite("serialisation"))
+{
+  SUBCASE("Fixed-size integral")
+  {
+    std::vector<uint8_t> bytes(sizeof(uint64_t) - 1);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next<uint64_t>());
+  }
+
+  SUBCASE("Fixed-size array")
+  {
+    std::vector<uint8_t> bytes(ccf::crypto::Sha256Hash::SIZE - 1);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next<ccf::crypto::Sha256Hash::Representation>());
+  }
+
+  SUBCASE("Short size prefix")
+  {
+    std::vector<uint8_t> bytes(sizeof(size_t) - 1);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next<std::vector<uint8_t>>());
+  }
+
+  SUBCASE("Prefix without payload")
+  {
+    auto bytes = make_size_prefixed_bytes(1, 0);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next<std::vector<uint8_t>>());
+  }
+
+  SUBCASE("Nine bytes remaining declare two payload bytes")
+  {
+    auto bytes = make_size_prefixed_bytes(2, 1);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next<std::vector<uint8_t>>());
+  }
+
+  SUBCASE("Span of more payload bytes than remain")
+  {
+    auto bytes = make_size_prefixed_bytes(2, 1);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next_span());
+  }
+
+  SUBCASE("Impossible payload length")
+  {
+    auto bytes =
+      make_size_prefixed_bytes(std::numeric_limits<size_t>::max(), 0);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next<std::vector<uint8_t>>());
+  }
+
+  SUBCASE("Payload is not a whole number of elements")
+  {
+    auto bytes = make_size_prefixed_bytes(1, 1);
+    ccf::kv::RawReader reader(bytes);
+    REQUIRE_THROWS(reader.read_next<std::vector<uint64_t>>());
+  }
+
+  SUBCASE("Default-constructed reader is immediately at end of stream")
+  {
+    ccf::kv::RawReader reader;
+    REQUIRE(reader.is_eos());
+    REQUIRE_THROWS(reader.read_next<uint64_t>());
+  }
+}
+
+static std::vector<uint8_t> make_public_domain_entry(
+  size_t declared_public_domain_size, const std::vector<uint8_t>& public_domain)
+{
+  ccf::kv::SerialisedEntryHeader header;
+  header.set_size(sizeof(size_t) + public_domain.size());
+  std::vector<uint8_t> entry(sizeof(header) + header.size);
+  auto* data = entry.data();
+  auto remaining = entry.size();
+  serialized::write(data, remaining, header);
+  serialized::write(data, remaining, declared_public_domain_size);
+  serialized::write(
+    data, remaining, public_domain.data(), public_domain.size());
+  return entry;
+}
+
+TEST_CASE(
+  "KV deserialiser rejects invalid public domains" *
+  doctest::test_suite("serialisation"))
+{
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
+
+  const auto initialise = [&](const std::vector<uint8_t>& entry) {
+    ccf::kv::RawKvStoreDeserialiser deserialiser(
+      encryptor, ccf::kv::SecurityDomain::PUBLIC);
+    ccf::kv::Term term = 0;
+    ccf::kv::EntryFlags flags = {};
+    return deserialiser.init(entry.data(), entry.size(), term, flags, false);
+  };
+
+  SUBCASE("Public domain exceeds remaining entry")
+  {
+    const auto entry = make_public_domain_entry(2, {0});
+    REQUIRE_THROWS(initialise(entry));
+  }
+
+  SUBCASE("Public domain length prefix is truncated")
+  {
+    ccf::kv::SerialisedEntryHeader header;
+    header.set_size(sizeof(size_t) - 1);
+    std::vector<uint8_t> entry(sizeof(header) + header.size);
+    std::memcpy(entry.data(), &header, sizeof(header));
+    REQUIRE_THROWS(initialise(entry));
+  }
+
+  SUBCASE("Public domain length is impossible")
+  {
+    const auto entry =
+      make_public_domain_entry(std::numeric_limits<size_t>::max(), {});
+    REQUIRE_THROWS(initialise(entry));
+  }
+
+  SUBCASE("Claims digest is truncated")
+  {
+    std::vector<uint8_t> public_domain(
+      sizeof(ccf::kv::EntryType) + sizeof(ccf::kv::Version));
+    auto* data = public_domain.data();
+    *data++ = static_cast<uint8_t>(ccf::kv::EntryType::WriteSetWithClaims);
+    const ccf::kv::Version version = 1;
+    std::memcpy(data, &version, sizeof(version));
+    const auto entry =
+      make_public_domain_entry(public_domain.size(), public_domain);
+    REQUIRE_THROWS(initialise(entry));
+  }
+}
 
 TEST_CASE(
   "Serialise/deserialise public map only" *
@@ -26,14 +176,14 @@ TEST_CASE(
   // No need for an encryptor here as all maps are public. Both serialisation
   // and deserialisation should succeed.
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
 
-  auto consensus = std::make_shared<kv::test::StubConsensus>();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
   kv_store.set_consensus(consensus);
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
   kv_store.set_encryptor(encryptor);
 
-  kv::Store kv_store_target;
+  ccf::kv::Store kv_store_target;
   kv_store_target.set_encryptor(encryptor);
 
   MapTypes::StringString map("public:pub_map");
@@ -53,7 +203,7 @@ TEST_CASE(
     handle0->put(k1, v1);
     handle0->put(k2, v1);
     handle0->put(k3, v1);
-    REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
   }
 
   const auto first_version = kv_store.current_version();
@@ -68,7 +218,7 @@ TEST_CASE(
     // no change to k1, write to k2, remove k3
     handle0->put(k2, v2);
     handle0->remove(k3);
-    REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
   }
 
   const auto second_version = kv_store.current_version();
@@ -80,7 +230,7 @@ TEST_CASE(
     INFO("Deserialise first transaction in target store");
     REQUIRE(
       kv_store_target.deserialize(first_tx_serialised.value())->apply() ==
-      kv::ApplyResult::PASS);
+      ccf::kv::ApplyResult::PASS);
 
     auto tx_target = kv_store_target.create_tx();
     auto handle_target = tx_target.ro(map);
@@ -105,7 +255,7 @@ TEST_CASE(
     INFO("Deserialise second transaction in target store");
     REQUIRE(
       kv_store_target.deserialize(second_tx_serialised.value())->apply() ==
-      kv::ApplyResult::PASS);
+      ccf::kv::ApplyResult::PASS);
 
     auto tx_target = kv_store_target.create_tx();
     auto handle_target = tx_target.ro(map);
@@ -130,13 +280,13 @@ TEST_CASE(
   "Serialise/deserialise private map only" *
   doctest::test_suite("serialisation"))
 {
-  auto consensus = std::make_shared<kv::test::StubConsensus>();
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
   kv_store.set_consensus(consensus);
 
-  kv::Store kv_store_target;
+  ccf::kv::Store kv_store_target;
   kv_store_target.set_encryptor(encryptor);
 
   SUBCASE(
@@ -145,7 +295,7 @@ TEST_CASE(
     auto tx = kv_store.create_tx();
     auto handle0 = tx.rw<MapTypes::StringString>("priv_map");
     handle0->put("privk1", "privv1");
-    REQUIRE_THROWS_AS(tx.commit(), kv::KvSerialiserException);
+    REQUIRE_THROWS_AS(tx.commit(), ccf::kv::KvSerialiserException);
   }
 
   SUBCASE("Commit private transaction with encryptor")
@@ -156,7 +306,7 @@ TEST_CASE(
       auto tx = kv_store.create_tx();
       auto handle0 = tx.rw<MapTypes::StringString>("priv_map");
       handle0->put("privk1", "privv1");
-      REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+      REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
     }
 
     INFO("Deserialise transaction in target store");
@@ -165,7 +315,7 @@ TEST_CASE(
       REQUIRE(latest_data.has_value());
       REQUIRE(
         kv_store_target.deserialize(latest_data.value())->apply() ==
-        kv::ApplyResult::PASS);
+        ccf::kv::ApplyResult::PASS);
 
       auto tx_target = kv_store_target.create_tx();
       auto handle_target = tx_target.rw<MapTypes::StringString>("priv_map");
@@ -175,20 +325,442 @@ TEST_CASE(
 }
 
 TEST_CASE(
+  "Reject transactions exceeding configured serialised size" *
+  doctest::test_suite("serialisation"))
+{
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
+
+  ccf::kv::Store kv_store;
+  kv_store.set_consensus(consensus);
+  kv_store.set_encryptor(encryptor);
+  kv_store.set_max_transaction_size(1024);
+
+  MapTypes::StringString map("public:pub_map");
+
+  {
+    INFO("An oversized transaction is rejected before it is applied");
+    auto tx = kv_store.create_tx();
+    auto handle = tx.rw(map);
+    handle->put("oversized", std::string(2048, 'A'));
+    REQUIRE_THROWS_AS(tx.commit(), ccf::kv::MaxTransactionSizeExceeded);
+    REQUIRE(kv_store.current_version() == 0);
+    REQUIRE(!consensus->get_latest_data().has_value());
+  }
+
+  {
+    INFO("Later transactions are unaffected");
+    auto tx = kv_store.create_tx();
+    auto handle = tx.rw(map);
+    handle->put("small", "ok");
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
+    REQUIRE(kv_store.current_version() == 1);
+  }
+}
+
+TEST_CASE(
+  "The transaction size limit is compared against the exact entry size" *
+  doctest::test_suite("serialisation"))
+{
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
+
+  MapTypes::StringString map("public:pub_map");
+  const auto value = std::string(512, 'A');
+
+  // Serialise the transaction under a permissive limit to find the exact size
+  // of the ledger entry it produces.
+  size_t entry_size = 0;
+  {
+    ccf::kv::Store kv_store;
+    kv_store.set_consensus(consensus);
+    kv_store.set_encryptor(encryptor);
+
+    auto tx = kv_store.create_tx();
+    auto handle = tx.rw(map);
+    handle->put("key", value);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
+
+    const auto latest_data = consensus->get_latest_data();
+    REQUIRE(latest_data.has_value());
+    entry_size = latest_data->size();
+  }
+
+  // The allocation-free sizing pass must report the exact size of the entry
+  // which is eventually written. A limit of precisely that size is accepted,
+  // and one byte less is not.
+  {
+    ccf::kv::Store kv_store;
+    kv_store.set_encryptor(encryptor);
+    kv_store.set_max_transaction_size(entry_size);
+
+    auto tx = kv_store.create_tx();
+    auto handle = tx.rw(map);
+    handle->put("key", value);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
+  }
+
+  {
+    ccf::kv::Store kv_store;
+    kv_store.set_encryptor(encryptor);
+    kv_store.set_max_transaction_size(entry_size - 1);
+
+    auto tx = kv_store.create_tx();
+    auto handle = tx.rw(map);
+    handle->put("key", value);
+    REQUIRE_THROWS_AS(tx.commit(), ccf::kv::MaxTransactionSizeExceeded);
+    REQUIRE(kv_store.current_version() == 0);
+  }
+}
+
+TEST_CASE(
+  "The transaction size limit includes encrypted private data" *
+  doctest::test_suite("serialisation"))
+{
+  const auto create_encryptor = []() {
+    auto secrets = std::make_shared<ccf::LedgerSecrets>();
+    secrets->init();
+    return std::make_shared<ccf::NodeEncryptor>(secrets);
+  };
+
+  MapTypes::StringString public_map("public:pub_map");
+  MapTypes::StringString private_map("priv_map");
+  const auto value = std::string(512, 'A');
+
+  const auto populate = [&](ccf::kv::CommittableTx& tx) {
+    tx.rw(public_map)->put("public_key", value);
+    tx.rw(private_map)->put("private_key", value);
+  };
+
+  size_t entry_size = 0;
+  {
+    auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+    ccf::kv::Store kv_store;
+    kv_store.set_consensus(consensus);
+    kv_store.set_encryptor(create_encryptor());
+
+    auto tx = kv_store.create_tx();
+    populate(tx);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
+
+    const auto latest_data = consensus->get_latest_data();
+    REQUIRE(latest_data.has_value());
+    entry_size = latest_data->size();
+  }
+
+  {
+    ccf::kv::Store kv_store;
+    kv_store.set_encryptor(create_encryptor());
+    kv_store.set_max_transaction_size(entry_size);
+
+    auto tx = kv_store.create_tx();
+    populate(tx);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
+  }
+
+  {
+    ccf::kv::Store kv_store;
+    kv_store.set_encryptor(create_encryptor());
+    kv_store.set_max_transaction_size(entry_size - 1);
+
+    auto tx = kv_store.create_tx();
+    populate(tx);
+    REQUIRE_THROWS_AS(tx.commit(), ccf::kv::MaxTransactionSizeExceeded);
+    REQUIRE(kv_store.current_version() == 0);
+  }
+}
+
+TEST_CASE(
+  "Deserialisation is not subject to the transaction size limit" *
+  doctest::test_suite("serialisation"))
+{
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
+
+  // Serialise a transaction under a permissive (default) limit.
+  ccf::kv::Store kv_store;
+  kv_store.set_consensus(consensus);
+  kv_store.set_encryptor(encryptor);
+
+  MapTypes::StringString map("public:pub_map");
+
+  {
+    auto tx = kv_store.create_tx();
+    auto handle = tx.rw(map);
+    handle->put("large", std::string(2048, 'A'));
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
+  }
+
+  const auto latest_data = consensus->get_latest_data();
+  REQUIRE(latest_data.has_value());
+
+  // The cap applies only to serialisation. A tiny limit on the target store
+  // must not prevent it from deserialising an already-serialised transaction.
+  ccf::kv::Store kv_store_target;
+  kv_store_target.set_encryptor(encryptor);
+  kv_store_target.set_max_transaction_size(1);
+
+  REQUIRE(
+    kv_store_target.deserialize(latest_data.value())->apply() ==
+    ccf::kv::ApplyResult::PASS);
+}
+
+TEST_CASE(
+  "RawWriter, SizeWriter and SpanWriter agree" *
+  doctest::test_suite("serialisation"))
+{
+  const auto check = [](const auto& entry) {
+    ccf::kv::RawWriter raw_writer;
+    ccf::kv::SizeWriter size_writer;
+    const auto expected_size = ccf::kv::RawWriter::serialised_size(entry);
+    raw_writer.append(entry);
+    size_writer.append(entry);
+    REQUIRE(raw_writer.size() == expected_size);
+    REQUIRE(size_writer.size() == expected_size);
+
+    // A SpanWriter writes the same bytes into a buffer of exactly that size,
+    // and nothing beyond it
+    std::vector<uint8_t> buffer(expected_size);
+    ccf::kv::SpanWriter span_writer(buffer);
+    span_writer.append(entry);
+    REQUIRE(span_writer.size() == expected_size);
+    REQUIRE(buffer == raw_writer.get_raw_data());
+    REQUIRE_THROWS_AS(span_writer.append(1), std::length_error);
+    REQUIRE_THROWS_AS(span_writer.append(entry), std::length_error);
+    REQUIRE(span_writer.size() == expected_size);
+
+    // Once cleared, it writes from the start of the buffer again
+    span_writer.clear();
+    REQUIRE(span_writer.size() == 0);
+    span_writer.append(entry);
+    REQUIRE(span_writer.size() == expected_size);
+    REQUIRE(buffer == raw_writer.get_raw_data());
+  };
+
+  check(ccf::kv::EntryType::WriteSetWithCommitEvidenceAndClaims);
+  check(uint8_t(42));
+  check(uint64_t(42));
+  check(ccf::kv::Version(42));
+  check(ccf::crypto::Sha256Hash(std::string("some content")));
+  check(std::string());
+  check(std::string("a string of some length"));
+  check(std::vector<uint8_t>());
+  check(std::vector<uint8_t>(37, 'x'));
+  check(std::vector<ccf::kv::Version>{1, 2, 3});
+  check(ccf::kv::serialisers::SerialisedEntry());
+  check(ccf::kv::serialisers::SerialisedEntry(91, 'y'));
+}
+
+TEST_CASE(
+  "Writers append size-prefixed payloads in place" *
+  doctest::test_suite("serialisation"))
+{
+  for (const size_t payload_size : {0, 37})
+  {
+    INFO(payload_size);
+    std::vector<uint8_t> payload(payload_size);
+    std::iota(payload.begin(), payload.end(), uint8_t{1});
+    ccf::kv::RawWriter expected;
+    expected.append(payload);
+
+    size_t fills = 0;
+    const auto fill = [&](std::span<uint8_t> out) {
+      ++fills;
+      REQUIRE(out.size() == payload.size());
+      std::ranges::copy(payload, out.begin());
+    };
+
+    ccf::kv::RawWriter raw_writer;
+    raw_writer.append_size_prefixed_in_place(payload_size, fill);
+    REQUIRE(raw_writer.get_raw_data() == expected.get_raw_data());
+
+    // Only measures, so does not fill, and has no data to return
+    ccf::kv::SizeWriter size_writer;
+    size_writer.append_size_prefixed_in_place(payload_size, fill);
+    REQUIRE(size_writer.size() == expected.size());
+    REQUIRE_THROWS_AS(std::ignore = size_writer.view(), std::logic_error);
+
+    std::vector<uint8_t> buffer(expected.size());
+    ccf::kv::SpanWriter span_writer(buffer);
+    span_writer.append_size_prefixed_in_place(payload_size, fill);
+    REQUIRE(span_writer.size() == expected.size());
+    REQUIRE(buffer == expected.get_raw_data());
+
+    // A buffer too small for the payload is detected before filling it
+    std::vector<uint8_t> small_buffer(expected.size() - 1);
+    ccf::kv::SpanWriter small_writer(small_buffer);
+    REQUIRE_THROWS_AS(
+      small_writer.append_size_prefixed_in_place(payload_size, fill),
+      std::length_error);
+    REQUIRE(small_writer.size() == 0);
+
+    // Empty payloads are not filled
+    REQUIRE(fills == (payload_size == 0 ? 0 : 2));
+  }
+}
+
+TEST_CASE(
+  "Writers discard a payload whose in-place fill throws" *
+  doctest::test_suite("serialisation"))
+{
+  // Payloads within and beyond RawWriter's inline capacity
+  for (const size_t payload_size : {37, 1000})
+  {
+    INFO(payload_size);
+    const uint32_t header = 0x01020304;
+    std::vector<uint8_t> payload(payload_size);
+    std::iota(payload.begin(), payload.end(), uint8_t{1});
+    ccf::kv::RawWriter expected;
+    expected.append(header);
+    expected.append(payload);
+    const auto expected_header = expected.view().first(sizeof(header));
+
+    const auto failing_fill = [](std::span<uint8_t> out) {
+      std::ranges::fill(out.first(out.size() / 2), uint8_t{0xff});
+      throw std::runtime_error("fill failed");
+    };
+    const auto fill = [&](std::span<uint8_t> out) {
+      std::ranges::copy(payload, out.begin());
+    };
+
+    // The writer keeps only what it held before the failed append, so it
+    // exports neither the payload's size nor the part of it that was written,
+    // and can still be appended to
+    ccf::kv::RawWriter raw_writer;
+    raw_writer.append(header);
+    REQUIRE_THROWS_WITH_AS(
+      raw_writer.append_size_prefixed_in_place(payload_size, failing_fill),
+      "fill failed",
+      std::runtime_error);
+    REQUIRE(raw_writer.size() == sizeof(header));
+    REQUIRE(std::ranges::equal(raw_writer.view(), expected_header));
+    raw_writer.append_size_prefixed_in_place(payload_size, fill);
+    REQUIRE(raw_writer.get_raw_data() == expected.get_raw_data());
+
+    std::vector<uint8_t> buffer(expected.size());
+    ccf::kv::SpanWriter span_writer(buffer);
+    span_writer.append(header);
+    REQUIRE_THROWS_WITH_AS(
+      span_writer.append_size_prefixed_in_place(payload_size, failing_fill),
+      "fill failed",
+      std::runtime_error);
+    REQUIRE(span_writer.size() == sizeof(header));
+    REQUIRE(std::ranges::equal(span_writer.view(), expected_header));
+    span_writer.append_size_prefixed_in_place(payload_size, fill);
+    REQUIRE(buffer == expected.get_raw_data());
+  }
+}
+
+TEST_CASE(
+  "Writers reject sizes beyond the serialisable limit" *
+  doctest::test_suite("serialisation"))
+{
+  constexpr auto max_size = ccf::kv::RawWriter::MAX_SIZE;
+  size_t fills = 0;
+  const auto fill = [&fills](std::span<uint8_t>) { ++fills; };
+
+  // A payload which, with its size prefix, would not fit in a ptrdiff_t is
+  // rejected without reserving space for it or filling it
+  for (const size_t payload_size :
+       {max_size - sizeof(size_t) + 1, std::numeric_limits<size_t>::max()})
+  {
+    INFO(payload_size);
+    ccf::kv::RawWriter raw_writer;
+    REQUIRE_THROWS_AS(
+      raw_writer.append_size_prefixed_in_place(payload_size, fill),
+      std::length_error);
+    REQUIRE(raw_writer.size() == 0);
+
+    std::vector<uint8_t> buffer(sizeof(size_t));
+    ccf::kv::SpanWriter span_writer(buffer);
+    REQUIRE_THROWS_AS(
+      span_writer.append_size_prefixed_in_place(payload_size, fill),
+      std::length_error);
+    REQUIRE(span_writer.size() == 0);
+
+    ccf::kv::SizeWriter size_writer;
+    REQUIRE_THROWS_AS(
+      size_writer.append_size_prefixed_in_place(payload_size, fill),
+      std::length_error);
+    REQUIRE(size_writer.size() == 0);
+  }
+
+  // A payload which, with its size prefix, fits exactly is accepted
+  ccf::kv::SizeWriter exact_writer;
+  exact_writer.append_size_prefixed_in_place(max_size - sizeof(size_t), fill);
+  REQUIRE(exact_writer.size() == max_size);
+
+  // The total measured by a SizeWriter is bounded the same way, up to and
+  // including the limit, whichever way it is reached
+  ccf::kv::SizeWriter size_writer;
+  size_writer.append_size_prefixed_in_place(
+    max_size - sizeof(size_t) - sizeof(uint32_t), fill);
+  REQUIRE(size_writer.size() == max_size - sizeof(uint32_t));
+  REQUIRE_THROWS_AS(
+    size_writer.append_size_prefixed_in_place(0, fill), std::length_error);
+  REQUIRE_THROWS_AS(size_writer.append(uint64_t{0}), std::length_error);
+  REQUIRE(size_writer.size() == max_size - sizeof(uint32_t));
+  size_writer.append(uint32_t{0});
+  REQUIRE(size_writer.size() == max_size);
+  REQUIRE_THROWS_AS(size_writer.append(uint8_t{0}), std::length_error);
+  REQUIRE(size_writer.size() == max_size);
+
+  REQUIRE(fills == 0);
+}
+
+TEST_CASE(
+  "Reserved signature transactions ignore the configured transaction size "
+  "limit" *
+  doctest::test_suite("serialisation"))
+{
+  ccf::kv::Store kv_store;
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
+  kv_store.set_encryptor(encryptor);
+  kv_store.set_max_transaction_size(1);
+
+  MapTypes::StringString map("public:signature");
+  auto tx = kv_store.create_reserved_tx(kv_store.next_txid());
+  tx.rw(map)->put("signature", std::string(512, 'A'));
+
+  const auto [result, data, claims, commit_evidence, hooks] =
+    tx.commit_reserved();
+  REQUIRE(result == ccf::kv::CommitResult::SUCCESS);
+  REQUIRE(data.size() > kv_store.get_max_transaction_size());
+}
+
+TEST_CASE(
+  "Reject configuring a maximum transaction size beyond the serialisable "
+  "limit" *
+  doctest::test_suite("serialisation"))
+{
+  ccf::kv::Store kv_store;
+
+  // The largest entry the ledger entry header can describe is accepted.
+  REQUIRE_NOTHROW(
+    kv_store.set_max_transaction_size(ccf::kv::max_serialised_entry_size));
+
+  // A value larger than can ever be serialised is rejected at configuration
+  // time, rather than being deferred to a later serialisation failure.
+  REQUIRE_THROWS_AS(
+    kv_store.set_max_transaction_size(std::numeric_limits<size_t>::max()),
+    std::logic_error);
+}
+
+TEST_CASE(
   "Serialise/deserialise private map and public maps" *
   doctest::test_suite("serialisation"))
 {
-  auto consensus = std::make_shared<kv::test::StubConsensus>();
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
   kv_store.set_consensus(consensus);
   kv_store.set_encryptor(encryptor);
 
   constexpr auto priv_map = "priv_map";
   constexpr auto pub_map = "public:pub_map";
 
-  kv::Store kv_store_target;
+  ccf::kv::Store kv_store_target;
   kv_store_target.set_encryptor(encryptor);
 
   INFO("Commit to public and private map in source store");
@@ -200,7 +772,7 @@ TEST_CASE(
     handle_priv->put("privk1", "privv1");
     handle_pub->put("pubk1", "pubv1");
 
-    REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
   }
 
   INFO("Deserialise transaction in target store");
@@ -209,7 +781,7 @@ TEST_CASE(
     REQUIRE(latest_data.has_value());
     REQUIRE(
       kv_store_target.deserialize(latest_data.value())->apply() !=
-      kv::ApplyResult::FAIL);
+      ccf::kv::ApplyResult::FAIL);
 
     auto tx_target = kv_store_target.create_tx();
     auto handle_priv = tx_target.rw<MapTypes::StringString>(priv_map);
@@ -221,16 +793,178 @@ TEST_CASE(
 }
 
 TEST_CASE(
+  "Encrypted entries retain the GCM layout and authenticate public bytes" *
+  doctest::test_suite("serialisation"))
+{
+  auto secrets = std::make_shared<ccf::LedgerSecrets>();
+  secrets->init();
+  secrets->set_secret(4, ccf::make_ledger_secret());
+  auto encryptor = std::make_shared<ccf::NodeEncryptor>(secrets);
+  const ccf::TxID tx_id{2, 2};
+
+  const auto check = [&](
+                       const std::vector<uint8_t>& public_domain,
+                       const std::vector<uint8_t>& private_domain,
+                       ccf::kv::EntryType type,
+                       bool historical_hint) {
+    ccf::kv::RawKvStoreSerialiser serialiser(
+      encryptor, tx_id, type, 0, {}, ccf::no_claims(), historical_hint);
+    const auto entry =
+      serialiser.serialise_domains(public_domain, private_domain);
+
+    std::vector<uint8_t> header;
+    std::vector<uint8_t> cipher;
+    REQUIRE(encryptor->encrypt(
+      private_domain,
+      public_domain,
+      header,
+      cipher,
+      tx_id,
+      type,
+      historical_hint));
+
+    ccf::kv::SerialisedEntryHeader entry_header;
+    entry_header.set_size(
+      header.size() + sizeof(size_t) + public_domain.size() + cipher.size());
+    std::vector<uint8_t> expected(entry.size());
+    auto* data = expected.data();
+    auto remaining = expected.size();
+    serialized::write(data, remaining, entry_header);
+    serialized::write(data, remaining, header.data(), header.size());
+    serialized::write(data, remaining, public_domain.size());
+    serialized::write(
+      data, remaining, public_domain.data(), public_domain.size());
+    serialized::write(data, remaining, cipher.data(), cipher.size());
+    REQUIRE(remaining == 0);
+    REQUIRE(entry == expected);
+
+    std::vector<uint8_t> decrypted;
+    ccf::kv::Term term = 0;
+    REQUIRE(encryptor->decrypt(
+      cipher, public_domain, header, decrypted, tx_id.seqno, term, true));
+    REQUIRE(decrypted == private_domain);
+    if (type != ccf::kv::EntryType::Snapshot)
+    {
+      REQUIRE(term == tx_id.view);
+    }
+
+    auto changed_public_domain = public_domain;
+    changed_public_domain.front() ^= 1;
+    REQUIRE_FALSE(encryptor->decrypt(
+      cipher,
+      changed_public_domain,
+      header,
+      decrypted,
+      tx_id.seqno,
+      term,
+      true));
+  };
+
+  check({1, 2, 3}, {}, ccf::kv::EntryType::WriteSet, false);
+  check({1}, {4, 5, 6}, ccf::kv::EntryType::WriteSet, false);
+  check({1, 2, 3}, {4, 5, 6}, ccf::kv::EntryType::WriteSet, false);
+  check({1, 2, 3}, {4, 5, 6}, ccf::kv::EntryType::Snapshot, true);
+
+  auto missing_secrets = std::make_shared<ccf::LedgerSecrets>();
+  ccf::kv::RawKvStoreSerialiser failing(
+    std::make_shared<ccf::NodeEncryptor>(missing_secrets),
+    tx_id,
+    ccf::kv::EntryType::WriteSet,
+    0);
+  REQUIRE_THROWS_AS(
+    failing.serialise_domains({1, 2, 3}, {4, 5, 6}),
+    ccf::kv::KvSerialiserException);
+}
+
+TEST_CASE(
+  "Encrypted public and private transactions replay" *
+  doctest::test_suite("serialisation"))
+{
+  auto secrets = std::make_shared<ccf::LedgerSecrets>();
+  secrets->init();
+  auto encryptor = std::make_shared<ccf::NodeEncryptor>(secrets);
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  ccf::kv::Store source;
+  source.set_encryptor(encryptor);
+  source.set_consensus(consensus);
+  ccf::kv::Store recovered;
+  recovered.set_encryptor(encryptor);
+
+  MapTypes::StringString public_map("public:pub_map");
+  MapTypes::StringString private_map("priv_map");
+  for (size_t i = 1; i <= 3; ++i)
+  {
+    auto tx = source.create_tx();
+    if (i != 2)
+    {
+      tx.rw(public_map)->put(std::to_string(i), "public");
+    }
+    if (i != 1)
+    {
+      tx.rw(private_map)->put(std::to_string(i), "private");
+    }
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
+    const auto entry = consensus->get_latest_data();
+    REQUIRE(entry.has_value());
+    REQUIRE(
+      recovered.deserialize(*entry)->apply() == ccf::kv::ApplyResult::PASS);
+  }
+
+  auto tx = recovered.create_tx();
+  REQUIRE(tx.ro(public_map)->get("1") == "public");
+  REQUIRE(tx.ro(private_map)->get("2") == "private");
+  REQUIRE(tx.ro(public_map)->get("3") == "public");
+  REQUIRE(tx.ro(private_map)->get("3") == "private");
+}
+
+TEST_CASE(
+  "Partial encryption failure cannot replicate an entry" *
+  doctest::test_suite("serialisation"))
+{
+  class FailingEncryptor : public ccf::NodeEncryptor
+  {
+  public:
+    using ccf::NodeEncryptor::NodeEncryptor;
+
+    bool encrypt(
+      std::span<const uint8_t>,
+      std::span<const uint8_t>,
+      std::span<uint8_t> header,
+      std::span<uint8_t> cipher,
+      const ccf::TxID&,
+      ccf::kv::EntryType,
+      bool) override
+    {
+      std::fill(header.begin(), header.end(), 0xAA);
+      std::fill(cipher.begin(), cipher.end(), 0xBB);
+      return false;
+    }
+  };
+
+  auto secrets = std::make_shared<ccf::LedgerSecrets>();
+  secrets->init();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  ccf::kv::Store store;
+  store.set_encryptor(std::make_shared<FailingEncryptor>(secrets));
+  store.set_consensus(consensus);
+
+  auto tx = store.create_tx();
+  tx.rw<MapTypes::StringString>("private_map")->put("key", "secret");
+  REQUIRE_THROWS_AS(tx.commit(), ccf::kv::KvSerialiserException);
+  REQUIRE_FALSE(consensus->get_latest_data().has_value());
+}
+
+TEST_CASE(
   "Serialise/deserialise removed keys" * doctest::test_suite("serialisation"))
 {
-  auto consensus = std::make_shared<kv::test::StubConsensus>();
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
   kv_store.set_consensus(consensus);
   kv_store.set_encryptor(encryptor);
 
-  kv::Store kv_store_target;
+  ccf::kv::Store kv_store_target;
   kv_store_target.set_encryptor(encryptor);
 
   INFO("Commit new keys in source store and deserialise in target store");
@@ -241,13 +975,13 @@ TEST_CASE(
     handle->put("key1", "value1");
     handle2->put("key2", "value2");
     handle2->put("key3", "value3");
-    REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
 
     const auto latest_data = consensus->get_latest_data();
     REQUIRE(latest_data.has_value());
     REQUIRE(
       kv_store_target.deserialize(latest_data.value())->apply() !=
-      kv::ApplyResult::FAIL);
+      ccf::kv::ApplyResult::FAIL);
 
     auto tx_target = kv_store_target.create_tx();
     auto handle_target = tx_target.rw<MapTypes::StringString>("map");
@@ -281,7 +1015,7 @@ TEST_CASE(
     handle_->remove("key3");
     handle_->put("key3", "value3");
 
-    REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
 
     // Make sure keys have been marked as deleted in source store
     auto tx2 = kv_store.create_tx();
@@ -296,7 +1030,7 @@ TEST_CASE(
     REQUIRE(latest_data.has_value());
     REQUIRE(
       kv_store_target.deserialize(latest_data.value())->apply() !=
-      kv::ApplyResult::FAIL);
+      ccf::kv::ApplyResult::FAIL);
 
     auto tx_target = kv_store_target.create_tx();
     auto handle_target = tx_target.rw<MapTypes::StringString>("map");
@@ -318,11 +1052,12 @@ struct CustomClass
 // These macros allow the default nlohmann JSON serialiser to be used
 DECLARE_JSON_TYPE(CustomClass);
 DECLARE_JSON_REQUIRED_FIELDS(CustomClass, s, n);
+
 // SNIPPET_END: CustomClass definition
 
 // Not really intended to be extended, but lets us use the BlitSerialiser for
 // this specific type
-namespace kv::serialisers
+namespace ccf::kv::serialisers
 {
   template <>
   struct BlitSerialiser<CustomClass>
@@ -373,11 +1108,13 @@ struct CustomSerialiser
 
   static constexpr auto size_of_n = 8;
   static constexpr auto size_of_size_of_s = 8;
-  static kv::serialisers::SerialisedEntry to_serialised(const CustomClass& cc)
+
+  static ccf::kv::serialisers::SerialisedEntry to_serialised(
+    const CustomClass& cc)
   {
     const auto s_size = cc.s.size();
     const auto total_size = size_of_n + size_of_size_of_s + s_size;
-    kv::serialisers::SerialisedEntry serialised(total_size);
+    ccf::kv::serialisers::SerialisedEntry serialised(total_size);
     uint8_t* data = serialised.data();
     memcpy(data, (const uint8_t*)&cc.n, size_of_n);
     data += size_of_n;
@@ -388,7 +1125,7 @@ struct CustomSerialiser
   }
 
   static CustomClass from_serialised(
-    const kv::serialisers::SerialisedEntry& ser)
+    const ccf::kv::serialisers::SerialisedEntry& ser)
   {
     CustomClass cc;
     const uint8_t* data = ser.data();
@@ -401,11 +1138,12 @@ struct CustomSerialiser
     return cc;
   }
 };
+
 // SNIPPET_END: CustomSerialiser definition
 
 struct CustomJsonSerialiser
 {
-  using Bytes = kv::serialisers::SerialisedEntry;
+  using Bytes = ccf::kv::serialisers::SerialisedEntry;
 
   static Bytes to_serialised(const CustomClass& c)
   {
@@ -439,7 +1177,7 @@ struct VPrefix
 template <typename T>
 struct CustomVerboseDumbSerialiser
 {
-  using Bytes = kv::serialisers::SerialisedEntry;
+  using Bytes = ccf::kv::serialisers::SerialisedEntry;
 
   static Bytes to_serialised(const CustomClass& c)
   {
@@ -471,25 +1209,26 @@ struct CustomVerboseDumbSerialiser
   }
 };
 
-using JsonSerialisedMap = kv::JsonSerialisedMap<CustomClass, CustomClass>;
-using RawCopySerialisedMap = kv::RawCopySerialisedMap<CustomClass, CustomClass>;
-using MixSerialisedMapB = kv::TypedMap<
+using JsonSerialisedMap = ccf::kv::JsonSerialisedMap<CustomClass, CustomClass>;
+using RawCopySerialisedMap =
+  ccf::kv::RawCopySerialisedMap<CustomClass, CustomClass>;
+using MixSerialisedMapB = ccf::kv::TypedMap<
   CustomClass,
   CustomClass,
-  kv::serialisers::JsonSerialiser<CustomClass>,
-  kv::serialisers::BlitSerialiser<CustomClass>>;
+  ccf::kv::serialisers::JsonSerialiser<CustomClass>,
+  ccf::kv::serialisers::BlitSerialiser<CustomClass>>;
 
 // SNIPPET_START: CustomSerialisedMap definition
-using CustomSerialisedMap =
-  kv::TypedMap<CustomClass, CustomClass, CustomSerialiser, CustomSerialiser>;
+using CustomSerialisedMap = ccf::kv::
+  TypedMap<CustomClass, CustomClass, CustomSerialiser, CustomSerialiser>;
 // SNIPPET_END: CustomSerialisedMap definition
 
-using CustomJsonMap = kv::TypedMap<
+using CustomJsonMap = ccf::kv::TypedMap<
   CustomClass,
   CustomClass,
   CustomJsonSerialiser,
   CustomJsonSerialiser>;
-using VerboseSerialisedMap = kv::TypedMap<
+using VerboseSerialisedMap = ccf::kv::TypedMap<
   CustomClass,
   CustomClass,
   CustomVerboseDumbSerialiser<KPrefix>,
@@ -505,8 +1244,8 @@ TEST_CASE_TEMPLATE(
   CustomJsonMap,
   VerboseSerialisedMap)
 {
-  kv::Store kv_store;
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+  ccf::kv::Store kv_store;
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
   kv_store.set_encryptor(encryptor);
 
   MapType map("public:map");
@@ -519,7 +1258,7 @@ TEST_CASE_TEMPLATE(
 
   INFO("Serialise/Deserialise 2 kv stores");
   {
-    kv::Store kv_store2;
+    ccf::kv::Store kv_store2;
     kv_store2.set_encryptor(encryptor);
 
     MapType map2("public:map");
@@ -533,10 +1272,10 @@ TEST_CASE_TEMPLATE(
       tx.commit_reserved();
     auto& success = success_;
     auto& data = data_;
-    REQUIRE(success == kv::CommitResult::SUCCESS);
+    REQUIRE(success == ccf::kv::CommitResult::SUCCESS);
     kv_store.compact(kv_store.current_version());
 
-    REQUIRE(kv_store2.deserialize(data)->apply() == kv::ApplyResult::PASS);
+    REQUIRE(kv_store2.deserialize(data)->apply() == ccf::kv::ApplyResult::PASS);
     auto tx2 = kv_store2.create_tx();
     auto handle2 = tx2.rw(map2);
 
@@ -564,11 +1303,11 @@ TEST_CASE("nlohmann (de)serialisation" * doctest::test_suite("serialisation"))
 
   SUBCASE("baseline")
   {
-    auto consensus = std::make_shared<kv::test::StubConsensus>();
-    using Table = kv::Map<std::vector<int>, std::string>;
-    kv::Store s0, s1;
+    auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+    using Table = ccf::kv::Map<std::vector<int>, std::string>;
+    ccf::kv::Store s0, s1;
     s0.set_consensus(consensus);
-    auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+    auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
     s0.set_encryptor(encryptor);
     s1.set_encryptor(encryptor);
 
@@ -576,21 +1315,22 @@ TEST_CASE("nlohmann (de)serialisation" * doctest::test_suite("serialisation"))
 
     auto tx = s0.create_tx();
     tx.rw(t)->put(k1, v1);
-    REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
 
     const auto latest_data = consensus->get_latest_data();
     REQUIRE(latest_data.has_value());
     REQUIRE(
-      s1.deserialize(latest_data.value())->apply() != kv::ApplyResult::FAIL);
+      s1.deserialize(latest_data.value())->apply() !=
+      ccf::kv::ApplyResult::FAIL);
   }
 
   SUBCASE("nlohmann")
   {
-    auto consensus = std::make_shared<kv::test::StubConsensus>();
-    using Table = kv::Map<nlohmann::json, nlohmann::json>;
-    kv::Store s0, s1;
+    auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+    using Table = ccf::kv::Map<nlohmann::json, nlohmann::json>;
+    ccf::kv::Store s0, s1;
     s0.set_consensus(consensus);
-    auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+    auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
     s0.set_encryptor(encryptor);
     s1.set_encryptor(encryptor);
 
@@ -599,12 +1339,13 @@ TEST_CASE("nlohmann (de)serialisation" * doctest::test_suite("serialisation"))
     auto tx = s0.create_tx();
     tx.rw(t)->put(k0, v0);
     tx.rw(t)->put(k1, v1);
-    REQUIRE(tx.commit() == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit() == ccf::kv::CommitResult::SUCCESS);
 
     const auto latest_data = consensus->get_latest_data();
     REQUIRE(latest_data.has_value());
     REQUIRE(
-      s1.deserialize(latest_data.value())->apply() != kv::ApplyResult::FAIL);
+      s1.deserialize(latest_data.value())->apply() !=
+      ccf::kv::ApplyResult::FAIL);
   }
 }
 
@@ -613,7 +1354,7 @@ struct NonSerialisable
 
 struct NonSerialiser
 {
-  using Bytes = kv::serialisers::SerialisedEntry;
+  using Bytes = ccf::kv::serialisers::SerialisedEntry;
 
   static Bytes to_serialised(const NonSerialisable& ns)
   {
@@ -628,23 +1369,23 @@ struct NonSerialiser
 
 TEST_CASE("Exceptional serdes" * doctest::test_suite("serialisation"))
 {
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
-  auto consensus = std::make_shared<kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
 
-  kv::Store store;
+  ccf::kv::Store store;
   store.set_consensus(consensus);
   store.set_encryptor(encryptor);
 
-  kv::TypedMap<
+  ccf::kv::TypedMap<
     NonSerialisable,
     size_t,
     NonSerialiser,
-    kv::serialisers::JsonSerialiser<size_t>>
+    ccf::kv::serialisers::JsonSerialiser<size_t>>
     bad_map_k("bad_map_k");
-  kv::TypedMap<
+  ccf::kv::TypedMap<
     size_t,
     NonSerialisable,
-    kv::serialisers::JsonSerialiser<size_t>,
+    ccf::kv::serialisers::JsonSerialiser<size_t>,
     NonSerialiser>
     bad_map_v("bad_map_v");
 
@@ -665,21 +1406,22 @@ TEST_CASE(
   "Serialise/deserialise maps with claims" *
   doctest::test_suite("serialisation"))
 {
-  auto consensus = std::make_shared<kv::test::StubConsensus>();
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
   kv_store.set_consensus(consensus);
   kv_store.set_encryptor(encryptor);
 
   constexpr auto priv_map = "priv_map";
   constexpr auto pub_map = "public:pub_map";
 
-  kv::Store kv_store_target;
+  ccf::kv::Store kv_store_target;
   kv_store_target.set_encryptor(encryptor);
 
   ccf::ClaimsDigest claims_digest;
-  claims_digest.set(crypto::Sha256Hash("claim text"));
+  claims_digest.set(ccf::crypto::Sha256Hash("claim text"));
+  ccf::crypto::Sha256Hash expected_commit_evidence_digest;
 
   INFO("Commit to source store, including claims");
   {
@@ -690,17 +1432,24 @@ TEST_CASE(
     handle_priv->put("privk1", "privv1");
     handle_pub->put("pubk1", "pubv1");
 
-    REQUIRE(tx.commit(claims_digest) == kv::CommitResult::SUCCESS);
+    REQUIRE(tx.commit(claims_digest) == ccf::kv::CommitResult::SUCCESS);
+    expected_commit_evidence_digest = ccf::crypto::Sha256Hash(
+      encryptor->get_commit_evidence({tx.commit_term(), tx.commit_version()}));
   }
 
-  INFO("Deserialise transaction in target store and extract claims");
+  INFO("Deserialise transaction in target store and extract digests");
   {
     const auto latest_data = consensus->get_latest_data();
     REQUIRE(latest_data.has_value());
     auto wrapper = kv_store_target.deserialize(latest_data.value());
-    REQUIRE(wrapper->apply() != kv::ApplyResult::FAIL);
+    REQUIRE(wrapper->apply() != ccf::kv::ApplyResult::FAIL);
     auto deserialised_claims = wrapper->consume_claims_digest();
     REQUIRE(claims_digest == deserialised_claims);
+    auto deserialised_commit_evidence =
+      wrapper->consume_commit_evidence_digest();
+    REQUIRE(deserialised_commit_evidence.has_value());
+    REQUIRE(
+      deserialised_commit_evidence.value() == expected_commit_evidence_digest);
 
     auto tx_target = kv_store_target.create_tx();
     auto handle_priv = tx_target.rw<MapTypes::StringString>(priv_map);

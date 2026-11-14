@@ -1,27 +1,54 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import base64
+import copy
+import hashlib
+import http
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from datetime import UTC, datetime, timedelta
+
+import ccf.ledger
+import ccf.signatures
+import ccf.tx_id
+import infra.checker
+import infra.commit
+import infra.crypto
 import infra.e2e_args
+import infra.health_watcher
+import infra.logging_app as app
+import infra.member
+import infra.net
 import infra.network
 import infra.node
-import infra.logging_app as app
-import infra.checker
-import suite.test_requirements as reqs
-import ccf.ledger
-import os
-import json
-from infra.runner import ConcurrentRunner
-from distutils.dir_util import copy_tree
-from infra.consortium import slurp_file
-import infra.health_watcher
-import time
-from e2e_logging import verify_receipt
+import infra.platform_detection
+import infra.proposal
 import infra.service_load
-import ccf.tx_id
-import tempfile
-import http
-import shutil
-
+import infra.utils
+import suite.test_requirements as reqs
+from ccf.cose import verify_cose_sign1_with_key  # type: ignore
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
+from cryptography.x509 import load_pem_x509_certificate
+from e2e_logging import (
+    fetch_and_verify_cose_receipt,
+    get_service_key,
+    test_cose_receipt_schema,
+    verify_receipt,
+)
+from infra.consortium import slurp_file
+from infra.runner import ConcurrentRunner
 from loguru import logger as LOG
+from reconfiguration import assert_no_ipv4_in_node_configs
+
+
+def shifted_tx(tx, view_diff, seq_dif):
+    return ccf.tx_id.TxID(tx.view + view_diff, tx.seqno + seq_dif)
 
 
 def get_and_verify_historical_receipt(network, ref_msg):
@@ -42,22 +69,700 @@ def get_and_verify_historical_receipt(network, ref_msg):
     return ref_msg
 
 
-@reqs.description("Recover a service")
+def query_endorsements_chain(node, txid):
+    for _ in range(10):
+        with node.client("user0") as cli:
+            response = cli.get(
+                "/log/public/cose_endorsements",
+                headers={infra.clients.CCF_TX_ID_HEADER: str(txid)},
+            )
+            if response.status_code != http.HTTPStatus.ACCEPTED:
+                return response
+        time.sleep(0.1)
+    return response
+
+
+def verify_endorsements_chain(primary, endorsements, pubkey, *, temp_dir):
+    for endorsement in endorsements:
+        phdr, _, payload = verify_cose_sign1_with_key(pubkey, endorsement)
+
+        last_tx = ccf.tx_id.TxID.from_str(phdr["ccf.v1"]["epoch.end.txid"])
+        receipt = primary.get_receipt(last_tx.view, last_tx.seqno)
+        root_from_receipt = bytes.fromhex(receipt.json()["leaf"])
+        root_from_headers = phdr["ccf.v1"]["epoch.end.merkle.root"]
+        assert root_from_receipt == root_from_headers
+
+        CWT_KEY = 15
+        IAT_CWT_LABEL = 6
+        assert CWT_KEY in phdr and IAT_CWT_LABEL in phdr[CWT_KEY], phdr
+
+        last_five_minutes = 5 * 60
+        assert time.time() - phdr[CWT_KEY][IAT_CWT_LABEL] < last_five_minutes, phdr
+
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=temp_dir,
+            prefix="prev_service_identity_endorsement_",
+            suffix=".cose",
+        ) as endorsement_file:
+            endorsement_file.write(endorsement)
+            endorsement_file.flush()
+            subprocess.run(
+                [
+                    "cddl",
+                    "../cddl/ccf-cose-endorsement-service-identity.cddl",
+                    "v",
+                    endorsement_file.name,
+                ],
+                check=True,
+            )
+
+        next_key_bytes = payload
+        pubkey = infra.crypto.pub_key_der_to_pem(next_key_bytes).encode("ascii")
+
+
+def restart_network(old_network, args, current_ledger_dir, committed_ledger_dirs):
+    network = infra.network.Network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        existing_network=old_network,
+    )
+    network.start_in_recovery(
+        args,
+        ledger_dir=current_ledger_dir,
+        committed_ledger_dirs=committed_ledger_dirs,
+    )
+    network.recover(args)
+    return network
+
+
+def get_replacement_package(args):
+    return (
+        "samples/apps/logging/logging"
+        if os.path.basename(args.package) == "js_generic"
+        else "js_generic"
+    )
+
+
+def find_service_open_txids(node, from_seqno):
+    """Return the committed txids after from_seqno, in the node's ledger, of the
+    transactions which set the service status to Open."""
+    with node.client() as c:
+        r = c.get("/node/commit")
+        assert r.status_code == http.HTTPStatus.OK, r
+        target_seqno = ccf.tx_id.TxID.from_str(r.body.json()["transaction_id"]).seqno
+
+    open_txids = []
+    with node.download_ledger(
+        target_seqno,
+        local_only=True,
+        include_committed_prefix=True,
+    ) as ledger_paths:
+        for path in ledger_paths:
+            # BEGIN SDK 7.0.18 compatibility (remove for 7.0.19).
+            chunk_path = path.removesuffix(infra.node.COMMITTED_PREFIX_FILE_SUFFIX)
+            if chunk_path != path:
+                os.rename(path, chunk_path)
+            path = chunk_path
+            # END SDK 7.0.18 compatibility.
+            for tx in ccf.ledger.LedgerChunk(path):
+                public_domain = tx.get_public_domain()
+                seqno = public_domain.get_seqno()
+                tables = public_domain.get_tables()
+                if (
+                    not from_seqno < seqno <= target_seqno
+                    or ccf.ledger.SERVICE_INFO_TABLE_NAME not in tables
+                ):
+                    continue
+                service_info = tables[ccf.ledger.SERVICE_INFO_TABLE_NAME][
+                    ccf.signatures.WELL_KNOWN_SINGLETON_TABLE_KEY
+                ]
+                if (
+                    service_info is not None
+                    and json.loads(service_info)["status"] == "Open"
+                ):
+                    open_txids.append(tx.get_txid())
+    return open_txids
+
+
+def recover_with_primary_dying(args, recovered_network, after_backups_recovered=False):
+    # Suspend the primary after the final recovery share commits, so a different
+    # node must be elected. A SIGTERM stop notice only nominates a successor:
+    # if that successor is behind, it can lose and the old primary can win again.
+    #
+    # Private recovery and the service opening may finish before suspension.
+    # If the opening survives the election, the new primary must not open again;
+    # otherwise it must open the service itself, even if it completed private
+    # recovery as a backup. Recovery must complete, every survivor must stay
+    # healthy, and each survivor's ledger must open the service exactly once.
+    #
+    # With after_backups_recovered, the old primary is instead suspended as
+    # soon as every backup has begun private recovery, and a backup is elected
+    # after the election timeout, by which time every backup has completed
+    # private recovery as a backup. So the new primary must open the service,
+    # and any opening by the old primary must be rolled back: backups begin
+    # private recovery once they learn, one AE after the primary, that the
+    # final share committed, and the primary cannot sign again, so cannot sign
+    # an opening, until sig_ms_interval after the signature which committed it.
+    recovered_network.consortium.activate(recovered_network.find_random_node())
+    recovered_network.consortium.check_for_service(
+        recovered_network.find_random_node(),
+        status=infra.network.ServiceStatus.RECOVERING,
+    )
+    recovered_network.wait_for_all_nodes_to_be_trusted(
+        recovered_network.find_random_node()
+    )
+
+    prev_service_identity = None
+    if args.previous_service_identity_file:
+        prev_service_identity = slurp_file(args.previous_service_identity_file)
+    LOG.info(f"Prev identity: {prev_service_identity}")
+
+    recovered_network.consortium.transition_service_to_open(
+        recovered_network.find_random_node(),
+        previous_service_identity=prev_service_identity,
+    )
+
+    retired_primary, initial_view = recovered_network.find_primary()
+    retired_id = retired_primary.node_id
+    backups = [
+        node
+        for node in recovered_network.get_joined_nodes()
+        if node is not retired_primary
+    ]
+
+    # Submit the shares to the primary, so its response to the final share is
+    # authoritative: once it says the end of recovery is initiated, the private
+    # ledger read has been triggered on it.
+    recovered_network.consortium.recover_with_shares(retired_primary)
+
+    if after_backups_recovered:
+        for node in backups:
+            recovered_network.wait_for_states(
+                node,
+                [
+                    infra.node.State.READING_PRIVATE_LEDGER.value,
+                    infra.node.State.PART_OF_NETWORK.value,
+                ],
+                timeout=args.ledger_recovery_timeout,
+            )
+        LOG.info(f"Suspend primary {retired_id} before it can sign an opening")
+        retired_primary.suspend()
+
+        for node in backups:
+            recovered_network.wait_for_state(
+                node,
+                infra.node.State.PART_OF_NETWORK.value,
+                timeout=args.ledger_recovery_timeout,
+            )
+        # Views only increase, so no backup was primary when it completed
+        # private recovery
+        for node in backups:
+            with node.client() as c:
+                view = c.get("/node/network").body.json()["current_view"]
+            assert view == initial_view, (
+                f"Backup {node.node_id} reached view {view} before it was seen "
+                f"to complete private recovery in view {initial_view}"
+            )
+    else:
+        LOG.info(f"Suspend primary {retired_id} to force failover")
+        retired_primary.suspend()
+
+    primary, new_view = recovered_network.wait_for_new_primary(retired_primary)
+    assert new_view > initial_view, (new_view, initial_view)
+    LOG.info(f"New primary {primary.node_id} elected in view {new_view}")
+
+    # SIGKILL the suspended primary and confirm it is gone before dropping it:
+    # SIGKILL is asynchronous, and once removed nothing else will reap it.
+    retired_primary.sigkill()
+    assert (
+        retired_primary.remote.check_done()
+    ), f"Old primary {retired_id} did not terminate after SIGKILL"
+    recovered_network.nodes.remove(retired_primary)
+
+    # Recovery must still complete: the new primary finishes reading the private
+    # ledger and opens the service.
+    for node in recovered_network.get_joined_nodes():
+        recovered_network.wait_for_state(
+            node,
+            infra.node.State.PART_OF_NETWORK.value,
+            timeout=args.ledger_recovery_timeout,
+        )
+
+    # The service is open, and no survivor died attempting a second opening. A
+    # new primary which completed private recovery as a backup opens the service
+    # asynchronously after its election, so wait for that.
+    recovered_network.wait_for_status(
+        primary, infra.network.ServiceStatus.OPEN.value, timeout=10
+    )
+    recovered_network.consortium.check_for_service(
+        primary, status=infra.network.ServiceStatus.OPEN
+    )
+    for node in recovered_network.get_joined_nodes():
+        assert not node.check_log_for_error_message(
+            "current service status is"
+        ), f"Node {node.node_id} attempted to open an already-open service"
+
+    # Each survivor's ledger, once it has everything the new primary committed,
+    # opens the recovered service exactly once. An opening the old primary
+    # wrote but did not commit has been rolled back out of it.
+    with primary.client() as c:
+        create_seqno = ccf.tx_id.TxID.from_str(
+            c.get("/node/network").body.json()["current_service_create_txid"]
+        ).seqno
+    recovered_network.wait_for_all_nodes_to_commit(primary=primary)
+    open_seqno = None
+    for node in recovered_network.get_joined_nodes():
+        open_seqnos = [
+            txid.seqno for txid in find_service_open_txids(node, create_seqno)
+        ]
+        assert (
+            len(open_seqnos) == 1
+        ), f"Node {node.node_id} ledger opens the service at {open_seqnos}"
+        assert open_seqno in (None, open_seqnos[0]), (open_seqno, open_seqnos)
+        open_seqno = open_seqnos[0]
+
+    if after_backups_recovered:
+        # The service was opened in the new primary's view, so any opening by
+        # the old primary was rolled back.
+        with primary.client() as c:
+            r = c.get(f"/node/tx?transaction_id={new_view}.{open_seqno}")
+            assert r.status_code == http.HTTPStatus.OK, r
+            assert r.body.json()["status"] == "Committed", (
+                f"Service not opened at {new_view}.{open_seqno} by the new "
+                f"primary, so the old primary's opening was kept: {r.body.json()}"
+            )
+
+    LOG.info(
+        f"Recovered service has exactly one opening at seqno {open_seqno}; "
+        f"new primary {primary.node_id} was elected in view {new_view}"
+    )
+
+
+@reqs.description("Recovery members cannot be changed during recovery")
 @reqs.recover(number_txs=2)
-def test_recover_service(network, args, from_snapshot=True):
+def test_recovery_member_changes_rejected_during_recovery(network, args):
     network.save_service_identity(args)
     old_primary, _ = network.find_primary()
 
-    prev_ident = open(args.previous_service_identity_file, "r", encoding="utf-8").read()
+    pending_recovery_member = network.consortium.generate_and_add_new_member(
+        old_primary, args.participants_curve
+    )
+
+    set_member_proposal, _, set_member_vote = (
+        network.consortium.generate_and_propose_new_member(
+            old_primary, args.participants_curve
+        )
+    )
+
+    member_to_remove = network.consortium.get_any_active_member(
+        infra.member.RecoveryRole.Participant
+    )
+    remove_member_body, remove_member_vote = network.consortium.make_proposal(
+        "remove_member", member_id=member_to_remove.service_id
+    )
+    remove_member_proposal = network.consortium.get_any_active_member().propose(
+        old_primary, remove_member_body
+    )
+    recovery_threshold = 1
+    if recovery_threshold == network.consortium.recovery_threshold:
+        recovery_threshold = 2
+    set_threshold_body, set_threshold_vote = network.consortium.make_proposal(
+        "set_recovery_threshold", recovery_threshold=recovery_threshold
+    )
+    set_threshold_proposal = network.consortium.get_any_active_member().propose(
+        old_primary, set_threshold_body
+    )
+
+    network.stop_all_nodes()
+    current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+
+    recovered_network = infra.network.Network(
+        args.nodes, args.binary_dir, args.debug_nodes, existing_network=network
+    )
+    recovered_network.start_in_recovery(
+        args,
+        ledger_dir=current_ledger_dir,
+        committed_ledger_dirs=committed_ledger_dirs,
+    )
+
+    primary, _ = recovered_network.find_primary()
+    recovered_network.consortium.transition_service_to_open(
+        primary,
+        previous_service_identity=slurp_file(args.previous_service_identity_file),
+    )
+    recovered_network.consortium.check_for_service(
+        primary,
+        [
+            infra.network.ServiceStatus.RECOVERING,
+            infra.network.ServiceStatus.WAITING_FOR_RECOVERY_SHARES,
+        ],
+    )
+
+    def assert_proposal_not_created(fn):
+        try:
+            fn()
+            assert False, "Proposal should not be created during recovery"
+        except infra.proposal.ProposalNotCreated as e:
+            assert e.response.status_code == http.HTTPStatus.BAD_REQUEST, e.response
+
+    assert_proposal_not_created(
+        lambda: recovered_network.consortium.generate_and_propose_new_member(
+            primary, args.participants_curve
+        )
+    )
+    assert_proposal_not_created(
+        lambda: recovered_network.consortium.get_any_active_member().propose(
+            primary, remove_member_body
+        )
+    )
+    assert_proposal_not_created(
+        lambda: recovered_network.consortium.set_recovery_threshold(
+            primary, recovered_network.consortium.recovery_threshold
+        )
+    )
+    assert_proposal_not_created(
+        lambda: recovered_network.consortium.trigger_recovery_shares_refresh(primary)
+    )
+    assert_proposal_not_created(
+        lambda: recovered_network.consortium.trigger_ledger_rekey(primary)
+    )
+
+    for proposal, ballot in (
+        (set_member_proposal, set_member_vote),
+        (remove_member_proposal, remove_member_vote),
+        (set_threshold_proposal, set_threshold_vote),
+    ):
+        try:
+            recovered_network.consortium.vote_using_majority(primary, proposal, ballot)
+            assert False, "Proposal should not be accepted during recovery"
+        except infra.proposal.ProposalNotAccepted:
+            pass
+
+    state_digest = pending_recovery_member.update_ack_state_digest(primary).body.json()
+    with primary.api_versioned_client(
+        *pending_recovery_member.auth(write=True),
+        api_version=pending_recovery_member.gov_api_impl_inst.API_VERSION,
+    ) as mc:
+        r = mc.post(
+            f"/gov/members/state-digests/{pending_recovery_member.service_id}:ack",
+            body=state_digest,
+        )
+        assert r.status_code == http.HTTPStatus.BAD_REQUEST, r
+
+    recovered_network.consortium.recover_with_shares(primary)
+    for node in recovered_network.get_joined_nodes():
+        recovered_network.wait_for_state(
+            node,
+            infra.node.State.PART_OF_NETWORK.value,
+            timeout=args.ledger_recovery_timeout,
+        )
+    recovered_network.recovery_count += 1
+    recovered_network.consortium.check_for_service(
+        primary, infra.network.ServiceStatus.OPEN
+    )
+    r = pending_recovery_member.ack(primary)
+    with primary.client() as nc:
+        nc.wait_for_commit(r)
+
+    return recovered_network
+
+
+@reqs.description("Reconfigure a recovered service before submitting recovery shares")
+def run_reconfiguration_before_recovery_shares(args):
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        txs.issue(network, number_txs=2)
+        network.save_service_identity(args)
+        old_primary, _ = network.find_primary()
+        network.stop_all_nodes()
+        current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+
+        recovered_network = infra.network.Network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            existing_network=network,
+            txs=txs,
+        )
+        with infra.network.close_on_error(recovered_network):
+            recovered_network.start_in_recovery(
+                args,
+                ledger_dir=current_ledger_dir,
+                committed_ledger_dirs=committed_ledger_dirs,
+            )
+
+            primary, _ = recovered_network.find_primary()
+            recovered_network.consortium.transition_service_to_open(
+                primary,
+                previous_service_identity=slurp_file(
+                    args.previous_service_identity_file
+                ),
+            )
+            recovered_network.consortium.check_for_service(
+                primary, infra.network.ServiceStatus.WAITING_FOR_RECOVERY_SHARES
+            )
+
+            new_node = recovered_network.create_node()
+            recovered_network.join_node(
+                new_node,
+                args.package,
+                args,
+                wait_for_node_in_store=False,
+            )
+            recovered_network.wait_for_node_in_store(
+                primary,
+                new_node.node_id,
+                node_status=ccf.ledger.NodeStatus.PENDING,
+                timeout=args.ledger_recovery_timeout,
+            )
+
+            valid_from = datetime.now(UTC)
+            recovered_network.consortium.trust_node(
+                primary,
+                new_node.node_id,
+                valid_from=valid_from,
+                timeout=args.ledger_recovery_timeout,
+            )
+            new_node.wait_for_node_to_join(timeout=args.ledger_recovery_timeout)
+            new_node.set_certificate_validity_period(
+                valid_from, args.maximum_node_certificate_validity_days
+            )
+            recovered_network.wait_for_all_nodes_to_commit(primary=primary)
+            recovered_network.wait_for_node_in_store(
+                primary,
+                new_node.node_id,
+                node_status=ccf.ledger.NodeStatus.TRUSTED,
+                timeout=args.ledger_recovery_timeout,
+            )
+            recovered_network.consortium.check_for_service(
+                primary, infra.network.ServiceStatus.WAITING_FOR_RECOVERY_SHARES
+            )
+
+            recovered_network.consortium.recover_with_shares(primary)
+            for node in recovered_network.get_joined_nodes():
+                recovered_network.wait_for_state(
+                    node,
+                    infra.node.State.PART_OF_NETWORK.value,
+                    timeout=args.ledger_recovery_timeout,
+                )
+                recovered_network._wait_for_app_open(
+                    node, timeout=args.ledger_recovery_timeout
+                )
+
+            recovered_network.recovery_count += 1
+            recovered_network.consortium.check_for_service(
+                primary, infra.network.ServiceStatus.OPEN
+            )
+
+            txs.issue(recovered_network, number_txs=1)
+            txs.verify(
+                network=recovered_network,
+                timeout=args.ledger_recovery_timeout,
+            )
+
+            recovered_network.stop_all_nodes()
+
+
+@reqs.description("Recover a service")
+@reqs.recover(number_txs=2)
+def test_recover_service(
+    network,
+    args,
+    from_snapshot=True,
+    no_ledger=False,
+    via_recovery_owner=False,
+    force_election=False,
+    snapshots_dir=None,
+    isolate_latest_snapshot=False,
+    election_after_backups_recovered=False,
+    recovered_networks=None,
+):
+    if not from_snapshot and snapshots_dir is not None:
+        raise ValueError("snapshots_dir requires from_snapshot=True")
+    if isolate_latest_snapshot and not from_snapshot:
+        raise ValueError("isolate_latest_snapshot requires from_snapshot=True")
+    if isolate_latest_snapshot and snapshots_dir is not None:
+        raise ValueError(
+            "isolate_latest_snapshot cannot be combined with snapshots_dir"
+        )
+
+    if isolate_latest_snapshot:
+        # The recovery requirement has already issued its tracked transactions, so
+        # this snapshot contains everything that the recovered network must verify.
+        primary, _ = network.find_primary()
+        snapshot_trigger = primary.trigger_snapshot()
+        committed_snapshots_dir = network.get_committed_snapshots(
+            primary,
+            target_seqno=snapshot_trigger.seqno,
+            wait_for_target_seqno=True,
+        )
+        snapshot_name = ccf.ledger.latest_snapshot(committed_snapshots_dir)
+        assert snapshot_name is not None
+        snapshot_seqno, _ = ccf.ledger.snapshot_index_from_filename(snapshot_name)
+        assert snapshot_seqno >= snapshot_trigger.seqno
+
+        with tempfile.TemporaryDirectory(
+            prefix="ccf_recovery_snapshot_"
+        ) as isolated_snapshots_dir:
+            shutil.copy(
+                os.path.join(committed_snapshots_dir, snapshot_name),
+                isolated_snapshots_dir,
+            )
+            return _recover_service(
+                network,
+                args,
+                from_snapshot=from_snapshot,
+                no_ledger=no_ledger,
+                via_recovery_owner=via_recovery_owner,
+                force_election=force_election,
+                snapshots_dir=isolated_snapshots_dir,
+                election_after_backups_recovered=election_after_backups_recovered,
+                recovered_networks=recovered_networks,
+            )
+
+    return _recover_service(
+        network,
+        args,
+        from_snapshot=from_snapshot,
+        no_ledger=no_ledger,
+        via_recovery_owner=via_recovery_owner,
+        force_election=force_election,
+        snapshots_dir=snapshots_dir,
+        election_after_backups_recovered=election_after_backups_recovered,
+        recovered_networks=recovered_networks,
+    )
+
+
+@reqs.description("Recover with committed ledger entries after the startup snapshot")
+def test_recover_service_with_ledger_after_snapshot(network, args):
+    primary, _ = network.find_primary()
+    snapshots_dir = network.get_committed_snapshots(primary)
+    snapshot_name = ccf.ledger.latest_snapshot(snapshots_dir)
+    assert snapshot_name is not None
+    snapshot_seqno, _ = ccf.ledger.snapshot_index_from_filename(snapshot_name)
+
+    # Keep the copied snapshot, but commit the chunk after it before recovery.
+    # get_ledger() then puts snapshot_seqno + 1 in read-only recovery input,
+    # rather than leaving it in the main directory's current chunk by chance.
+    committed_seqno = network.create_and_wait_for_ledger_chunk(primary)
+    assert committed_seqno > snapshot_seqno, (committed_seqno, snapshot_seqno)
+    return test_recover_service(network, args, snapshots_dir=snapshots_dir)
+
+
+@reqs.description("Recover with a stale incomplete chunk behind committed history")
+@reqs.recover(number_txs=2)
+def test_recover_service_with_stale_incomplete_ledger(
+    network, args, recovered_networks=None
+):
+    primary, _ = network.find_primary()
+    committed_seqno = network.create_and_wait_for_ledger_chunk(primary)
+    snapshot_trigger = primary.trigger_snapshot()
+    snapshots_dir = network.get_committed_snapshots(
+        primary,
+        target_seqno=snapshot_trigger.seqno,
+        wait_for_target_seqno=True,
+    )
+    snapshot_name = ccf.ledger.latest_snapshot(snapshots_dir)
+    assert snapshot_name is not None
+    snapshot_seqno, _ = ccf.ledger.snapshot_index_from_filename(snapshot_name)
+
+    stale_entries = None
+    with primary.get_ledger_from_api(committed_seqno) as ledger:
+        for chunk in ledger:
+            _, end_seqno = chunk.get_seqnos()
+            if end_seqno is None or end_seqno >= snapshot_seqno:
+                continue
+            entries = [
+                (tx.get_public_domain().get_seqno(), tx.get_raw_tx()) for tx in chunk
+            ]
+            if len(entries) > 1:
+                stale_entries = entries[:-1]
+                break
+    assert stale_entries is not None, "No old committed chunk for the stale fixture"
+
+    network.txs.issue(network, number_txs=2)
+    network.create_and_wait_for_ledger_chunk(primary)
+    network = _recover_service(
+        network,
+        args,
+        snapshots_dir=snapshots_dir,
+        recovered_networks=recovered_networks,
+        stale_ledger_entries=stale_entries,
+    )
+
+    primary, _ = network.find_primary()
+    ignored_path = os.path.join(
+        primary.remote.current_ledger_path(),
+        f"ledger_{stale_entries[0][0]}{ccf.ledger.IGNORED_FILE_SUFFIX}",
+    )
+    expected_stale_bytes = b"\0" * ccf.ledger.LEDGER_HEADER_SIZE + b"".join(
+        raw_tx for _, raw_tx in stale_entries
+    )
+    with open(ignored_path, "rb") as ignored_file:
+        assert ignored_file.read() == expected_stale_bytes
+
+    opening_txids = find_service_open_txids(primary, snapshot_seqno)
+    assert len(opening_txids) == 1, opening_txids
+    opening_txid = opening_txids[0]
+    network.wait_for_all_nodes_to_commit(tx_id=opening_txid)
+    for node in network.get_joined_nodes():
+        with node.client() as c:
+            response = c.get("/node/ready/app")
+            assert response.status_code == http.HTTPStatus.NO_CONTENT, response
+    return network
+
+
+def _recover_service(
+    network,
+    args,
+    from_snapshot=True,
+    no_ledger=False,
+    via_recovery_owner=False,
+    force_election=False,
+    snapshots_dir=None,
+    election_after_backups_recovered=False,
+    recovered_networks=None,
+    stale_ledger_entries=None,
+):
+    network.save_service_identity(args)
+    old_node_ids = {node.node_id for node in network.get_joined_nodes()}
+    old_primary, _ = network.find_primary()
+
+    with open(args.previous_service_identity_file, "r", encoding="utf-8") as prev_file:
+        prev_ident = prev_file.read()
     # Strip trailing null byte
     prev_ident = prev_ident.strip("\x00")
     with old_primary.client() as c:
         r = c.get("/node/service/previous_identity")
         assert r.status_code in (200, 404), r.status_code
-        prev_view = c.get("/node/network").body.json()["current_view"]
+        previous_network_info = c.get("/node/network").body.json()
+        previous_service_create_txid = previous_network_info[
+            "current_service_create_txid"
+        ]
+        prev_view = previous_network_info["current_view"]
 
-    snapshots_dir = None
-    if from_snapshot:
+    with old_primary.api_versioned_client(api_version=args.gov_api_version) as c:
+        r = c.get("/gov/service/info")
+        assert r.status_code == http.HTTPStatus.OK, r
+        previous_service_info = r.body.json()
+        assert previous_service_info["status"] == infra.network.ServiceStatus.OPEN.value
+        assert previous_service_info["certificate"] == prev_ident
+        assert previous_service_info["recoveryCount"] == network.recovery_count
+        assert (
+            previous_service_info["creationTransactionId"]
+            == previous_service_create_txid
+        )
+
+    if from_snapshot and snapshots_dir is None:
         snapshots_dir = network.get_committed_snapshots(old_primary)
 
     # Start health watcher and stop nodes one by one until a recovery has to be staged
@@ -70,7 +775,33 @@ def test_recover_service(network, args, from_snapshot=True):
 
     watcher.wait_for_recovery()
 
-    current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+    if no_ledger:
+        current_ledger_dir = None
+        committed_ledger_dirs = None
+    else:
+        current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+
+    if stale_ledger_entries is not None:
+        assert current_ledger_dir is not None
+        committed_chunks = list(ccf.ledger.Ledger(committed_ledger_dirs))
+        assert len(committed_chunks) > 1
+        latest_chunk = committed_chunks[-1]
+        tail_entries = [
+            (tx.get_public_domain().get_seqno(), tx.get_raw_tx()) for tx in latest_chunk
+        ]
+        assert tail_entries[0][0] > stale_ledger_entries[-1][0]
+        # Keep a valid incomplete tail above the committed prefix, so public
+        # recovery completes that tail rather than the stale chunk.
+        infra.utils.write_ledger_chunk(
+            current_ledger_dir, tail_entries, tail_entries[-1][0], complete=False
+        )
+        os.remove(latest_chunk.filename())
+        infra.utils.write_ledger_chunk(
+            current_ledger_dir,
+            stale_ledger_entries,
+            stale_ledger_entries[-1][0],
+            complete=False,
+        )
 
     with tempfile.NamedTemporaryFile(mode="w+") as node_data_tf:
         start_node_data = {"this is a": "recovery node"}
@@ -80,10 +811,12 @@ def test_recover_service(network, args, from_snapshot=True):
             args.nodes,
             args.binary_dir,
             args.debug_nodes,
-            args.perf_nodes,
             existing_network=network,
             node_data_json_file=node_data_tf.name,
         )
+        if recovered_networks is not None:
+            # Lets the caller clean up the recovered nodes, even if this fails
+            recovered_networks.append(recovered_network)
 
         with tempfile.NamedTemporaryFile(mode="w+") as ntf:
             service_data = {"this is a": "recovery service"}
@@ -115,7 +848,7 @@ def test_recover_service(network, args, from_snapshot=True):
         args.initial_service_cert_validity_days
     )
 
-    new_nodes = recovered_network.find_primary_and_any_backup()
+    new_nodes = recovered_network.get_joined_nodes()
     for n in new_nodes:
         with n.client() as c:
             r = c.get("/node/service/previous_identity")
@@ -131,27 +864,175 @@ def test_recover_service(network, args, from_snapshot=True):
             r = c.get("/node/ready/app")
             assert r.status_code == http.HTTPStatus.SERVICE_UNAVAILABLE.value, r
 
-    recovered_network.recover(args)
+    if force_election:
+        recover_with_primary_dying(
+            args,
+            recovered_network,
+            after_backups_recovered=election_after_backups_recovered,
+        )
+    else:
+        recovered_network.recover(args, via_recovery_owner=via_recovery_owner)
 
     LOG.info("Check that new service view is as expected")
     new_primary, _ = recovered_network.find_primary()
     with new_primary.client() as c:
+        current_network_info = c.get("/node/network").body.json()
         assert (
             ccf.tx_id.TxID.from_str(
-                c.get("/node/network").body.json()["current_service_create_txid"]
+                current_network_info["current_service_create_txid"]
             ).view
             == prev_view + 2
         )
         r = c.get("/node/ready/gov")
         assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r
         r = c.get("/node/ready/app")
+
+        # Service opening may be slightly delayed due to forced election (if option enabled).
+        app_ready_attempts = 10 if force_election else 0
+        while (
+            r.status_code != http.HTTPStatus.NO_CONTENT.value and app_ready_attempts > 0
+        ):
+            time.sleep(0.1)
+            app_ready_attempts -= 1
+            r = c.get("/node/ready/app")
+
         assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r
+
+    with new_primary.api_versioned_client(api_version=args.gov_api_version) as c:
+        r = c.get("/gov/service/info")
+        assert r.status_code == http.HTTPStatus.OK, r
+        current_service_info = r.body.json()
+        assert current_service_info["status"] == infra.network.ServiceStatus.OPEN.value
+        assert (
+            current_service_info["certificate"]
+            == current_network_info["service_certificate"]
+        )
+        assert (
+            current_service_info["recoveryCount"]
+            == previous_service_info["recoveryCount"] + 1
+        )
+        assert (
+            current_service_info["creationTransactionId"]
+            == current_network_info["current_service_create_txid"]
+        )
+        assert (
+            current_service_info["previousServiceCreationTransactionId"]
+            == previous_service_info["creationTransactionId"]
+        )
+        assert current_service_info["serviceData"] == service_data
+
+    with new_primary.client() as c:
+        current_node_ids = {
+            node["node_id"]
+            for node in c.get("/node/network/nodes").body.json()["nodes"]
+        }
+        unexpected_node_ids = old_node_ids & current_node_ids
+        assert not unexpected_node_ids, unexpected_node_ids
+        removable_node_ids = {
+            node["node_id"]
+            for node in c.get("/node/network/removable_nodes").body.json()["nodes"]
+        }
+        unexpected_removable_node_ids = old_node_ids & removable_node_ids
+        assert not unexpected_removable_node_ids, unexpected_removable_node_ids
+
+    # Nodes recovered from a snapshot taken before the recovery initially know
+    # the previous service's nodes, and must forget them once their deletion
+    # is committed, or would keep contacting them if later elected primary.
+    recovered_network.wait_for_all_nodes_to_commit(primary=new_primary)
+    for node in recovered_network.get_joined_nodes():
+        with node.client() as c:
+            r = c.get("/node/consensus")
+            assert r.status_code == http.HTTPStatus.OK, r
+            acked_node_ids = set(r.body.json()["details"]["acks"].keys())
+            unexpected_acked_node_ids = old_node_ids & acked_node_ids
+            assert not unexpected_acked_node_ids, (
+                node.node_id,
+                unexpected_acked_node_ids,
+            )
 
     return recovered_network
 
 
+@reqs.description("Recover a service using a different code ID")
+@reqs.not_snp("Cannot produce package-specific code IDs on SNP")
+def test_recover_service_with_different_code_id(network, args):
+    network.txs.issue(
+        network=network,
+        number_txs=vars(args).get("msgs_per_recovery", 2),
+    )
+
+    recovery_package = getattr(args, "recovery_package", get_replacement_package(args))
+    platform = infra.platform_detection.get_platform()
+    initial_host_data, _ = infra.utils.get_host_data_and_security_policy(
+        platform, args.package
+    )
+    recovery_host_data, _ = infra.utils.get_host_data_and_security_policy(
+        platform, recovery_package
+    )
+    assert (
+        initial_host_data != recovery_host_data
+    ), "Initial and recovery packages should produce different code IDs"
+
+    old_primary, _ = network.find_primary()
+    with old_primary.api_versioned_client(api_version=args.gov_api_version) as c:
+        r = c.get("/gov/service/join-policy")
+        assert r.status_code == http.HTTPStatus.OK, r
+        old_host_data = r.body.json()[platform]["hostData"]
+        assert initial_host_data in old_host_data, old_host_data
+        assert recovery_host_data not in old_host_data, old_host_data
+
+    network.save_service_identity(args)
+    network.stop_all_nodes()
+    current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+
+    recovery_args = copy.copy(args)
+    recovery_args.package = recovery_package
+
+    recovered_network = infra.network.Network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        existing_network=network,
+    )
+    with infra.network.close_on_error(recovered_network):
+        recovered_network.start_in_recovery(
+            recovery_args,
+            ledger_dir=current_ledger_dir,
+            committed_ledger_dirs=committed_ledger_dirs,
+        )
+        recovered_network.recover(recovery_args)
+
+        new_primary, _ = recovered_network.find_primary()
+        with new_primary.api_versioned_client(api_version=args.gov_api_version) as c:
+            r = c.get("/gov/service/join-policy")
+            assert r.status_code == http.HTTPStatus.OK, r
+            recovered_host_data = r.body.json()[platform]["hostData"]
+            assert recovery_host_data in recovered_host_data, recovered_host_data
+
+        if os.path.basename(recovery_package) == "js_generic":
+            js_logging_app = getattr(
+                args,
+                "recovery_js_app_bundle",
+                os.path.join(
+                    os.path.dirname(__file__), "..", "samples", "apps", "logging", "js"
+                ),
+            )
+            recovered_network.consortium.set_js_app_from_dir(
+                new_primary, js_logging_app
+            )
+
+        recovered_network.txs = app.LoggingTxs("user0")
+        recovered_network.txs.issue(recovered_network, number_txs=1)
+        recovered_network.txs.verify(
+            network=recovered_network,
+            timeout=vars(args).get("ledger_recovery_timeout"),
+        )
+        return recovered_network
+
+
 @reqs.description("Recover a service with wrong service identity")
 @reqs.recover(number_txs=2)
+@reqs.sufficient_network_recovery_count(required_count=1)
 def test_recover_service_with_wrong_identity(network, args):
     old_primary, _ = network.find_primary()
 
@@ -160,11 +1041,20 @@ def test_recover_service_with_wrong_identity(network, args):
     network.save_service_identity(args)
     first_service_identity_file = args.previous_service_identity_file
 
+    with old_primary.client() as c:
+        before_recovery_tx_id = ccf.tx_id.TxID.from_str(
+            c.get("/node/commit").body.json()["transaction_id"]
+        )
+        previous_service_created_tx_id = ccf.tx_id.TxID.from_str(
+            c.get("/node/network").body.json()["current_service_create_txid"]
+        )
+
     network.stop_all_nodes()
 
     current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
 
     # Attempt a recovery with the wrong previous service certificate
+    # The mismatch results in all snapshots being ignored
 
     args.previous_service_identity_file = network.consortium.user_cert_path("user0")
 
@@ -172,39 +1062,6 @@ def test_recover_service_with_wrong_identity(network, args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
-        existing_network=network,
-    )
-
-    exception = None
-    try:
-        broken_network.start_in_recovery(
-            args,
-            ledger_dir=current_ledger_dir,
-            committed_ledger_dirs=committed_ledger_dirs,
-            snapshots_dir=snapshots_dir,
-        )
-    except Exception as ex:
-        exception = ex
-
-    broken_network.ignoring_shutdown_errors = True
-    broken_network.stop_all_nodes(skip_verification=True)
-
-    if exception is None:
-        raise ValueError("Recovery should have failed")
-    if not broken_network.nodes[0].check_log_for_error_message(
-        "Previous service identity does not endorse the node identity that signed the snapshot"
-    ):
-        raise ValueError("Node log does not contain the expected error message")
-
-    # Attempt a second recovery with the broken cert but no snapshot
-    # Now the mismatch is only noticed when the transition proposal is submitted
-
-    broken_network = infra.network.Network(
-        args.nodes,
-        args.binary_dir,
-        args.debug_nodes,
-        args.perf_nodes,
         existing_network=network,
     )
 
@@ -212,8 +1069,10 @@ def test_recover_service_with_wrong_identity(network, args):
         args,
         ledger_dir=current_ledger_dir,
         committed_ledger_dirs=committed_ledger_dirs,
+        snapshots_dir=snapshots_dir,
     )
 
+    # The mismatch is only fatal when used in a transition proposal
     exception = None
     try:
         broken_network.recover(args)
@@ -225,6 +1084,12 @@ def test_recover_service_with_wrong_identity(network, args):
 
     if exception is None:
         raise ValueError("Recovery should have failed")
+
+    if not broken_network.nodes[0].check_log_for_error_message(
+        "Previous service identity does not match the service identity that signed the snapshot"
+    ):
+        raise ValueError("Node log does not contain the expected error message")
+
     if not broken_network.nodes[0].check_log_for_error_message(
         "Unable to open service: Previous service identity does not match."
     ):
@@ -238,73 +1103,332 @@ def test_recover_service_with_wrong_identity(network, args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         existing_network=network,
     )
 
-    recovered_network.start_in_recovery(
-        args,
-        ledger_dir=current_ledger_dir,
-        committed_ledger_dirs=committed_ledger_dirs,
-        snapshots_dir=snapshots_dir,
+    with infra.network.close_on_error(recovered_network):
+        recovered_network.start_in_recovery(
+            args,
+            ledger_dir=current_ledger_dir,
+            committed_ledger_dirs=committed_ledger_dirs,
+            snapshots_dir=snapshots_dir,
+        )
+
+        # Must fail with a dedicated error message if requesting a receipt for a TX
+        # from past epochs, since ledger secrets are not yet available,
+        # therefore no receipt can be generated.
+        primary, _ = recovered_network.find_primary()
+        with primary.client() as cli:
+            curr_tx_id = ccf.tx_id.TxID.from_str(
+                cli.get("/node/commit").body.json()["transaction_id"]
+            )
+
+            response = cli.get(
+                f"/node/receipt?transaction_id={before_recovery_tx_id!s}"
+            )
+            assert response.status_code == http.HTTPStatus.NOT_FOUND, response
+            assert (
+                "not signed by the current service"
+                in response.body.json()["error"]["message"]
+            ), response
+
+            current_service_created_tx_id = ccf.tx_id.TxID.from_str(
+                cli.get("/node/network").body.json()["current_service_create_txid"]
+            )
+
+        # TX from the current epoch though can be verified, as soon as the caller
+        # trusts the current service identity.
+        receipt = primary.get_receipt(curr_tx_id.view, curr_tx_id.seqno).json()
+        verify_receipt(receipt, recovered_network.cert, is_signature_tx=True)
+
+        recovered_network.recover(args)
+
+        # Needs refreshing, recovery has completed.
+        with primary.client() as cli:
+            curr_tx_id = ccf.tx_id.TxID.from_str(
+                cli.get("/node/commit").body.json()["transaction_id"]
+            )
+
+        # Check receipts for transactions after multiple recoveries. This test
+        # relies on previous recoveries and is therefore prone to failures if
+        # surrounding test calls change.
+        txids = [
+            # Last TX before previous recovery
+            shifted_tx(previous_service_created_tx_id, -2, -1),
+            # First after previous recovery
+            previous_service_created_tx_id,
+            # Random TX before previous and last recovery
+            shifted_tx(current_service_created_tx_id, -2, -5),
+            # Last TX before last recovery
+            shifted_tx(current_service_created_tx_id, -2, -1),
+            # First TX after last recovery
+            current_service_created_tx_id,
+            # Random TX after last recovery
+            shifted_tx(curr_tx_id, 0, -3),
+        ]
+
+        with primary.client("user0") as client:
+
+            def pull_with_handle():
+                # Receipts for previous service instances require back-endorsement.
+                # In this case it should trigger reading pulling up state
+                # for previous_service_created_tx_id, which will have an overlapping
+                # seqno with the target tx, but this has to work just fine due to
+                # App/Sys handle split.
+                return client.get(
+                    f"/log/private/historical/handle?seqno={previous_service_created_tx_id.seqno + 1}&handle={previous_service_created_tx_id.seqno}"
+                ).status_code
+
+            for _ in range(10):
+                if pull_with_handle() == http.HTTPStatus.OK:
+                    break
+                time.sleep(0.5)
+            else:
+                assert False, "Could not get a receipt with a custom handle"
+
+        for tx in txids:
+            receipt = primary.get_receipt(tx.view, tx.seqno).json()
+
+            try:
+                verify_receipt(receipt, recovered_network.cert)
+            except AssertionError:
+                # May fail due to missing leaf components if it's a signature TX,
+                # try again with a flag to force skip leaf components verification.
+                verify_receipt(receipt, recovered_network.cert, is_signature_tx=True)
+
+        with primary.client() as cli:
+            service_cert = cli.get("/node/network").body.json()["service_certificate"]
+            cert = load_pem_x509_certificate(
+                service_cert.encode("ascii"), default_backend()
+            )
+
+        for tx in txids[0:1]:
+            response = query_endorsements_chain(primary, tx)
+            assert response.status_code == http.HTTPStatus.OK, response
+            endorsements = [
+                base64.b64decode(x) for x in response.body.json()["endorsements"]
+            ]
+            assert len(endorsements) == 2  # 2 recoveries behind
+            verify_endorsements_chain(
+                primary,
+                endorsements,
+                cert.public_key().public_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                ),
+                temp_dir=recovered_network.common_dir,
+            )
+
+        for tx in txids[1:4]:
+            response = query_endorsements_chain(primary, tx)
+            assert response.status_code == http.HTTPStatus.OK, response
+            endorsements = [
+                base64.b64decode(x) for x in response.body.json()["endorsements"]
+            ]
+            assert len(endorsements) == 1  # 1 recovery behind
+            verify_endorsements_chain(
+                primary,
+                endorsements,
+                cert.public_key().public_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PublicFormat.SubjectPublicKeyInfo,
+                ),
+                temp_dir=recovered_network.common_dir,
+            )
+
+        for tx in txids[4:]:
+            response = query_endorsements_chain(primary, tx)
+            assert response.status_code == http.HTTPStatus.NOT_FOUND, response
+
+        return recovered_network
+
+
+@reqs.description("Test trusted keys as JWKs via logging app endpoint")
+@reqs.sufficient_network_recovery_count(required_count=2)
+def test_trusted_keys_vs_endorsements(network, args):
+    primary, _ = network.find_primary()
+
+    with primary.client() as cli:
+        service_cert = cli.get("/node/network").body.json()["service_certificate"]
+        cert = load_pem_x509_certificate(
+            service_cert.encode("ascii"), default_backend()
+        )
+
+    expected_keys_der = set()
+    expected_keys_der.add(
+        bytes(
+            cert.public_key().public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+    )
+    chain_pubkey = cert.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
-    recovered_network.recover(args)
+    look_from = ccf.tx_id.TxID(2, 3)
+    response = query_endorsements_chain(primary, look_from)
+    chain_endorsements = [
+        base64.b64decode(x) for x in response.body.json()["endorsements"]
+    ]
+    for endorsement in chain_endorsements:
+        _, _, payload = verify_cose_sign1_with_key(chain_pubkey, endorsement)
+        expected_keys_der.add(bytes(payload))
+        chain_pubkey = infra.crypto.pub_key_der_to_pem(payload).encode("ascii")
 
-    return recovered_network
+    # Verify trusted keys from the endpoint match endorsement keys
+    with primary.client() as cli:
+        r = cli.get("/log/public/trusted_keys")
+        assert r.status_code == http.HTTPStatus.OK, r
+        jwks = r.body.json()
+        assert "keys" in jwks, jwks
+
+        endpoint_keys_der = set()
+        for key in jwks["keys"]:
+            assert "kid" in key, key
+            der = bytes(infra.crypto.pub_key_der_from_jwk(key))
+            expected_kid = infra.crypto.compute_public_key_der_hash_hex(der)
+            assert (
+                key["kid"] == expected_kid
+            ), f"kid mismatch: got {key['kid']}, expected {expected_kid}"
+            endpoint_keys_der.add(der)
+
+        assert endpoint_keys_der == expected_keys_der, (
+            f"Keys from trusted_keys endpoint do not match endorsement keys. "
+            f"Expected {len(expected_keys_der)}, got {len(endpoint_keys_der)}"
+        )
+
+    return network
 
 
 @reqs.description("Recover a service from local files")
-def test_recover_service_from_files(
-    args, directory, expected_recovery_count, test_receipt=True
+def run_recover_service_from_files(
+    args,
+    directory,
+    expected_recovery_count,
+    test_receipts_at=None,
+    test_cose_receipts_at=None,
+    snapshots_with_json_receipts=False,
 ):
     service_dir = os.path.join(
         os.path.dirname(os.path.realpath(__file__)), "testdata", directory
     )
 
+    old_common = os.path.join(service_dir, "common")
+    LOG.info(f"Copying common folder: {old_common}")
     new_common = infra.network.get_common_folder_name(args.workspace, args.label)
-    copy_tree(os.path.join(service_dir, "common"), new_common)
 
-    network = infra.network.Network(args.nodes, args.binary_dir)
+    cmd = ["rm", "-rf", new_common]
+    assert (
+        infra.proc.ccall(*cmd).returncode == 0
+    ), f"Could not remove existing {new_common} directory"
+    cmd = ["mkdir", "-p", new_common]
+    assert (
+        infra.proc.ccall(*cmd).returncode == 0
+    ), f"Could not create fresh {new_common} directory"
+    for file in os.listdir(old_common):
+        cmd = ["cp", os.path.join(old_common, file), new_common]
+        assert (
+            infra.proc.ccall(*cmd).returncode == 0
+        ), f"Could not copy {file} to {new_common}"
 
-    args.previous_service_identity_file = os.path.join(
-        service_dir, "common", "service_cert.pem"
-    )
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        skip_verify_chunking=True,
+        check_file_invariants=False,
+    ) as network:
 
-    network.start_in_recovery(
-        args,
-        ledger_dir=os.path.join(service_dir, "ledger"),
-        committed_ledger_dirs=[os.path.join(service_dir, "ledger")],
-        snapshots_dir=os.path.join(service_dir, "snapshots"),
-        common_dir=new_common,
-    )
+        args.previous_service_identity_file = os.path.join(
+            old_common, "service_cert.pem"
+        )
 
-    network.recover(args, expected_recovery_count=expected_recovery_count)
+        # Snapshots written by releases before 7.0 carry JSON receipts, which
+        # nodes reject. Operators remove them before recovering, so such a
+        # service is recovered from its ledger alone.
+        network.start_in_recovery(
+            args,
+            committed_ledger_dirs=[os.path.join(service_dir, "ledger")],
+            snapshots_dir=(
+                None
+                if snapshots_with_json_receipts
+                else os.path.join(service_dir, "snapshots")
+            ),
+            common_dir=new_common,
+        )
 
-    primary, _ = network.find_primary()
+        network.recover(args, expected_recovery_count=expected_recovery_count)
 
-    # The member and user certs stored on this service are all currently expired.
-    # Remove user certs and add new users before attempting any user requests
-    primary, _ = network.find_primary()
-    with primary.client() as c:
-        r = c.get("/gov/kv/users/certs")
-        assert r.status_code == http.HTTPStatus.OK
+        primary, _ = network.find_primary()
 
-        user_ids = r.body.json().keys()
+        # The member and user certs stored on this service are all currently expired.
+        # Remove user certs and add new users before attempting any user requests
+        primary, _ = network.find_primary()
+
+        user_certs = [
+            os.path.join(old_common, file)
+            for file in os.listdir(old_common)
+            if file.startswith("user") and file.endswith("_cert.pem")
+        ]
+        user_ids = []
+        for cert in user_certs:
+            with open(cert) as cert_file:
+                user_ids.append(
+                    infra.crypto.compute_cert_der_hash_hex_from_pem(cert_file.read())
+                )
         for user_id in user_ids:
             LOG.info(f"Removing expired user {user_id}")
             network.consortium.remove_user(primary, user_id)
 
-    new_user_local_id = "recovery_user"
-    new_user = network.create_user(new_user_local_id, args.participants_curve)
-    LOG.info(f"Adding new user {new_user.service_id}")
-    network.consortium.add_user(primary, new_user.local_id)
+        new_user_local_id = "recovery_user"
+        new_user = network.create_user(new_user_local_id, args.participants_curve)
+        LOG.info(f"Adding new user {new_user.service_id}")
+        network.consortium.add_user(primary, new_user.local_id)
 
-    infra.checker.check_can_progress(primary, local_user_id=new_user_local_id)
+        infra.checker.check_can_progress(primary, local_user_id=new_user_local_id)
 
-    if test_receipt:
-        r = primary.get_receipt(2, 3)
-        verify_receipt(r.json(), network.cert)
+        for view, seqno in test_receipts_at or []:
+            r = primary.get_receipt(view, seqno)
+
+            verify_receipt(
+                r.json(),
+                network.cert,
+                # Even when we want to check that receipts are valid,
+                # these old services are likely to use expired certs
+                skip_cert_chain_checks=True,
+            )
+
+        for view, seqno in test_cose_receipts_at or []:
+            with primary.client() as client:
+                for _ in range(10):
+                    r = client.get(
+                        "/log/public/cose_receipt",
+                        headers={infra.clients.CCF_TX_ID_HEADER: f"{view}.{seqno}"},
+                        log_capture=[],  # Do not emit raw binary to stdout
+                    )
+                    if r.status_code == http.HTTPStatus.ACCEPTED:
+                        LOG.debug(f"Receipt for {view}.{seqno} not ready, retrying")
+                        time.sleep(0.1)
+                    elif r.status_code == http.HTTPStatus.OK:
+                        cose_receipt = r.body.data()
+                        r = client.get(
+                            "/log/public/verify_cose_receipt",
+                            cose_receipt,
+                            headers={"Content-Type": "application/cose"},
+                        )
+                        assert (
+                            r.status_code == http.HTTPStatus.NO_CONTENT
+                        ), f"Failed to verify COSE receipt for txid {view}.{seqno}: {r.status_code} {r.body.text()}"
+                        break
+
+                    else:
+                        assert (
+                            False
+                        ), f"Failed to get COSE receipt for tx {view}.{seqno} with response {r.status_code} {r.body.text()}"
+                else:
+                    assert False, f"Failed to get a receipt for tx {view}.{seqno}"
 
 
 @reqs.description("Attempt to recover a service but abort before recovery is complete")
@@ -320,7 +1444,10 @@ def test_recover_service_aborted(network, args, from_snapshot=False):
     current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
 
     aborted_network = infra.network.Network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, network
+        args.nodes,
+        binary_dir=args.binary_dir,
+        dbg_nodes=args.debug_nodes,
+        existing_network=network,
     )
     aborted_network.start_in_recovery(
         args,
@@ -354,9 +1481,10 @@ def test_recover_service_aborted(network, args, from_snapshot=False):
     if from_snapshot:
         snapshots_dir = network.get_committed_snapshots(primary)
 
-    # Check that all nodes have the same (recovery) ledger files
+    # We've deliberately terminated mid-recovery, when it is likely that some nodes still have local-only .recovery files.
     aborted_network.stop_all_nodes(
-        skip_verification=True, read_recovery_ledger_files=True
+        skip_verification=True,
+        check_file_invariants=False,
     )
 
     current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
@@ -364,7 +1492,6 @@ def test_recover_service_aborted(network, args, from_snapshot=False):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         existing_network=aborted_network,
     )
     recovered_network.start_in_recovery(
@@ -408,7 +1535,7 @@ def test_persistence_old_snapshot(network, args):
     with old_primary.client() as c:
         latest_txid = c.get("/node/commit").body.json()["transaction_id"]
 
-    new_node = network.create_node("local://localhost")
+    new_node = network.create_node()
     # Use invalid node-to-node interface so that the new node is isolated and does
     # not receive any consensus updates.
     new_node.n2n_interface = infra.interfaces.Interface(host="invalid", port=8000)
@@ -417,6 +1544,7 @@ def test_persistence_old_snapshot(network, args):
         args.package,
         args,
         copy_ledger=False,
+        from_snapshot=True,
         snapshots_dir=snapshots_dir,
         ledger_dir=current_ledger_dir,
     )
@@ -432,13 +1560,18 @@ def test_persistence_old_snapshot(network, args):
 
     new_node_ledger_path = new_node.remote.ledger_paths()[0]
 
+    primary, _ = network.find_primary()
+    try:
+        network.retire_node(primary, new_node)
+    finally:
+        new_node.stop()
+
     network.stop_all_nodes()
 
     recovered_network = infra.network.Network(
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         existing_network=network,
     )
     recovered_network.start_in_recovery(args, ledger_dir=new_node_ledger_path)
@@ -467,7 +1600,7 @@ def test_share_resilience(network, args, from_snapshot=False):
     current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
 
     recovered_network = infra.network.Network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, network
+        args.nodes, args.binary_dir, args.debug_nodes, network
     )
     recovered_network.start_in_recovery(
         args,
@@ -565,7 +1698,9 @@ def test_recover_service_truncated_ledger(network, args, get_truncation_point):
     )
 
     # Corrupt _uncommitted_ ledger before starting new service
-    ledger = ccf.ledger.Ledger([current_ledger_dir], committed_only=False)
+    ledger = ccf.ledger.Ledger(
+        [current_ledger_dir], committed_only=False, contiguous_suffix=True
+    )
 
     chunk_filename, truncate_offset = get_truncation_point(ledger)
 
@@ -580,7 +1715,7 @@ def test_recover_service_truncated_ledger(network, args, get_truncation_point):
     )
 
     recovered_network = infra.network.Network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, network
+        args.nodes, args.binary_dir, args.debug_nodes, network
     )
     recovered_network.start_in_recovery(
         args,
@@ -598,7 +1733,6 @@ def run_corrupted_ledger(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
         txs=txs,
     ) as network:
@@ -635,7 +1769,7 @@ def run_corrupted_ledger(args):
             LOG.info("Finding first sig to corrupt")
             for chunk, tx in all_txs(ledger, verbose):
                 tables = tx.get_public_domain().get_tables()
-                if ccf.ledger.SIGNATURE_TX_TABLE_NAME in tables:
+                if ccf.signatures.is_signature_transaction(tables):
                     return chunk.filename(), get_middle_tx_offset(tx)
             return None, None
 
@@ -649,7 +1783,9 @@ def run_corrupted_ledger(args):
 
     # Make sure ledger can be read once recovered (i.e. ledger corruption does not affect recovered ledger)
     for node in network.nodes:
-        ledger = ccf.ledger.Ledger(node.remote.ledger_paths(), committed_only=False)
+        ledger = ccf.ledger.Ledger(
+            node.remote.ledger_paths(), committed_only=False, contiguous_suffix=True
+        )
         _, last_seqno = ledger.get_latest_public_state()
         LOG.info(
             f"Successfully read ledger for node {node.local_node_id} up to seqno {last_seqno}"
@@ -657,29 +1793,14 @@ def run_corrupted_ledger(args):
 
 
 def find_recovery_tx_seqno(node):
-    min_recovery_seqno = 0
     with node.client() as c:
         r = c.get("/node/state").body.json()
         if "last_recovered_seqno" not in r:
             return None
         min_recovery_seqno = r["last_recovered_seqno"]
 
-    ledger = ccf.ledger.Ledger(node.remote.ledger_paths(), committed_only=False)
-    for chunk in ledger:
-        _, chunk_end_seqno = chunk.get_seqnos()
-        if chunk_end_seqno < min_recovery_seqno:
-            continue
-        for tx in chunk:
-            tables = tx.get_public_domain().get_tables()
-            seqno = tx.get_public_domain().get_seqno()
-            if ccf.ledger.SERVICE_INFO_TABLE_NAME in tables:
-                service_status = json.loads(
-                    tables[ccf.ledger.SERVICE_INFO_TABLE_NAME][
-                        ccf.ledger.WELL_KNOWN_SINGLETON_TABLE_KEY
-                    ]
-                )["status"]
-                if service_status == "Open":
-                    return seqno
+    for txid in find_service_open_txids(node, min_recovery_seqno):
+        return txid.seqno
     return None
 
 
@@ -699,7 +1820,7 @@ def check_snapshots(args, network):
             )
 
 
-def run(args):
+def run(args, ipv6=False):
     recoveries_count = 3
 
     txs = app.LoggingTxs("user0")
@@ -707,12 +1828,23 @@ def run(args):
         args.nodes,
         args.binary_dir,
         args.debug_nodes,
-        args.perf_nodes,
         pdb=args.pdb,
         txs=txs,
+        ipv6=ipv6,
     ) as network:
-        network.start_and_open(args)
+        # Multi-RDN subject, which each recovery must copy from the previous identity
+        network.start_and_open(
+            args, service_subject_name="CN=https://this.test.service,O=CCF User"
+        )
+        service_subject = network.cert.subject.public_bytes()
         primary, _ = network.find_primary()
+
+        if ipv6:
+            primary_host = primary.get_public_rpc_host()
+            assert (
+                ":" in primary_host
+            ), f"Expected IPv6 primary host, got {primary_host}"
+            LOG.info(f"Confirmed recovery network is using IPv6: {primary_host}")
 
         LOG.info("Check for well-known genesis service TxID")
         with primary.client() as c:
@@ -740,6 +1872,7 @@ def run(args):
 
         network = test_persistence_old_snapshot(network, args)
         network = test_recover_service_with_wrong_identity(network, args)
+        network = test_trusted_keys_vs_endorsements(network, args)
 
         for i in range(recoveries_count):
             # Issue transactions which will required historical ledger queries recovery
@@ -763,29 +1896,37 @@ def run(args):
             for node in network.get_joined_nodes():
                 node.verify_certificate_validity_period()
 
+            assert (
+                network.cert.subject.public_bytes() == service_subject
+            ), network.cert.subject
+
             check_snapshots(args, network)
             ref_msg = get_and_verify_historical_receipt(network, ref_msg)
 
             LOG.success("Recovery complete on all nodes")
+            # Verify COSE receipt schema and issuer/subject have remained the same
+            test_cose_receipt_schema(network, args)
 
         primary, _ = network.find_primary()
         network.stop_all_nodes()
 
     # Verify that a new ledger chunk was created at the start of each recovery
+    validator = ccf.ledger.LedgerValidator(accept_deprecated_entry_types=False)
     ledger = ccf.ledger.Ledger(
         primary.remote.ledger_paths(),
         committed_only=False,
-        validator=ccf.ledger.LedgerValidator(accept_deprecated_entry_types=False),
+        contiguous_suffix=True,
     )
     for chunk in ledger:
         chunk_start_seqno, _ = chunk.get_seqnos()
         for tx in chunk:
+            validator.add_transaction(tx)
             tables = tx.get_public_domain().get_tables()
             seqno = tx.get_public_domain().get_seqno()
             if ccf.ledger.SERVICE_INFO_TABLE_NAME in tables:
                 service_status = json.loads(
                     tables[ccf.ledger.SERVICE_INFO_TABLE_NAME][
-                        ccf.ledger.WELL_KNOWN_SINGLETON_TABLE_KEY
+                        ccf.signatures.WELL_KNOWN_SINGLETON_TABLE_KEY
                     ]
                 )["status"]
                 if service_status == "Opening" or service_status == "Recovering":
@@ -796,14 +1937,1380 @@ def run(args):
                         chunk_start_seqno == seqno
                     ), f"{service_status} service at seqno {seqno} did not start a new ledger chunk (started at {chunk_start_seqno})"
 
-    test_recover_service_from_files(
-        args, "expired_service", expected_recovery_count=1, test_receipt=True
+    if ipv6:
+        assert_no_ipv4_in_node_configs(network)
+
+
+def run_recover_service_with_different_code_id(args):
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=app.LoggingTxs("user0"),
+    ) as network:
+        network.start_and_open(args)
+        network = test_recover_service_with_different_code_id(network, args)
+        network.stop_all_nodes()
+
+
+def run_ipv6(args):
+    assert infra.net.ipv6_loopback_available(), (
+        "IPv6 loopback (::1) is not available; CI enables IPv6 via the "
+        "container --sysctl net.ipv6.conf.*.disable_ipv6=0 (see .github/workflows)"
     )
-    # sgx_service is historical ledger, from 1.x -> 2.x -> 3.x -> main.
-    # This is used to test recovery from SGX to SNP.
-    test_recover_service_from_files(
-        args, "sgx_service", expected_recovery_count=3, test_receipt=False
+
+    run(args, ipv6=True)
+
+
+def run_recovery_from_files(args):
+    run_recover_service_from_files(
+        args,
+        directory=args.directory,
+        expected_recovery_count=args.expected_recovery_count,
+        test_receipts_at=args.test_receipts_at,
+        test_cose_receipts_at=args.test_cose_receipts_at,
+        snapshots_with_json_receipts=args.snapshots_with_json_receipts,
     )
+
+
+def test_incomplete_ledger_recovery(network, args):
+    # Try to get incomplete pre-recovery ledger files with at least one
+    # signature and some unsigned payload following.
+    ATTEMPTS = 5
+
+    network.save_service_identity(args)
+    primary, _ = network.find_primary()
+    current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+    network.stop_all_nodes(skip_verification=True)
+
+    for attempt in range(ATTEMPTS):
+        LOG.info(
+            f"Try get incomplete pre-recovery ledger files on primary, attempt=#{attempt}/{ATTEMPTS}"
+        )
+
+        network = restart_network(
+            network, args, current_ledger_dir, committed_ledger_dirs
+        )
+        network.save_service_identity(args)
+
+        primary, _ = network.find_primary()
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+
+        with primary.client("user0") as c:
+            for _ in range(100 + 100 * attempt):
+                r = c.post(
+                    "/app/log/public",
+                    {
+                        "id": 42,
+                        "msg": "Boring recoverable transactions",
+                    },
+                )
+                assert r.status_code == 200, r
+
+        network.stop_all_nodes(skip_verification=True)
+
+        # Calling .get_ledger() after shutdown because it lazy-copies the files.
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+
+        ledger = ccf.ledger.Ledger(
+            primary.remote.ledger_paths(),
+            committed_only=False,
+            contiguous_suffix=True,
+        )
+
+        _, last_seqno = ledger.get_latest_public_state()
+        last_tx = ledger.get_transaction(last_seqno)
+
+        if ccf.signatures.is_signature_transaction(
+            last_tx.get_public_domain().get_tables()
+        ):
+            LOG.info(
+                f"Found signature in last tx {last_tx.get_tx_digest()}, not a suitable candidate for this test"
+            )
+            continue
+
+        # We've got a suffix with extra payload with no following signature.
+        break
+    else:
+        raise RuntimeError(
+            f"Failed to get incomplete pre-recovery ledger files after {ATTEMPTS} attempts"
+        )
+
+    network = restart_network(network, args, current_ledger_dir, committed_ledger_dirs)
+
+    primary, _ = network.find_nodes()
+    with primary.client("user0") as c:
+        for _ in range(10):
+            r = c.post(
+                "/app/log/public",
+                {
+                    "id": 42,
+                    "msg": "Less boring recoverable transactions",
+                },
+            )
+            assert r.status_code == 200, r
+
+    network.wait_for_all_nodes_to_commit(primary=primary)
+    network.save_service_identity(args)
+    primary, _ = network.find_primary()
+    current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+    network.stop_all_nodes(skip_verification=True, check_file_invariants=True)
+
+    network = restart_network(network, args, current_ledger_dir, committed_ledger_dirs)
+    return network
+
+
+def run_recovery_corrupt_snapshot(args):
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        network.start_and_open(args)
+        primary, _ = network.find_primary()
+
+        for _ in range(2):
+            app.LoggingTxs("user0").issue(
+                network,
+                number_txs=2,
+                send_private=False,
+                send_public=True,
+                wait_for_sync=True,
+            )
+            snapshot_trigger = primary.trigger_snapshot()
+            committed_snapshots_dir = network.get_committed_snapshots(
+                primary,
+                target_seqno=snapshot_trigger.seqno,
+                wait_for_target_seqno=True,
+            )
+
+        snapshots = sorted(
+            (
+                name
+                for name in os.listdir(committed_snapshots_dir)
+                if name.startswith("snapshot_")
+                and ccf.ledger.is_snapshot_file_committed(name)
+            ),
+            key=lambda name: infra.node.get_snapshot_seqnos(name)[0],
+        )
+        assert len(snapshots) >= 2
+        valid_snapshot_name = snapshots[-2]
+        corrupt_snapshot_name = snapshots[-1]
+
+        recovery_snapshots_dir = os.path.join(
+            network.common_dir, "recovery_corrupt_snapshot"
+        )
+        shutil.rmtree(recovery_snapshots_dir, ignore_errors=True)
+        os.makedirs(recovery_snapshots_dir)
+        shutil.copy(
+            os.path.join(committed_snapshots_dir, valid_snapshot_name),
+            recovery_snapshots_dir,
+        )
+        corrupt_snapshot_path = shutil.copy(
+            os.path.join(committed_snapshots_dir, corrupt_snapshot_name),
+            recovery_snapshots_dir,
+        )
+        with open(corrupt_snapshot_path, "r+b") as corrupt_snapshot:
+            # Remain non-empty so discovery selects this before the valid snapshot.
+            corrupt_snapshot.truncate(1)
+
+        network.save_service_identity(args)
+        network.stop_all_nodes()
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+
+        recovered = infra.network.Network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            existing_network=network,
+        )
+        with infra.network.close_on_error(recovered):
+            recovered.start_in_recovery(
+                args,
+                ledger_dir=current_ledger_dir,
+                committed_ledger_dirs=committed_ledger_dirs,
+                snapshots_dir=recovery_snapshots_dir,
+            )
+            recovered.recover(args)
+
+            recovered_primary, _ = recovered.find_primary()
+            recovered.stop_all_nodes()
+
+            expected_seqno = infra.node.get_snapshot_seqnos(valid_snapshot_name)[0]
+            out_path, _ = recovered_primary.get_logs()
+            assert out_path is not None
+            with open(out_path, encoding="utf-8", errors="replace") as output:
+                startup_seqnos = [
+                    int(match.group(1))
+                    for line in output
+                    if (
+                        match := re.search(
+                            r"Setting startup snapshot seqno to (\d+)", line
+                        )
+                    )
+                ]
+            assert startup_seqnos == [expected_seqno], startup_seqnos
+
+
+def run_recover_snapshot_alone(args):
+    """
+    Recover a service from a snapshot alone, without any ledger files from a previous service.
+    """
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        _primary, _ = network.find_primary()
+        # Recover node solely from snapshot
+        test_recover_service(network, args, from_snapshot=True, no_ledger=True)
+        return network
+
+
+def run_recovery_with_missing_service_data(args):
+    """
+    Recovery nodes read their file-backed inputs when they are created, so a
+    missing service data file fails node creation, rather than failing once
+    the public ledger has been recovered.
+    """
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+    ) as network:
+        network.start_and_open(args)
+        network.save_service_identity(args)
+        primary, _ = network.find_primary()
+        network.stop_all_nodes()
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+
+        missing_service_data = os.path.join(
+            network.common_dir, "missing_service_data.json"
+        )
+        with infra.network.network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            pdb=args.pdb,
+            existing_network=network,
+            skip_verify_chunking=True,
+            check_file_invariants=False,
+        ) as recovered_network:
+            recovered_network.ignore_errors_on_shutdown()
+            try:
+                recovered_network.start_in_recovery(
+                    args,
+                    ledger_dir=current_ledger_dir,
+                    committed_ledger_dirs=committed_ledger_dirs,
+                    service_data_json_file=missing_service_data,
+                )
+            except Exception as e:
+                LOG.info(f"Recovery node failed to start, as expected: {e}")
+            else:
+                raise AssertionError(
+                    "Recovery node started with a missing service data file"
+                )
+
+            out_path, _ = recovered_network.nodes[0].get_logs()
+            with open(out_path, "r", encoding="utf-8") as f:
+                logs = f.read()
+            expected = f"Error starting node: Could not read service data from {missing_service_data}"
+            assert expected in logs, f"Expected '{expected}' in {out_path}"
+            assert (
+                "End of public ledger recovery" not in logs
+            ), "Node should have failed before recovering the public ledger"
+
+
+def run_recover_snapshot_from_expired_node_certificate(args):
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        primary, _ = network.find_primary()
+
+        previous_verify_ca_by_default = primary.verify_ca_by_default
+        recovered_network = None
+        try:
+            valid_from = str(
+                infra.crypto.datetime_to_X509time(datetime.now(UTC) - timedelta(days=2))
+            )
+            validity_period_days = 1
+            primary.verify_ca_by_default = False
+            network.consortium.set_node_certificate_validity(
+                primary,
+                primary,
+                valid_from=valid_from,
+                validity_period_days=validity_period_days,
+            )
+            primary.set_certificate_validity_period(valid_from, validity_period_days)
+
+            network.wait_for_all_nodes_to_commit(primary)
+            primary.verify_certificate_validity_period()
+            _, valid_to = infra.crypto.get_validity_period_from_pem_cert(
+                primary.get_tls_certificate_pem()
+            )
+            assert valid_to < datetime.now(UTC), valid_to
+
+            recovered_network = test_recover_service(
+                network,
+                args,
+                from_snapshot=True,
+                no_ledger=True,
+                isolate_latest_snapshot=True,
+            )
+        finally:
+            primary.verify_ca_by_default = previous_verify_ca_by_default
+            if recovered_network is not None:
+                # There is no pre-snapshot ledger for historical range queries.
+                recovered_network.stop_all_nodes(skip_verification=True)
+
+
+def run_recovery_with_election(args, after_backups_recovered=False):
+    """
+    Recover a service but force an election as the final recovery share is accepted.
+    """
+    if not args.with_election:
+        return
+
+    txs = app.LoggingTxs("user0")
+    recovered_networks = []
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        try:
+            test_recover_service(
+                network,
+                args,
+                force_election=True,
+                election_after_backups_recovered=after_backups_recovered,
+                recovered_networks=recovered_networks,
+            )
+        finally:
+            # Recovered nodes are a separate Network (not torn down by the
+            # context manager). SIGKILL them, including any suspended or not yet
+            # joined, even if the test failed. SIGKILL is asynchronous, so confirm
+            # each one is gone (which also reaps it).
+            recovered_nodes = [
+                node
+                for recovered_network in recovered_networks
+                for node in recovered_network.get_live_nodes()
+            ]
+            for node in recovered_nodes:
+                node.sigkill()
+            for node in recovered_nodes:
+                assert (
+                    node.remote.check_done()
+                ), f"Recovered node {node.node_id} did not terminate after SIGKILL"
+        return network
+
+
+def run_recovery_with_election_after_backups_recovered(args):
+    """
+    Recover a service but suspend the primary, before it can sign an opening of
+    the service, once every backup has begun private recovery, so that a backup
+    which completed private recovery as a backup is elected and must open it.
+    """
+    return run_recovery_with_election(args, after_backups_recovered=True)
+
+
+def run_recovery_with_incomplete_ledger(args):
+    """
+    Recover a service with incomplete ledger file on a primary which contains unsigned suffix.
+    """
+    if not args.with_unsigned_suffix:
+        return
+
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        test_incomplete_ledger_recovery(network, args)
+        return network
+
+
+def run_recovery_with_stale_incomplete_ledger(args):
+    txs = app.LoggingTxs("user0")
+    recovered_networks = []
+    with infra.network.network(
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb, txs=txs
+    ) as network:
+        try:
+            network.start_and_open(args)
+            network = test_recover_service_with_stale_incomplete_ledger(
+                network, args, recovered_networks=recovered_networks
+            )
+            post_opening_txid = network.txs.issue(network, number_txs=3)
+            network.wait_for_all_nodes_to_commit(tx_id=post_opening_txid)
+            primary, _ = network.find_primary()
+            network.create_and_wait_for_ledger_chunk(primary)
+            with primary.get_ledger_chunk_from_api(post_opening_txid.seqno) as ledger:
+                post_opening_bytes = ledger.get_transaction(
+                    post_opening_txid.seqno
+                ).get_raw_tx()
+
+            network = test_recover_service(
+                network,
+                args,
+                from_snapshot=False,
+                recovered_networks=recovered_networks,
+            )
+            primary, _ = network.find_primary()
+            network.stop_all_nodes()
+            validator = ccf.ledger.LedgerValidator(accept_deprecated_entry_types=False)
+            ledger = ccf.ledger.Ledger(
+                primary.remote.ledger_paths(),
+                committed_only=False,
+                contiguous_suffix=True,
+            )
+            found_post_opening_tx = False
+            for chunk in ledger:
+                for tx in chunk:
+                    validator.add_transaction(tx)
+                    if tx.get_txid() == post_opening_txid:
+                        assert tx.get_raw_tx() == post_opening_bytes
+                        found_post_opening_tx = True
+            assert found_post_opening_tx, post_opening_txid
+        finally:
+            for recovered_network in reversed(recovered_networks):
+                recovered_network.stop_all_nodes(
+                    skip_verification=True,
+                    check_file_invariants=False,
+                    skip_verify_chunking=True,
+                )
+
+
+def run_recover_via_initial_recovery_owner(args):
+    """
+    Recover a service using the recovery owner added as part of service creation, without requiring any other recovery members to participate.
+    """
+    txs = app.LoggingTxs("user0")
+    args.initial_member_count = 4
+    args.initial_recovery_participant_count = 3
+    args.initial_recovery_owner_count = 1
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        # Recover service using recovery owner and participants
+        network = test_recover_service(
+            network, args, from_snapshot=True, via_recovery_owner=True
+        )
+        network = test_recover_service(network, args, from_snapshot=True)
+        return network
+
+
+def run_recover_via_added_recovery_owner(args):
+    """
+    Recover a service using the recovery owner added after opening the service, without requiring any other recovery members to participate.
+    """
+    txs = app.LoggingTxs("user0")
+    args.initial_recovery_participant_count = 2
+    args.initial_recovery_owner_count = 0
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        primary, _ = network.find_primary()
+
+        # Add a recovery owner after opening the network
+        recovery_owner = network.consortium.generate_and_add_new_member(
+            primary,
+            curve=args.participants_curve,
+            recovery_role=infra.member.RecoveryRole.Owner,
+        )
+        r = recovery_owner.ack(primary)
+        with primary.client() as nc:
+            nc.wait_for_commit(r)
+
+        # Recover service using recovery owner and participants
+        network = test_recover_service(
+            network, args, from_snapshot=True, via_recovery_owner=True
+        )
+        network = test_recover_service(network, args, from_snapshot=True)
+        return network
+
+
+def run_recovery_after_cose_upgrade(args):
+    """Start Dual, upgrade to COSE-only via node replacement, then recover
+    with allow-dual-joiners. Then live-upgrade the recovered network to strict
+    COSE-only by replacing nodes again, and recover from ledger files.
+    Exercises the full upgrade path: Dual -> COSE (allow dual) -> COSE (strict),
+    with recovery at each transition."""
+    cose_only_package = args.package + "_cose_only_allow_join_dual"
+
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        network.txs.issue(network, number_txs=5)
+
+        primary, _ = network.find_primary()
+        old_nodes = network.get_joined_nodes()
+
+        # Trust COSE-only binary and replace all nodes
+        cose_host_data, _ = infra.utils.get_host_data_and_security_policy(
+            infra.platform_detection.get_platform(),
+            cose_only_package,
+            binary_dir=args.binary_dir,
+        )
+        network.consortium.add_host_data(
+            primary,
+            infra.platform_detection.get_platform(),
+            cose_host_data,
+        )
+
+        new_nodes = []
+        for _ in range(len(old_nodes)):
+            new_node = network.create_node()
+            network.join_node(new_node, cose_only_package, args, from_snapshot=False)
+            network.trust_node(new_node, args)
+            new_nodes.append(new_node)
+
+        network.txs.issue(network, number_txs=5)
+
+        new_primary = new_nodes[0]
+        for old_node in old_nodes:
+            network.retire_node(new_primary, old_node)
+            old_node.stop()
+
+        # Issue more TXs in COSE-only mode (new view after election)
+        network.txs.issue(network, number_txs=5)
+
+        # Now stop and recover - the ledger has dual sigs then COSE-only sigs
+        network.save_service_identity(args)
+        recover_primary, _ = network.find_primary()
+        current_ledger_dir, committed_ledger_dirs = recover_primary.get_ledger()
+
+        watcher = infra.health_watcher.NetworkHealthWatcher(network, args, verbose=True)
+        watcher.start()
+        for node in network.get_joined_nodes():
+            time.sleep(args.election_timeout_ms / 1000)
+            node.stop()
+        watcher.wait_for_recovery()
+
+        # Recover with COSE-only binary
+        recovered_args = copy.deepcopy(args)
+        recovered_args.package = cose_only_package
+        recovered_network = infra.network.Network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            existing_network=network,
+        )
+        recovered_network.start_in_recovery(
+            recovered_args,
+            ledger_dir=current_ledger_dir,
+            committed_ledger_dirs=committed_ledger_dirs,
+            # No snapshot - force full ledger replay so the recovery path
+            # encounters both dual and COSE-only signature entries.
+        )
+        recovered_network.recover(recovered_args)
+
+        # Verify the recovered network works
+        recovered_network.txs.issue(recovered_network, number_txs=3)
+        new_primary, _ = recovered_network.find_primary()
+        service_key = get_service_key(recovered_network)
+        post_msg = recovered_network.txs.priv[recovered_network.txs.idx][0]
+        with new_primary.client("user0") as c:
+            fetch_and_verify_cose_receipt(
+                c, post_msg["view"], post_msg["seqno"], service_key, b"\0" * 32
+            )
+
+        LOG.success("Recovery after dual-to-COSE-only upgrade succeeded")
+
+        # --- Phase 2: live-upgrade recovered network to strict COSE-only,
+        # then recover from ledger files ---
+        cose_strict_package = args.package + "_cose_only"
+
+        phase2_primary, _ = recovered_network.find_primary()
+        phase2_old_nodes = recovered_network.get_joined_nodes()
+
+        # Trust strict COSE-only binary and replace all nodes
+        strict_host_data, _ = infra.utils.get_host_data_and_security_policy(
+            infra.platform_detection.get_platform(),
+            cose_strict_package,
+            binary_dir=args.binary_dir,
+        )
+        recovered_network.consortium.add_host_data(
+            phase2_primary,
+            infra.platform_detection.get_platform(),
+            strict_host_data,
+        )
+
+        strict_nodes = []
+        for _ in range(len(phase2_old_nodes)):
+            n = recovered_network.create_node()
+            recovered_network.join_node(
+                n, cose_strict_package, recovered_args, from_snapshot=False
+            )
+            recovered_network.trust_node(n, recovered_args)
+            strict_nodes.append(n)
+
+        recovered_network.txs.issue(recovered_network, number_txs=5)
+
+        strict_primary = strict_nodes[0]
+        for old in phase2_old_nodes:
+            recovered_network.retire_node(strict_primary, old)
+            old.stop()
+
+        # Issue TXs in strict COSE-only mode
+        recovered_network.txs.issue(recovered_network, number_txs=5)
+
+        # Stop and recover from ledger
+        recovered_network.save_service_identity(recovered_args)
+        phase2_primary, _ = recovered_network.find_primary()
+        phase2_ledger_dir, phase2_committed_dirs = phase2_primary.get_ledger()
+
+        watcher2 = infra.health_watcher.NetworkHealthWatcher(
+            recovered_network, recovered_args, verbose=True
+        )
+        watcher2.start()
+        for node in recovered_network.get_joined_nodes():
+            time.sleep(args.election_timeout_ms / 1000)
+            node.stop()
+        watcher2.wait_for_recovery()
+
+        strict_args = copy.deepcopy(args)
+        strict_args.package = cose_strict_package
+        strict_args.previous_service_identity_file = (
+            recovered_args.previous_service_identity_file
+        )
+        strict_network = infra.network.Network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            existing_network=recovered_network,
+        )
+        strict_network.start_in_recovery(
+            strict_args,
+            ledger_dir=phase2_ledger_dir,
+            committed_ledger_dirs=phase2_committed_dirs,
+        )
+        strict_network.recover(strict_args)
+
+        strict_network.txs.issue(strict_network, number_txs=3)
+        final_primary, _ = strict_network.find_primary()
+        strict_service_key = get_service_key(strict_network)
+        strict_msg = strict_network.txs.priv[strict_network.txs.idx][0]
+        with final_primary.client("user0") as c:
+            fetch_and_verify_cose_receipt(
+                c,
+                strict_msg["view"],
+                strict_msg["seqno"],
+                strict_service_key,
+                b"\0" * 32,
+            )
+
+        LOG.success("Recovery with strict COSE-only after live upgrade succeeded")
+
+
+def run_recovery_dual_to_cose_only(args):
+    """Recover a Dual network in COSE-only mode.
+    Verifies COSE receipts after recovery and that pre-recovery dual receipts
+    remain available."""
+    cose_only_package = args.package + "_cose_only"
+
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+        network.txs.issue(network, number_txs=5)
+
+        # Verify dual receipts work before recovery
+        primary, _ = network.find_nodes()
+        first_msg = network.txs.priv[network.txs.idx][0]
+        first_receipt = network.txs.get_receipt(
+            primary,
+            network.txs.idx,
+            first_msg["seqno"],
+            first_msg["view"],
+        )
+        verify_receipt(first_receipt.json()["receipt"], network.cert)
+        dual_seqno = first_msg["seqno"]
+        dual_view = first_msg["view"]
+
+        # Stop all nodes
+        network.save_service_identity(args)
+        old_primary, _ = network.find_primary()
+        snapshots_dir = network.get_committed_snapshots(old_primary)
+        current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+
+        watcher = infra.health_watcher.NetworkHealthWatcher(network, args, verbose=True)
+        watcher.start()
+        for node in network.get_joined_nodes():
+            time.sleep(args.election_timeout_ms / 1000)
+            node.stop()
+        watcher.wait_for_recovery()
+
+        # Recover with COSE-only binary
+        recovered_args = copy.deepcopy(args)
+        recovered_args.package = cose_only_package
+        recovered_network = infra.network.Network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            existing_network=network,
+        )
+        recovered_network.start_in_recovery(
+            recovered_args,
+            ledger_dir=current_ledger_dir,
+            committed_ledger_dirs=committed_ledger_dirs,
+            snapshots_dir=snapshots_dir,
+        )
+        recovered_network.recover(recovered_args)
+
+        # Verify COSE receipts work after recovery
+        recovered_network.txs.issue(recovered_network, number_txs=3)
+        new_primary, _ = recovered_network.find_primary()
+        service_key = get_service_key(recovered_network)
+        post_msg = recovered_network.txs.priv[recovered_network.txs.idx][0]
+        with new_primary.client("user0") as c:
+            fetch_and_verify_cose_receipt(
+                c, post_msg["view"], post_msg["seqno"], service_key, b"\0" * 32
+            )
+
+        # Dual receipts from before recovery should still be available
+        with new_primary.client("user0") as c:
+            infra.commit.wait_for_commit(c, dual_seqno, dual_view, timeout=3)
+            start_time = time.time()
+            while time.time() < start_time + 10:
+                rc = c.get(f"/app/receipt?transaction_id={dual_view}.{dual_seqno}")
+                if rc.status_code == http.HTTPStatus.OK:
+                    verify_receipt(rc.body.json(), recovered_network.cert)
+                    break
+                elif rc.status_code == http.HTTPStatus.ACCEPTED:
+                    time.sleep(0.5)
+                else:
+                    assert False, rc
+            else:
+                assert False, "Timed out waiting for dual receipt"
+
+        LOG.success("Dual network recovered in COSE-only mode")
+
+
+def run_recovery_cose_only_network(args):
+    """Start a COSE-only network, stop it, then verify:
+    - Recovering as Dual fails.
+    - Recovering as COSE-only succeeds with valid COSE receipts."""
+    cose_only_package = args.package + "_cose_only"
+    cose_args = copy.deepcopy(args)
+    cose_args.package = cose_only_package
+
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(cose_args)
+        network.txs.issue(network, number_txs=5)
+
+        # Stop all nodes
+        network.save_service_identity(cose_args)
+        old_primary, _ = network.find_primary()
+        snapshots_dir = network.get_committed_snapshots(old_primary)
+        current_ledger_dir, committed_ledger_dirs = old_primary.get_ledger()
+
+        watcher = infra.health_watcher.NetworkHealthWatcher(network, args, verbose=True)
+        watcher.start()
+        for node in network.get_joined_nodes():
+            time.sleep(args.election_timeout_ms / 1000)
+            node.stop()
+        watcher.wait_for_recovery()
+
+        # Recovering as Dual should fail
+        LOG.info("Recovering COSE-only network as Dual (expect failure)")
+        dual_recovery_network = infra.network.Network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            existing_network=network,
+        )
+        try:
+            dual_recovery_network.start_in_recovery(
+                args,  # Dual package
+                ledger_dir=current_ledger_dir,
+                committed_ledger_dirs=committed_ledger_dirs,
+                snapshots_dir=snapshots_dir,
+            )
+            assert False, "Dual recovery of COSE-only ledger should have failed"
+        except Exception as e:
+            LOG.success(f"Dual recovery correctly failed: {e}")
+            for node in dual_recovery_network.nodes:
+                node.stop()
+
+        # Recovering as COSE-only should succeed
+        LOG.info("Recovering COSE-only network as COSE-only (expect success)")
+        cose_recovery_network = infra.network.Network(
+            args.nodes,
+            args.binary_dir,
+            args.debug_nodes,
+            existing_network=network,
+        )
+        cose_recovery_network.start_in_recovery(
+            cose_args,
+            ledger_dir=current_ledger_dir,
+            committed_ledger_dirs=committed_ledger_dirs,
+            snapshots_dir=snapshots_dir,
+        )
+        cose_recovery_network.recover(cose_args)
+
+        # Verify COSE receipts work
+        cose_recovery_network.txs.issue(cose_recovery_network, number_txs=3)
+        new_primary, _ = cose_recovery_network.find_primary()
+        service_key = get_service_key(cose_recovery_network)
+        post_msg = cose_recovery_network.txs.priv[cose_recovery_network.txs.idx][0]
+        with new_primary.client("user0") as c:
+            fetch_and_verify_cose_receipt(
+                c, post_msg["view"], post_msg["seqno"], service_key, b"\0" * 32
+            )
+
+        # Verify /node/state reports last_signed_seqno advancing
+        with new_primary.client() as c:
+            r = c.get("/node/state")
+            assert r.status_code == http.HTTPStatus.OK, r
+            last_signed_before = r.body.json()["last_signed_seqno"]
+            assert (
+                last_signed_before > 0
+            ), f"last_signed_seqno should be > 0 after recovery, got {last_signed_before}"
+
+        cose_recovery_network.txs.issue(cose_recovery_network, number_txs=3)
+
+        with new_primary.client() as c:
+            r = c.get("/node/state")
+            assert r.status_code == http.HTTPStatus.OK, r
+            last_signed_after = r.body.json()["last_signed_seqno"]
+            assert last_signed_after > last_signed_before, (
+                f"last_signed_seqno should advance after issuing TXs, "
+                f"got {last_signed_after} (was {last_signed_before})"
+            )
+
+        LOG.success("COSE-only network recovered as COSE-only")
+
+
+def run_recovery_cose_only(args):
+    """Run all COSE-only recovery test scenarios."""
+    run_recovery_after_cose_upgrade(args)
+    run_recovery_dual_to_cose_only(args)
+    run_recovery_cose_only_network(args)
+
+
+def run_recover_snapshot_ledger_offset(args):
+    txs = app.LoggingTxs("user0")
+    with infra.network.network(
+        args.nodes, args.binary_dir, args.debug_nodes, txs=txs
+    ) as network:
+        network.start_and_open(args)
+        primary, _ = network.find_primary()
+
+        network.create_and_wait_for_ledger_chunk(primary)
+
+        network.txs.issue(network, number_txs=5, send_private=False, send_public=True)
+        network.txs.issue(network, number_txs=5, send_private=False, send_public=True)
+
+        snapshot_trigger_txid = primary.trigger_snapshot()
+        committed_snapshots_dir = network.get_committed_snapshots(
+            primary,
+            target_seqno=snapshot_trigger_txid.seqno,
+            wait_for_target_seqno=True,
+        )
+        committed_snapshots = sorted(
+            [
+                f
+                for f in os.listdir(committed_snapshots_dir)
+                if f.startswith("snapshot_")
+                and ccf.ledger.is_snapshot_file_committed(f)
+            ],
+            key=lambda f: ccf.ledger.snapshot_index_from_filename(f)[0],
+        )
+        assert (
+            committed_snapshots
+        ), f"Expected committed snapshots in {committed_snapshots_dir}"
+        snapshot_file = committed_snapshots[-1]
+        snapshot_seqno, _ = ccf.ledger.snapshot_index_from_filename(snapshot_file)
+
+        source_snapshot_dir = os.path.join(
+            network.common_dir, "recovery_snapshot_ledger_offset.snapshots"
+        )
+        shutil.rmtree(source_snapshot_dir, ignore_errors=True)
+        os.makedirs(source_snapshot_dir)
+        shutil.copy(
+            os.path.join(committed_snapshots_dir, snapshot_file), source_snapshot_dir
+        )
+
+        rest_txid = network.txs.issue(
+            network, number_txs=5, send_private=False, send_public=True
+        )
+        network.create_and_wait_for_ledger_chunk(primary)
+
+        assert snapshot_trigger_txid.seqno < snapshot_seqno < rest_txid.seqno, (
+            snapshot_trigger_txid,
+            snapshot_seqno,
+            rest_txid,
+        )
+
+        network.save_service_identity(args)
+        network.stop_all_nodes(skip_verification=True)
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+        ledger = ccf.ledger.Ledger(
+            [current_ledger_dir] + committed_ledger_dirs,
+            committed_only=False,
+            contiguous_suffix=True,
+        )
+
+        snapshot_chunk_start = None
+        snapshot_chunk_entries = None
+        post_snapshot_entries = []
+        for chunk in ledger:
+            entries = [
+                (tx.get_public_domain().get_seqno(), tx.get_raw_tx()) for tx in chunk
+            ]
+            if not entries:
+                continue
+
+            chunk_start = entries[0][0]
+            chunk_end = entries[-1][0]
+            if chunk_start <= snapshot_seqno <= chunk_end:
+                snapshot_chunk_start = chunk_start
+                snapshot_chunk_entries = entries
+                assert (
+                    chunk_end == snapshot_seqno
+                ), f"Expected snapshot seqno {snapshot_seqno} at chunk boundary, got chunk {chunk_start}-{chunk_end}"
+
+            post_snapshot_entries.extend(
+                (seqno, raw_tx)
+                for seqno, raw_tx in entries
+                if snapshot_seqno < seqno <= rest_txid.seqno
+            )
+
+        assert (
+            snapshot_chunk_start is not None
+        ), f"Could not find ledger chunk ending at snapshot seqno {snapshot_seqno}"
+        assert snapshot_chunk_entries is not None
+        if snapshot_chunk_start <= snapshot_trigger_txid.seqno < snapshot_seqno:
+            mid_chunk_seqno = snapshot_trigger_txid.seqno
+        else:
+            mid_chunk_seqno = next(
+                seqno
+                for seqno, _ in reversed(snapshot_chunk_entries)
+                if seqno < snapshot_seqno
+            )
+        assert (
+            post_snapshot_entries
+        ), f"Expected ledger entries after snapshot {snapshot_seqno}"
+        assert post_snapshot_entries[0][0] == snapshot_seqno + 1, post_snapshot_entries[
+            0
+        ]
+
+        base_dir = os.path.join(
+            args.workspace, f"{args.label}_recovery_snapshot_ledger_offset"
+        )
+        shutil.rmtree(base_dir, ignore_errors=True)
+        os.makedirs(base_dir)
+
+        variants = [
+            (
+                "incomplete_mid_chunk",
+                [(snapshot_chunk_entries, mid_chunk_seqno, False)],
+            ),
+            (
+                "complete_mid_chunk",
+                [(snapshot_chunk_entries, mid_chunk_seqno, True)],
+            ),
+            (
+                "incomplete_snapshot",
+                [(snapshot_chunk_entries, snapshot_seqno, False)],
+            ),
+            (
+                "complete_snapshot",
+                [(snapshot_chunk_entries, snapshot_seqno, True)],
+            ),
+            (
+                "incomplete_rest",
+                [
+                    (snapshot_chunk_entries, snapshot_seqno, True),
+                    (post_snapshot_entries, rest_txid.seqno, False),
+                ],
+            ),
+        ]
+
+        for variant_index, (variant_name, chunks_to_write) in enumerate(variants):
+            LOG.info("Recovering service with {} ledger variant", variant_name)
+            variant_dir = os.path.join(base_dir, variant_name)
+            current_dir = os.path.join(variant_dir, "ledger.current")
+            prefix_dir = os.path.join(variant_dir, "ledger.committed")
+            snapshots_dir = os.path.join(variant_dir, "snapshots")
+            variant_common_dir = os.path.join(variant_dir, "common")
+            os.makedirs(current_dir)
+            os.makedirs(prefix_dir)
+            os.makedirs(snapshots_dir)
+            shutil.copytree(network.common_dir, variant_common_dir)
+            shutil.copy(os.path.join(source_snapshot_dir, snapshot_file), snapshots_dir)
+
+            for source_dir in [current_ledger_dir] + committed_ledger_dirs:
+                for f in os.listdir(source_dir):
+                    if not f.endswith(ccf.ledger.COMMITTED_FILE_SUFFIX):
+                        continue
+                    _, range_end = ccf.ledger.range_from_filename(f)
+                    if range_end is not None and range_end < snapshot_chunk_start:
+                        shutil.copy(os.path.join(source_dir, f), prefix_dir)
+
+            for entries, end_seqno, complete in chunks_to_write:
+                infra.utils.write_ledger_chunk(
+                    current_dir, entries, end_seqno, complete
+                )
+
+            recovered_args = copy.deepcopy(args)
+            recovered_args.label = f"{args.label}_{variant_name}"
+            recovered_network = infra.network.Network(
+                infra.e2e_args.min_nodes(recovered_args, f=0),
+                recovered_args.binary_dir,
+                recovered_args.debug_nodes,
+                txs=network.txs,
+                jwt_issuer=network.jwt_issuer,
+                next_node_id=variant_index,
+            )
+            recovered_network.ignore_errors_on_shutdown()
+            try:
+                recovered_network.start_in_recovery(
+                    recovered_args,
+                    ledger_dir=current_dir,
+                    committed_ledger_dirs=[prefix_dir],
+                    snapshots_dir=snapshots_dir,
+                    common_dir=variant_common_dir,
+                )
+                recovered_primary, _ = recovered_network.find_primary()
+                out_path, _ = recovered_primary.get_logs()
+                with open(out_path, encoding="utf-8") as out:
+                    assert f"snapshot_{snapshot_seqno}_" in out.read()
+
+                recovered_network.recover(recovered_args)
+                with recovered_primary.client() as c:
+                    r = c.get("/node/ready/app")
+                    assert r.status_code == http.HTTPStatus.NO_CONTENT.value, r
+            finally:
+                recovered_network.stop_all_nodes(
+                    skip_verification=True,
+                    skip_verify_chunking=True,
+                    check_file_invariants=True,
+                )
+
+
+def _find_endorsement_write_chunks(committed_ledger_dirs):
+    """Return [(seqno, chunk_path), ...] for every write to the previous
+    service identity endorsement table across the committed ledger
+    directories, sorted by seqno. Used by the partial-chain e2e test to
+    locate a chunk whose removal will break the chain walk."""
+    endorsement_table = "public:ccf.internal.previous_service_identity_endorsement"
+    writes = []
+    for ledger_dir in committed_ledger_dirs:
+        for filename in os.listdir(ledger_dir):
+            if not ccf.ledger.is_ledger_chunk_committed(filename):
+                continue
+            chunk_path = os.path.join(ledger_dir, filename)
+            chunk = ccf.ledger.LedgerChunk(chunk_path)
+            for transaction in chunk:
+                public_domain = transaction.get_public_domain()
+                tables = public_domain.get_tables()
+                if endorsement_table in tables:
+                    writes.append((public_domain.get_seqno(), chunk_path))
+    writes.sort(key=lambda w: w[0])
+    return writes
+
+
+@reqs.description(
+    "Network identity subsystem settles in Partial when a previous-identity "
+    "endorsement ledger chunk is missing"
+)
+def run_recovery_partial_when_ledger_gap(args):
+    """Builds a chain over 2 recoveries (S1 -> S2 -> S3), stops the
+    network, moves out the ledger chunk that contains the S2-era
+    endorsement write, and recovers once more (-> S4). With the
+    missing chunk the endorsement chain walk cannot complete; we
+    configure the subsystem with a small retry budget so it settles
+    in Partial quickly. We assert:
+
+      * the subsystem reaches Partial (not Done, not Failed);
+      * the validated suffix is available via the trusted_keys
+        endpoint.
+
+    No "restore the chunk and re-fetch" step: Partial is terminal."""
+    txs = app.LoggingTxs("user0")
+
+    with infra.network.network(
+        args.nodes,
+        args.binary_dir,
+        args.debug_nodes,
+        pdb=args.pdb,
+        txs=txs,
+    ) as network:
+        network.start_and_open(args)
+
+        # S1 is live. Capture an S1-era txid (after the issue) so we
+        # can later prove a receipt for it cannot be served in
+        # Partial mode.
+        network.txs.issue(network, number_txs=2)
+        _, msg = network.txs.get_last_tx(priv=True)
+        s1_era_txid = ccf.tx_id.TxID(msg["view"], msg["seqno"])
+
+        # First recovery -> S2.
+        network = test_recover_service(network, args)
+        # S2 is live: capture its cert and an S2-era txid.
+        primary, _ = network.find_primary()
+        with primary.client() as cli:
+            s2_cert_pem = cli.get("/node/network").body.json()["service_certificate"]
+        network.txs.issue(network, number_txs=2)
+        _, msg = network.txs.get_last_tx(priv=True)
+        s2_era_txid = ccf.tx_id.TxID(msg["view"], msg["seqno"])
+
+        # Second recovery -> S3.
+        network = test_recover_service(network, args)
+        # S3 is live: capture its cert and an S3-era txid.
+        primary, _ = network.find_primary()
+        with primary.client() as cli:
+            s3_cert_pem = cli.get("/node/network").body.json()["service_certificate"]
+        network.txs.issue(network, number_txs=2)
+        _, msg = network.txs.get_last_tx(priv=True)
+        s3_era_txid = ccf.tx_id.TxID(msg["view"], msg["seqno"])
+
+        primary, _ = network.find_primary()
+
+        snapshots_dir = network.get_committed_snapshots(primary)
+        network.save_service_identity(args)
+        network.stop_all_nodes()
+        current_ledger_dir, committed_ledger_dirs = primary.get_ledger()
+
+        # The committed ledger captured before the final recovery
+        # contains 3 endorsement-table writes:
+        #   writes[0]: self-endorsement of S1 (written when S1 first
+        #              opened; no previous service to endorse).
+        #   writes[1]: e_S1 (written by S2's recovery, endorses S1).
+        #   writes[2]: e_S2 (written by S3's recovery, endorses S2).
+        # We move out the chunk containing writes[1] (e_S1's write)
+        # to break the chain walk for S4 at the S1 link: S4's
+        # recovery bootstraps from a snapshot taken later than the
+        # missing chunk and proceeds normally; the chain walk then
+        # successfully fetches e_S2 historically but fails to fetch
+        # e_S1 from the moved chunk and settles in Partial. The
+        # validated suffix is then exactly three trusted keys -- S2
+        # endorsed by e_S2, S3 endorsed by e_S3 (the fresh entry S4
+        # just wrote), and S4 itself -- and a historical receipt for
+        # any S1-era seqno must return an error from the historical
+        # adapter (seqno below the validated suffix).
+        writes = _find_endorsement_write_chunks(committed_ledger_dirs)
+        LOG.info(f"Endorsement-table writes across committed ledger: {writes}")
+        assert len(writes) == 3, (
+            "Expected exactly 3 endorsement writes (self-endorsement "
+            "of S1 + one per recovery across S2, S3) in the committed "
+            f"ledger, got: {writes}"
+        )
+        target_seqno, target_chunk = writes[1]
+        other_writes_in_target_chunk = [
+            seq
+            for seq, chunk in writes
+            if chunk == target_chunk and seq != target_seqno
+        ]
+        assert not other_writes_in_target_chunk, (
+            f"Chunk {target_chunk} contains additional endorsement writes "
+            f"at seqnos {other_writes_in_target_chunk}; the test cannot "
+            "deterministically isolate the chain link to break."
+        )
+
+        backup_dir = tempfile.mkdtemp(prefix="ccf_missing_chunk_")
+        try:
+            moved_chunk_path = os.path.join(backup_dir, os.path.basename(target_chunk))
+            LOG.info(
+                f"Moving chunk {target_chunk} (containing endorsement write at "
+                f"seqno {target_seqno}) to {moved_chunk_path}"
+            )
+            shutil.move(target_chunk, moved_chunk_path)
+
+            # Third recovery (S4) with the missing chunk. The
+            # identity-history retry budget is shrunk so the test does
+            # not have to wait long for the chain walk to exhaust.
+            recovered_network = infra.network.Network(
+                args.nodes,
+                args.binary_dir,
+                args.debug_nodes,
+                existing_network=network,
+                txs=txs,
+            )
+            with infra.network.close_on_error(recovered_network):
+                recovered_network.start_in_recovery(
+                    args,
+                    ledger_dir=current_ledger_dir,
+                    committed_ledger_dirs=committed_ledger_dirs,
+                    snapshots_dir=snapshots_dir,
+                    identity_history_fetch_max_attempts=5,
+                    identity_history_fetch_retry_interval="200ms",
+                )
+                recovered_network.recover(args)
+
+                primary, _ = recovered_network.find_primary()
+
+                # S4 is live. Capture its cert and an S4-era txid for
+                # the receipt assertions below.
+                with primary.client() as cli:
+                    s4_cert_pem = cli.get("/node/network").body.json()[
+                        "service_certificate"
+                    ]
+                recovered_network.txs.issue(recovered_network, number_txs=2)
+                _, msg = recovered_network.txs.get_last_tx(priv=True)
+                s4_era_txid = ccf.tx_id.TxID(msg["view"], msg["seqno"])
+
+                # Poll /log/public/trusted_keys. While the subsystem is in
+                # Retry the endpoint returns 5xx (the underlying
+                # get_trusted_keys() throws IdentityHistoryNotFetched).
+                # Once the bounded retries settle in Partial (a few seconds
+                # under the small test budget), the endpoint returns 200
+                # with whatever validated suffix was built.
+                LOG.info(
+                    "Polling /log/public/trusted_keys until subsystem settles "
+                    "out of Retry"
+                )
+                deadline = time.time() + 30
+                settled_response = None
+                while time.time() < deadline:
+                    with primary.client() as cli:
+                        r = cli.get("/log/public/trusted_keys")
+                    if r.status_code == http.HTTPStatus.OK:
+                        settled_response = r
+                        break
+                    time.sleep(0.5)
+
+                assert settled_response is not None, (
+                    "trusted_keys never returned 200 within 30s; subsystem "
+                    "stayed in Retry beyond the configured retry budget."
+                )
+
+                partial_keys = settled_response.body.json()["keys"]
+                LOG.info(f"trusted_keys count while in Partial: {len(partial_keys)}")
+
+                # Expected validated suffix: S2, S3, S4. S1's key is
+                # NOT reachable because e_S1's ledger chunk was moved
+                # out, so the chain walk fails on the S2 -> S1 hop
+                # and settles in Partial.
+                def kid_for_cert_pem(cert_pem):
+                    cert = load_pem_x509_certificate(
+                        (
+                            cert_pem.encode("ascii")
+                            if isinstance(cert_pem, str)
+                            else cert_pem
+                        ),
+                        default_backend(),
+                    )
+                    pk_der = cert.public_key().public_bytes(
+                        serialization.Encoding.DER,
+                        serialization.PublicFormat.SubjectPublicKeyInfo,
+                    )
+                    return hashlib.sha256(pk_der).hexdigest()
+
+                expected_kids = {
+                    kid_for_cert_pem(s2_cert_pem),
+                    kid_for_cert_pem(s3_cert_pem),
+                    kid_for_cert_pem(s4_cert_pem),
+                }
+                got_kids = {k["kid"] for k in partial_keys}
+                assert got_kids == expected_kids, (
+                    f"trusted_keys mismatch in Partial.\n"
+                    f"  expected (S2 + S3 + S4): "
+                    f"{sorted(expected_kids)}\n"
+                    f"  got: {sorted(got_kids)}"
+                )
+
+                # User-visible Partial-vs-Done discriminator. A
+                # receipt for an S2/S3/S4-era seqno must be served
+                # successfully (the chain reader returns a valid sub-
+                # chain or an empty chain for current-service
+                # seqnos), but a receipt for an S1-era seqno must
+                # fail because the historical adapter cannot
+                # determine the endorsement chain for any seqno below
+                # the validated suffix.
+                def poll_receipt(txid, timeout=10):
+                    deadline = time.time() + timeout
+                    rc = None
+                    while time.time() < deadline:
+                        with primary.client() as cli:
+                            rc = cli.get(f"/node/receipt/cose?transaction_id={txid}")
+                        if rc.status_code != http.HTTPStatus.ACCEPTED:
+                            return rc
+                        time.sleep(0.2)
+                    return rc
+
+                for label, txid in (
+                    ("S2", s2_era_txid),
+                    ("S3", s3_era_txid),
+                    ("S4", s4_era_txid),
+                ):
+                    rc = poll_receipt(txid)
+                    assert rc.status_code == http.HTTPStatus.OK, (
+                        f"Receipt fetch for {label}-era {txid} failed: "
+                        f"{rc.status_code} {rc.body!r}"
+                    )
+                    LOG.info(f"Receipt for {label}-era {txid} -> 200 OK")
+
+                rc_s1 = poll_receipt(s1_era_txid)
+                assert rc_s1.status_code != http.HTTPStatus.OK, (
+                    f"Receipt fetch for S1-era {s1_era_txid} unexpectedly "
+                    f"succeeded; subsystem appears to be in Done, not "
+                    f"Partial. Response: {rc_s1.status_code} {rc_s1.body!r}"
+                )
+                LOG.info(
+                    f"Receipt for S1-era {s1_era_txid} -> {rc_s1.status_code} "
+                    "as expected (seqno below validated suffix)"
+                )
+
+                LOG.success(
+                    "Subsystem settled in Partial with exactly three "
+                    "validated trusted keys (S2 + S3 + S4); receipts "
+                    "serve for S2/S3/S4 seqnos and fail for S1 seqnos; "
+                    "the missing ledger chunk did not block node "
+                    "startup."
+                )
+        finally:
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -828,17 +3335,102 @@ checked. Note that the key for each logging message is unique (per table).
             action="store_true",
             default=False,
         )
+        parser.add_argument(
+            "--with-election",
+            help="If set, the primary is stopped to force an election at the end of recovery",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--with-unsigned-suffix",
+            help="If set, recover with open-ranged ledger file with unsigned suffix",
+            action="store_true",
+            default=False,
+        )
 
     cr = ConcurrentRunner(add)
 
     cr.add(
         "recovery",
         run,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.min_nodes(cr.args, f=1),
         ledger_chunk_bytes="50KB",
         snapshot_tx_interval=30,
     )
+
+    cr.add(
+        "recovery_ipv6",
+        run_ipv6,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=30,
+    )
+
+    cr.add(
+        "recovery_with_new_code_id",
+        run_recover_service_with_different_code_id,
+        package="samples/apps/logging/logging",
+        recovery_package="js_generic",
+        recovery_js_app_bundle=os.path.join(
+            os.path.dirname(__file__), "..", "samples", "apps", "logging", "js"
+        ),
+        # Single-node recovery is sufficient here because the test focuses on
+        # code ID switching rather than multi-node consensus behaviour.
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=30,
+    )
+
+    cr.add(
+        "recovery_reconfiguration_before_shares",
+        run_reconfiguration_before_recovery_shares,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=30,
+    )
+
+    # Releases before 7.0 wrote snapshots with JSON receipts, which nodes reject
+    for (
+        directory,
+        expected_recovery_count,
+        test_receipts_at,
+        test_cose_receipts_at,
+        snapshots_with_json_receipts,
+    ) in (
+        ("expired_service", 2, [(2, 3)], None, True),
+        # sgx_service is historical ledger, from 1.x -> 2.x -> 3.x -> 5.x -> main.
+        # This is used to test recovery from SGX to SNP.
+        ("sgx_service", 4, None, None, True),
+        # double_sealed_service is a regression test for the issue described in #6906
+        (
+            "double_sealed_service",
+            2,
+            [(2, 3), (4, 498), (5, 504), (7, 506)],
+            [(2, 3), (4, 498), (5, 504), (7, 506)],
+            False,
+        ),
+        # cose_flipflop_service is a regression test for the issue described in #7002
+        ("cose_flipflop_service", 0, None, None, False),
+        # acme_containing_service is a compatibility test for acme-containing ledgers
+        ("acme_containing_service", 0, [(2, 3)], [(2, 3)], False),
+    ):
+        cr.add(
+            f"recovery_from_{directory}",
+            run_recovery_from_files,
+            package="samples/apps/logging/logging",
+            nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+            ledger_chunk_bytes="50KB",
+            snapshot_tx_interval=30,
+            directory=directory,
+            expected_recovery_count=expected_recovery_count,
+            test_receipts_at=test_receipts_at,
+            test_cose_receipts_at=test_cose_receipts_at,
+            snapshots_with_json_receipts=snapshots_with_json_receipts,
+            gov_api_version="2024-07-01",
+        )
 
     # Note: `run_corrupted_ledger` runs with very a specific node configuration
     # so that the contents of recovered (and tampered) ledger chunks
@@ -848,11 +3440,124 @@ checked. Note that the key for each logging message is unique (per table).
     cr.add(
         "recovery_corrupt_ledger",
         run_corrupted_ledger,
-        package="samples/apps/logging/liblogging",
+        package="samples/apps/logging/logging",
         nodes=infra.e2e_args.min_nodes(cr.args, f=0),  # 1 node suffices for recovery
         sig_ms_interval=1000,
         ledger_chunk_bytes="1GB",
         snapshot_tx_interval=1000000,
+    )
+
+    cr.add(
+        "recovery_corrupt_snapshot",
+        run_recovery_corrupt_snapshot,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),  # 1 node suffices for recovery
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=10,
+        sig_tx_interval=1,
+    )
+
+    cr.add(
+        "recovery_snapshot_alone",
+        run_recover_snapshot_alone,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),  # 1 node suffices for recovery
+    )
+
+    cr.add(
+        "recovery_expired_node_certificate_snapshot",
+        run_recover_snapshot_from_expired_node_certificate,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),
+        snapshot_tx_interval=10,
+        sig_tx_interval=1,
+    )
+
+    cr.add(
+        "recovery_via_initial_recovery_owner",
+        run_recover_via_initial_recovery_owner,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),  # 1 node suffices for recovery
+    )
+
+    cr.add(
+        "recovery_via_added_recovery_owner",
+        run_recover_via_added_recovery_owner,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),  # 1 node suffices for recovery
+    )
+
+    cr.add(
+        "recovery_with_missing_service_data",
+        run_recovery_with_missing_service_data,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=0),
+    )
+
+    cr.add(
+        "recovery_with_election",
+        run_recovery_with_election,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=30,
+    )
+
+    cr.add(
+        "recovery_with_election_after_backups_recovered",
+        run_recovery_with_election_after_backups_recovered,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=30,
+        # Node default: leaves time to suspend the primary once the backups
+        # begin private recovery, before it can sign an opening of the service.
+        sig_ms_interval=1000,
+    )
+
+    cr.add(
+        "recovery_with_incomplete_ledger",
+        run_recovery_with_incomplete_ledger,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=10000,
+    )
+
+    cr.add(
+        "recovery_with_stale_incomplete_ledger",
+        run_recovery_with_stale_incomplete_ledger,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.nodes(cr.args, 2),
+        ledger_chunk_bytes="1B",
+        snapshot_tx_interval=30,
+    )
+
+    cr.add(
+        "recovery_cose_only",
+        run_recovery_cose_only,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=30,
+    )
+
+    cr.add(
+        "recovery_snapshot_ledger_offset",
+        run_recover_snapshot_ledger_offset,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50MB",
+        snapshot_tx_interval=50,
+    )
+
+    cr.add(
+        "recovery_partial_when_ledger_gap",
+        run_recovery_partial_when_ledger_gap,
+        package="samples/apps/logging/logging",
+        nodes=infra.e2e_args.min_nodes(cr.args, f=1),
+        ledger_chunk_bytes="50KB",
+        snapshot_tx_interval=30,
     )
 
     cr.run()

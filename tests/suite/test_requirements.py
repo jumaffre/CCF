@@ -3,7 +3,9 @@
 
 import functools
 
-from infra.snp import IS_SNP
+from infra import test_reporting
+from infra.member import RecoveryRole
+from infra.snp import SNP_SUPPORT
 from loguru import logger as LOG
 
 
@@ -15,10 +17,9 @@ def description(desc):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            LOG.opt(colors=True, depth=1).info(
-                f'<magenta>Test: {desc} {(kwargs or "")}</>'
-            )
-            return func(*args, **kwargs)
+            LOG.opt(depth=1).info(f'Test: {desc} {(kwargs or "")}')
+            with test_reporting.test_case(func, desc):
+                return func(*args, **kwargs)
 
         return wrapper
 
@@ -97,15 +98,31 @@ def exactly_n_nodes(n):
 
 
 def sufficient_recovery_member_count():
-    def check(network, args, recovery_member=True, *nargs, **kwargs):
-        if recovery_member and (
-            len(network.consortium.get_active_recovery_members())
+    def check(
+        network,
+        args,
+        recovery_role=RecoveryRole.Participant,
+        *nargs,
+        **kwargs,
+    ):
+        if recovery_role == RecoveryRole.Participant and (
+            len(network.consortium.get_active_recovery_participants())
             <= network.consortium.recovery_threshold
         ):
             raise TestRequirementsNotMet(
                 "Cannot remove recovery member since number of active recovery members"
-                f" ({len(network.consortium.get_active_recovery_members()) - 1}) would be less than"
+                f" ({len(network.consortium.get_active_recovery_participants()) - 1}) would be less than"
                 f" the recovery threshold ({network.consortium.recovery_threshold})"
+            )
+
+    return ensure_reqs(check)
+
+
+def sufficient_network_recovery_count(required_count):
+    def check(network, args, *nargs, **kwargs):
+        if network.recovery_count < required_count:
+            raise TestRequirementsNotMet(
+                f"Test requires {required_count} network recoveries, but only {network.recovery_count} have been performed"
             )
 
     return ensure_reqs(check)
@@ -138,18 +155,9 @@ def installed_package(*p):
     return ensure_reqs(check)
 
 
-def no_http2():
-    # HTTP/2 does not support forwarding
-    def check(network, args, *nargs, **kwargs):
-        if args.http2:
-            raise TestRequirementsNotMet("Test not run with HTTP/2")
-
-    return ensure_reqs(check)
-
-
 def snp_only():
     def check(*args, **kwargs):
-        if not IS_SNP:
+        if not SNP_SUPPORT:
             raise TestRequirementsNotMet("Platform does not support SNP")
 
     return ensure_reqs(check)
@@ -157,7 +165,7 @@ def snp_only():
 
 def not_snp(reason=None):
     def check(*args, **kwargs):
-        if IS_SNP:
+        if SNP_SUPPORT:
             raise TestRequirementsNotMet(
                 f"Platform should not be SNP (reason: {reason})"
             )

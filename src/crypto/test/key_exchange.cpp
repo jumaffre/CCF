@@ -4,7 +4,7 @@
 
 #include "crypto/key_exchange.h"
 
-#include "crypto/openssl/key_pair.h"
+#include "crypto/openssl/ec_key_pair.h"
 
 #include <doctest/doctest.h>
 
@@ -13,7 +13,7 @@ TEST_CASE("Simple key exchange")
   INFO("Try to compute shared secret before peer public have been exchanged");
   {
     // These key exchange contexts should not be used after negative testing.
-    tls::KeyExchangeContext peer1_ctx, peer2_ctx;
+    ::tls::KeyExchangeContext peer1_ctx, peer2_ctx;
 
     // Cannot compute the shared secret until the peer's public has been
     // loaded
@@ -33,7 +33,7 @@ TEST_CASE("Simple key exchange")
 
   INFO("Compute shared secret");
   {
-    tls::KeyExchangeContext peer1_ctx, peer2_ctx;
+    ::tls::KeyExchangeContext peer1_ctx, peer2_ctx;
     auto peer1_public = peer1_ctx.get_own_key_share();
     auto peer2_public = peer2_ctx.get_own_key_share();
 

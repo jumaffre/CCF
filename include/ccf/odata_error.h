@@ -37,7 +37,9 @@ namespace ccf
   {
     std::string code;
     std::string message;
-    std::vector<nlohmann::json> details = {};
+    std::vector<nlohmann::json> details;
+
+    bool operator==(const ODataError&) const = default;
   };
 
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(ODataError);
@@ -54,7 +56,7 @@ namespace ccf
 
   struct ErrorDetails
   {
-    http_status status;
+    http_status status = HTTP_STATUS_BAD_REQUEST;
     std::string code;
     std::string msg;
   };
@@ -81,7 +83,9 @@ namespace ccf
     ERROR(UnsupportedHttpVerb)
     ERROR(UnsupportedContentType)
     ERROR(RequestBodyTooLarge)
+    ERROR(RequestTargetTooLong)
     ERROR(RequestHeaderTooLarge)
+    ERROR(PreconditionFailed)
 
     // CCF-specific errors
     // client-facing:
@@ -97,6 +101,7 @@ namespace ccf
     ERROR(TransactionNotFound)
     ERROR(TransactionCommitAttemptsExceedLimit)
     ERROR(TransactionReplicationFailed)
+    ERROR(TransactionTooLarge)
     ERROR(UnknownCertificate)
     ERROR(VoteNotFound)
     ERROR(VoteAlreadyExists)
@@ -104,7 +109,9 @@ namespace ccf
     ERROR(TransactionPendingOrUnknown)
     ERROR(TransactionInvalid)
     ERROR(PrimaryNotFound)
+    ERROR(BackupNotFound)
     ERROR(RequestAlreadyForwarded)
+    ERROR(ForwardingTimeout)
     ERROR(NodeNotRetiredCommitted)
     ERROR(SessionConsistencyLost)
     ERROR(ExecutorDispatchFailed)
@@ -115,6 +122,7 @@ namespace ccf
     ERROR(TooManyPendingTransactions)
     ERROR(MissingApiVersionParameter)
     ERROR(UnsupportedApiVersionValue)
+    ERROR(EmptyFile)
 
     // node-to-node (/join and /create):
     ERROR(ConsensusTypeMismatch)

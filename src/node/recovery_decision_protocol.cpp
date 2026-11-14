@@ -1,0 +1,920 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+
+#include "node/recovery_decision_protocol.h"
+
+#include "ccf/crypto/verifier.h"
+#include "ccf/ds/locking.h"
+#include "ccf/service/tables/nodes.h"
+#include "ccf/service/tables/self_healing_open.h"
+#include "ccf/tx.h"
+#include "ccf/tx_id.h"
+#include "http_client/curl.h"
+#include "node_state.h"
+#include "tasks/basic_task.h"
+#include "tasks/task_system.h"
+
+#include <atomic>
+#include <cstdlib>
+#include <source_location>
+#include <stdexcept>
+#include <string_view>
+#include <tuple>
+
+namespace ccf
+{
+  namespace
+  {
+    constexpr auto recovery_trace_marker = "RDP_TRACE";
+
+    // Sends are only made by the retry task. Each invocation tags its sends
+    // with a new batch, so that concurrent invocations can be told apart, and
+    // with the version of the sm_state value it read.
+    thread_local uint64_t current_trace_batch = 0;
+    thread_local ccf::kv::Version current_trace_pre_version = 0;
+
+    // Tracing is enabled by setting the CCF_RECOVERY_TRACE environment variable
+    // to a non-empty value. It is read once, on first use.
+    bool tracing_enabled()
+    {
+      static const bool enabled = []() {
+        // NOLINTNEXTLINE(concurrency-mt-unsafe)
+        const char* value = std::getenv("CCF_RECOVERY_TRACE");
+        return value != nullptr && !std::string_view(value).empty();
+      }();
+      return enabled;
+    }
+
+    // All trace work runs through here, so that it is skipped unless tracing
+    // is enabled. Tracing only observes the protocol, so trace failures are
+    // logged, with the calling line, and never propagated to the protocol code
+    // being traced
+    template <typename F>
+    void trace_safely(
+      F&& f,
+      std::source_location caller = std::source_location::current()) noexcept
+    {
+      if (!tracing_enabled())
+      {
+        return;
+      }
+      try
+      {
+        std::forward<F>(f)();
+      }
+      catch (const std::exception& e)
+      {
+        LOG_FAIL_FMT(
+          "Failed to trace recovery-decision-protocol at line {}: {}",
+          caller.line(),
+          e.what());
+      }
+      catch (...)
+      {
+        LOG_FAIL_FMT(
+          "Failed to trace recovery-decision-protocol at line {}",
+          caller.line());
+      }
+    }
+  }
+
+  RecoveryDecisionProtocolSubsystem::RecoveryDecisionProtocolSubsystem(
+    NodeState* node_state_) :
+    node_state(node_state_)
+  {}
+
+  void RecoveryDecisionProtocolSubsystem::emit_trace(nlohmann::json&& record)
+  {
+    static std::atomic<uint64_t> next_trace_sequence = 0;
+    record["node"] = get_location().name;
+    record["sequence"] = next_trace_sequence.fetch_add(1);
+    LOG_INFO_FMT("{} {}", recovery_trace_marker, record.dump());
+  }
+
+  void RecoveryDecisionProtocolSubsystem::record_trace_send(
+    const std::string& message,
+    const sealing_recovery::Name& target,
+    const nlohmann::json& request) noexcept
+  {
+    trace_safely([&]() {
+      nlohmann::json record = {
+        {"kind", "send"},
+        {"batch", current_trace_batch},
+        {"pre_version", current_trace_pre_version},
+        {"message", message},
+        {"target", target}};
+      // A gossip's TxID is the only message content in the Lean model
+      if (message == "gossip")
+      {
+        record["txid"] = request.at("txid");
+      }
+      emit_trace(std::move(record));
+    });
+  }
+
+  void RecoveryDecisionProtocolSubsystem::prepare_trace_step(
+    ccf::RpcContext& rpc_ctx,
+    const char* kind,
+    std::string_view source,
+    std::optional<ccf::TxID> txid,
+    const recovery_decision_protocol::AdvanceTrace& trace) noexcept
+  {
+    trace_safely([&]() {
+      rpc_ctx.set_user_data(nullptr);
+      auto record = std::make_shared<nlohmann::json>(trace);
+      (*record)["kind"] = kind;
+      if (!source.empty())
+      {
+        (*record)["source"] = source;
+      }
+      if (txid.has_value())
+      {
+        (*record)["txid"] = txid.value();
+      }
+      rpc_ctx.set_user_data(record);
+    });
+  }
+
+  void RecoveryDecisionProtocolSubsystem::trace_committed_step(
+    ccf::endpoints::CommandEndpointContext& ctx, const ccf::TxID& txid) noexcept
+  {
+    trace_safely([&]() {
+      auto* record = static_cast<nlohmann::json*>(ctx.rpc_ctx->get_user_data());
+      if (record == nullptr)
+      {
+        throw std::logic_error("No execution was prepared for this commit");
+      }
+      // CCF reports the commit TxID of a transaction that wrote, and the TxID
+      // it read at otherwise
+      (*record)["version"] = txid.seqno;
+      emit_trace(std::move(*record));
+    });
+  }
+
+  void RecoveryDecisionProtocolSubsystem::reset_state(ccf::kv::Tx& tx)
+  {
+    // Clear any previous state
+    tx.rw<recovery_decision_protocol::SMState>(
+        Tables::RECOVERY_DECISION_PROTOCOL_SM_STATE)
+      ->clear();
+    tx.rw<recovery_decision_protocol::TimeoutSMState>(
+        Tables::RECOVERY_DECISION_PROTOCOL_TIMEOUT_SM_STATE)
+      ->clear();
+    tx.rw<recovery_decision_protocol::NodeInfoMap>(
+        Tables::RECOVERY_DECISION_PROTOCOL_NODES)
+      ->clear();
+    tx.rw<recovery_decision_protocol::Gossips>(
+        Tables::RECOVERY_DECISION_PROTOCOL_GOSSIPS)
+      ->clear();
+    tx.rw<recovery_decision_protocol::ChosenNode>(
+        Tables::RECOVERY_DECISION_PROTOCOL_CHOSEN_NODE)
+      ->clear();
+    tx.rw<recovery_decision_protocol::Votes>(
+        Tables::RECOVERY_DECISION_PROTOCOL_VOTES)
+      ->clear();
+    tx.rw<recovery_decision_protocol::OpenKind>(
+        Tables::RECOVERY_DECISION_PROTOCOL_OPEN_KIND)
+      ->clear();
+  }
+
+  void RecoveryDecisionProtocolSubsystem::try_start(
+    ccf::kv::Tx& tx, bool recovering)
+  {
+    if (!node_state->config.sealing_recovery.has_value())
+    {
+      LOG_INFO_FMT("Recovery-decision-protocol not configured, skipping");
+      return;
+    }
+    auto& config =
+      node_state->config.sealing_recovery->recovery_decision_protocol;
+    if (!recovering || !config.has_value())
+    {
+      LOG_INFO_FMT("Skipping recovery-decision-protocol");
+      return;
+    }
+
+    LOG_INFO_FMT("Starting recovery-decision-protocol");
+
+    tx.rw<recovery_decision_protocol::SMState>(
+        Tables::RECOVERY_DECISION_PROTOCOL_SM_STATE)
+      ->put(recovery_decision_protocol::StateMachine::GOSSIPING);
+    tx.rw<recovery_decision_protocol::TimeoutSMState>(
+        Tables::RECOVERY_DECISION_PROTOCOL_TIMEOUT_SM_STATE)
+      ->put(recovery_decision_protocol::StateMachine::GOSSIPING);
+
+    // Delay start of message retry and failover timers until after commit
+    node_state->network.tables->set_global_hook(
+      Tables::RECOVERY_DECISION_PROTOCOL_SM_STATE,
+      recovery_decision_protocol::SMState::wrap_commit_hook(
+        [this](
+          ccf::kv::Version hook_version,
+          const recovery_decision_protocol::SMState::Write& w) {
+          if (
+            w.has_value() &&
+            w.value() == recovery_decision_protocol::StateMachine::GOSSIPING)
+          {
+            trace_safely([&]() {
+              nlohmann::json expected_locations = nlohmann::json::array();
+              for (const auto& location : get_config().expected_locations)
+              {
+                expected_locations.push_back(location.name);
+              }
+              emit_trace(
+                {{"kind", "start"},
+                 {"version", hook_version},
+                 {"expected_locations", expected_locations}});
+            });
+            start_message_retry_timers();
+            start_failover_timers();
+          }
+        }));
+  }
+
+  void RecoveryDecisionProtocolSubsystem::advance(
+    ccf::kv::Tx& tx,
+    bool timeout,
+    recovery_decision_protocol::AdvanceTrace& trace)
+  {
+    auto& config = get_config();
+
+    auto* sm_state_handle = tx.rw<recovery_decision_protocol::SMState>(
+      Tables::RECOVERY_DECISION_PROTOCOL_SM_STATE);
+    auto* timeout_state_handle =
+      tx.rw<recovery_decision_protocol::TimeoutSMState>(
+        Tables::RECOVERY_DECISION_PROTOCOL_TIMEOUT_SM_STATE);
+
+    auto sm_state_opt = sm_state_handle->get();
+    auto timeout_state_opt = timeout_state_handle->get();
+    if ((!sm_state_opt.has_value()) || (!timeout_state_opt.has_value()))
+    {
+      throw std::logic_error(
+        "Recovery-decision-protocol state not set, cannot advance protocol");
+    }
+    auto& sm_state = sm_state_opt.value();
+    auto& timeout_state = timeout_state_opt.value();
+    trace.pre = sm_state;
+    trace.pre_timeout = timeout_state;
+    trace.post = sm_state;
+    trace.post_timeout = timeout_state;
+
+    // Protocol state is written through these, so that the trace records each
+    // write
+    auto put_sm_state = [&](recovery_decision_protocol::StateMachine state) {
+      sm_state_handle->put(state);
+      trace.post = state;
+    };
+    auto put_timeout_state =
+      [&](recovery_decision_protocol::StateMachine state) {
+        timeout_state_handle->put(state);
+        trace.post_timeout = state;
+      };
+    auto put_chosen_node = [&](const sealing_recovery::Name& chosen) {
+      tx.rw<recovery_decision_protocol::ChosenNode>(
+          Tables::RECOVERY_DECISION_PROTOCOL_CHOSEN_NODE)
+        ->put(chosen);
+      trace.chosen = chosen;
+    };
+    auto put_open_kind = [&](recovery_decision_protocol::OpenKinds open_kind) {
+      tx.rw<recovery_decision_protocol::OpenKind>(
+          Tables::RECOVERY_DECISION_PROTOCOL_OPEN_KIND)
+        ->put(open_kind);
+      trace.open_kind = open_kind;
+    };
+
+    bool valid_timeout = timeout && sm_state == timeout_state;
+
+    // Advance recovery-decision-protocol SM
+    switch (sm_state)
+    {
+      case recovery_decision_protocol::StateMachine::GOSSIPING:
+      {
+        auto* gossip_handle = tx.ro<recovery_decision_protocol::Gossips>(
+          Tables::RECOVERY_DECISION_PROTOCOL_GOSSIPS);
+        auto quorum_size = config.expected_locations.size();
+        if (gossip_handle->size() >= quorum_size || valid_timeout)
+        {
+          if (gossip_handle->size() == 0)
+          {
+            throw std::logic_error("No gossip addresses provided yet");
+          }
+
+          // Find the lexographical maximum by <view, seqno, name>
+          std::optional<std::tuple<ccf::View, ccf::SeqNo, std::string>> maximum;
+          gossip_handle->foreach([&maximum](const auto& iid, const auto& txid) {
+            if (
+              !maximum.has_value() ||
+              maximum.value() < std::make_tuple(txid.view, txid.seqno, iid))
+            {
+              maximum = std::make_tuple(txid.view, txid.seqno, iid);
+            }
+            return true;
+          });
+
+          if (!maximum.has_value())
+          {
+            throw std::logic_error("No valid gossip addresses provided");
+          }
+          put_chosen_node(std::get<2>(maximum.value()));
+
+          put_sm_state(recovery_decision_protocol::StateMachine::VOTING);
+        }
+        break;
+      }
+      case recovery_decision_protocol::StateMachine::VOTING:
+      {
+        auto* votes = tx.rw<recovery_decision_protocol::Votes>(
+          Tables::RECOVERY_DECISION_PROTOCOL_VOTES);
+
+        auto sufficient_quorum =
+          votes->size() >= config.expected_locations.size() / 2 + 1;
+        if (sufficient_quorum || valid_timeout)
+        {
+          if (valid_timeout && votes->size() == 0)
+          {
+            // If we have voted for another node, that node is better placed
+            // than ourselves to begin operating
+            // So we do not attempt to open the service ourselves
+            LOG_FAIL_FMT(
+              "Recovery-decision-protocol timeout without any votes for "
+              "ourselves, "
+              "skipping opening network");
+            return;
+          }
+
+          auto timeout_used = valid_timeout && !sufficient_quorum;
+          if (timeout_used)
+          {
+            put_open_kind(recovery_decision_protocol::OpenKinds::FAILOVER);
+            LOG_INFO_FMT(
+              "Recovery-decision-protocol succeeded on the failover path");
+          }
+          else
+          {
+            put_open_kind(recovery_decision_protocol::OpenKinds::QUORUM);
+            LOG_INFO_FMT(
+              "Recovery-decision-protocol succeeded on the quorum path");
+          }
+
+          auto* service = tx.ro<Service>(Tables::SERVICE);
+          auto service_info = service->get();
+          if (!service_info.has_value())
+          {
+            throw std::logic_error(
+              "Service information cannot be found to transition service to "
+              "open");
+          }
+          const auto prev_ident =
+            tx.ro<PreviousServiceIdentity>(Tables::PREVIOUS_SERVICE_IDENTITY)
+              ->get();
+          AbstractGovernanceEffects::ServiceIdentities identities{
+            .previous = prev_ident, .next = service_info->cert};
+
+          put_sm_state(recovery_decision_protocol::StateMachine::OPENING);
+
+          node_state->transition_service_to_open(tx, identities);
+        }
+        break;
+      }
+      case recovery_decision_protocol::StateMachine::JOINING:
+      {
+        auto chosen_replica =
+          tx.ro<recovery_decision_protocol::ChosenNode>(
+              Tables::RECOVERY_DECISION_PROTOCOL_CHOSEN_NODE)
+            ->get();
+        if (!chosen_replica.has_value())
+        {
+          throw std::logic_error(
+            "Recovery-decision-protocol chosen node not set, cannot join");
+        }
+        auto node_config = tx.ro<recovery_decision_protocol::NodeInfoMap>(
+                               Tables::RECOVERY_DECISION_PROTOCOL_NODES)
+                             ->get(chosen_replica.value());
+        if (!node_config.has_value())
+        {
+          throw std::logic_error(fmt::format(
+            "Recovery-decision-protocol chosen node {} not found",
+            chosen_replica.value()));
+        }
+
+        LOG_INFO_FMT(
+          "Recovery-decision-protocol joining {} at {} with fingerprint {}",
+          node_config->location.name,
+          node_config->location.address,
+          recovery_decision_protocol::service_fingerprint_from_pem(
+            ccf::crypto::cert_der_to_pem(node_config->service_cert_der)));
+        auto service_cert =
+          ccf::crypto::cert_der_to_pem(node_config->service_cert_der);
+        LOG_INFO_FMT("{}", service_cert.str());
+
+        trace.restart = true;
+        trace.chosen = chosen_replica;
+        node_state->request_restart();
+      }
+      case recovery_decision_protocol::StateMachine::OPENING:
+      {
+        if (valid_timeout)
+        {
+          put_sm_state(recovery_decision_protocol::StateMachine::OPEN);
+        }
+        break;
+      }
+      case recovery_decision_protocol::StateMachine::OPEN:
+      {
+        // Nothing to do here, we are already opening or open or joining
+        break;
+      }
+      default:
+      {
+        throw std::logic_error(fmt::format(
+          "Unknown recovery-decision-protocol state: {}",
+          static_cast<int>(sm_state)));
+      }
+    }
+
+    // Advance timeout SM
+    if (timeout)
+    {
+      switch (timeout_state)
+      {
+        case recovery_decision_protocol::StateMachine::GOSSIPING:
+        {
+          LOG_TRACE_FMT("Advancing timeout SM to VOTING");
+          put_timeout_state(recovery_decision_protocol::StateMachine::VOTING);
+          break;
+        }
+        case recovery_decision_protocol::StateMachine::VOTING:
+        {
+          LOG_TRACE_FMT("Advancing timeout SM to OPENING");
+          put_timeout_state(recovery_decision_protocol::StateMachine::OPENING);
+          break;
+        }
+        case recovery_decision_protocol::StateMachine::OPENING:
+        case recovery_decision_protocol::StateMachine::JOINING:
+        case recovery_decision_protocol::StateMachine::OPEN:
+        default:
+        {
+          LOG_TRACE_FMT("Timeout SM complete");
+        }
+      }
+    }
+  }
+
+  void RecoveryDecisionProtocolSubsystem::start_message_retry_timers()
+  {
+    LOG_TRACE_FMT("Recovery-decision-protocol: Setting up retry timers");
+
+    auto& config = get_config();
+
+    retry_task = ccf::tasks::make_basic_task(
+      [this]() {
+        if (!node_state->config.sealing_recovery.has_value())
+        {
+          LOG_INFO_FMT(
+            "Recovery-decision-protocol not configured, skipping retry timers");
+          return;
+        }
+        auto& config =
+          node_state->config.sealing_recovery->recovery_decision_protocol;
+        if (!config.has_value())
+        {
+          throw std::logic_error("Recovery-decision-protocol not configured");
+        }
+
+        auto tx = node_state->network.tables->create_read_only_tx();
+        auto* sm_state_handle = tx.ro<recovery_decision_protocol::SMState>(
+          Tables::RECOVERY_DECISION_PROTOCOL_SM_STATE);
+
+        auto sm_state_opt = sm_state_handle->get();
+        if (!sm_state_opt.has_value())
+        {
+          throw std::logic_error(
+            "Recovery-decision-protocol state not set, cannot retry protocol");
+        }
+        auto& sm_state = sm_state_opt.value();
+        trace_safely([&]() {
+          static std::atomic<uint64_t> next_trace_batch = 0;
+          current_trace_batch = next_trace_batch.fetch_add(1);
+          current_trace_pre_version =
+            sm_state_handle->get_version_of_previous_write().value();
+        });
+
+        // Stop if recovery-decision-protocol is complete
+        if (sm_state == recovery_decision_protocol::StateMachine::OPEN)
+        {
+          LOG_INFO_FMT(
+            "Recovery-decision-protocol complete, stopping retry timers.");
+          stop_timers();
+          return;
+        }
+
+        switch (sm_state)
+        {
+          case recovery_decision_protocol::StateMachine::GOSSIPING:
+          {
+            send_gossip_unsafe(tx);
+            break;
+          }
+          case recovery_decision_protocol::StateMachine::VOTING:
+          {
+            auto* node_info_handle =
+              tx.ro<recovery_decision_protocol::NodeInfoMap>(
+                Tables::RECOVERY_DECISION_PROTOCOL_NODES);
+            auto* chosen_replica_handle =
+              tx.ro<recovery_decision_protocol::ChosenNode>(
+                Tables::RECOVERY_DECISION_PROTOCOL_CHOSEN_NODE);
+            if (!chosen_replica_handle->get().has_value())
+            {
+              throw std::logic_error(
+                "Recovery-decision-protocol chosen node not set, cannot vote");
+            }
+            auto chosen_node_info =
+              node_info_handle->get(chosen_replica_handle->get().value());
+            if (!chosen_node_info.has_value())
+            {
+              throw std::logic_error(fmt::format(
+                "Recovery-decision-protocol chosen node {} not found",
+                chosen_replica_handle->get().value()));
+            }
+            send_vote_unsafe(tx, chosen_node_info.value());
+            // keep gossiping to allow lagging nodes to eventually vote
+            send_gossip_unsafe(tx);
+            break;
+          }
+          case recovery_decision_protocol::StateMachine::OPENING:
+          {
+            send_iamopen_unsafe(tx);
+            break;
+          }
+          case recovery_decision_protocol::StateMachine::JOINING:
+          case recovery_decision_protocol::StateMachine::OPEN:
+          {
+            stop_timers();
+            return;
+          }
+          default:
+          {
+            throw std::logic_error(fmt::format(
+              "Unknown recovery-decision-protocol state: {}",
+              static_cast<int>(sm_state)));
+          }
+        }
+      },
+      "RecoveryDecisionProtocolRetry");
+
+    ccf::tasks::add_periodic_task(
+      retry_task,
+      std::chrono::milliseconds(0),
+      std::chrono::milliseconds(config.message_retry_timeout));
+  }
+
+  void RecoveryDecisionProtocolSubsystem::start_failover_timers()
+  {
+    auto& config = get_config();
+
+    if (config.failover_timeout.count_ms() == 0)
+    {
+      LOG_DEBUG_FMT(
+        "Recovery-decision-protocol failover timeout disabled, skipping "
+        "failover timers");
+      return;
+    }
+
+    LOG_TRACE_FMT("Recovery-decision-protocol: Setting up failover timers");
+
+    failover_task = ccf::tasks::make_basic_task(
+      [this]() {
+        auto& location = get_location();
+
+        LOG_TRACE_FMT(
+          "Recovery-decision-protocol timeout, sending timeout to internal "
+          "handlers");
+
+        // Stop the timer if the node has completed its
+        // recovery-decision-protocol
+        auto tx = node_state->network.tables->create_read_only_tx();
+        auto* sm_state_handle = tx.ro<recovery_decision_protocol::SMState>(
+          Tables::RECOVERY_DECISION_PROTOCOL_SM_STATE);
+        if (!sm_state_handle->get().has_value())
+        {
+          throw std::logic_error(
+            "Recovery-decision-protocol state not set, cannot retry protocol");
+        }
+        auto sm_state = sm_state_handle->get().value();
+        if (sm_state == recovery_decision_protocol::StateMachine::OPEN)
+        {
+          LOG_INFO_FMT(
+            "Recovery-decision-protocol complete, stopping failover timers.");
+          stop_timers();
+          return;
+        }
+
+        // Send a timeout to the internal handlers
+        http_client::UniqueCURL curl_handle;
+
+        const auto cert = node_state->get_self_signed_certificate();
+        const auto privkey_pem = node_state->node_sign_kp->private_key_pem();
+
+        curl_handle.set_opt(CURLOPT_SSL_VERIFYHOST, 0L);
+        curl_handle.set_opt(CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_handle.set_opt(CURLOPT_SSL_VERIFYSTATUS, 0L);
+
+        curl_handle.set_blob_opt(
+          CURLOPT_SSLCERT_BLOB, cert.data(), cert.size());
+        curl_handle.set_opt(CURLOPT_SSLCERTTYPE, "PEM");
+
+        curl_handle.set_blob_opt(
+          CURLOPT_SSLKEY_BLOB, privkey_pem.data(), privkey_pem.size());
+        curl_handle.set_opt(CURLOPT_SSLKEYTYPE, "PEM");
+
+        auto url = fmt::format(
+          "https://{}/{}/recovery_decision_protocol/timeout",
+          location.address,
+          get_actor_prefix(ActorsType::nodes));
+
+        http_client::UniqueSlist headers;
+        headers.append("Content-Type: application/json");
+
+        auto curl_request = std::make_unique<http_client::CurlRequest>(
+          std::move(curl_handle),
+          HTTP_PUT,
+          std::move(url),
+          std::move(headers),
+          nullptr,
+          nullptr,
+          std::nullopt);
+        http_client::CurlmLibuvContextSingleton::get_instance()->attach_request(
+          std::move(curl_request));
+      },
+      "RecoveryDecisionProtocolFailover");
+
+    ccf::tasks::add_periodic_task(
+      failover_task,
+      std::chrono::milliseconds(config.failover_timeout),
+      std::chrono::milliseconds(config.failover_timeout));
+  }
+
+  void RecoveryDecisionProtocolSubsystem::stop_timers()
+  {
+    if (retry_task)
+    {
+      retry_task->cancel_task();
+      retry_task = nullptr;
+    }
+    if (failover_task)
+    {
+      failover_task->cancel_task();
+      failover_task = nullptr;
+    }
+  }
+
+  void RecoveryDecisionProtocolSubsystem::dispatch_authenticated_message(
+    const nlohmann::json& request,
+    const sealing_recovery::Location& target,
+    const std::string& endpoint,
+    const crypto::Pem& self_signed_node_cert,
+    const crypto::Pem& privkey_pem)
+  {
+    record_trace_send(endpoint, target.name, request);
+
+    http_client::UniqueCURL curl_handle;
+
+    // disable SSL verification as no confidential information is sent
+    curl_handle.set_opt(CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_handle.set_opt(CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_handle.set_opt(CURLOPT_SSL_VERIFYSTATUS, 0L);
+
+    curl_handle.set_blob_opt(
+      CURLOPT_SSLCERT_BLOB,
+      self_signed_node_cert.data(),
+      self_signed_node_cert.size());
+    curl_handle.set_opt(CURLOPT_SSLCERTTYPE, "PEM");
+
+    curl_handle.set_blob_opt(
+      CURLOPT_SSLKEY_BLOB, privkey_pem.data(), privkey_pem.size());
+    curl_handle.set_opt(CURLOPT_SSLKEYTYPE, "PEM");
+
+    auto url = fmt::format(
+      "https://{}/{}/recovery_decision_protocol/{}",
+      target.address,
+      get_actor_prefix(ActorsType::nodes),
+      endpoint);
+
+    http_client::UniqueSlist headers;
+    headers.append("Content-Type", "application/json");
+
+    auto body = std::make_unique<http_client::RequestBody>(request);
+
+    auto response_callback =
+      [](
+        std::unique_ptr<ccf::http_client::CurlRequest>&& request,
+        CURLcode curl_code,
+        long status_code) {
+        LOG_TRACE_FMT(
+          "Response received for {} to {}: curl_result {} ({}), status code {}",
+          request->get_method().c_str(),
+          request->get_url(),
+          curl_easy_strerror(curl_code),
+          curl_code,
+          status_code);
+      };
+
+    auto curl_request = std::make_unique<http_client::CurlRequest>(
+      std::move(curl_handle),
+      HTTP_PUT,
+      std::move(url),
+      std::move(headers),
+      std::move(body),
+      nullptr,
+      std::move(response_callback));
+
+    LOG_TRACE_FMT(
+      "Dispatching attested {} message to {}",
+      curl_request->get_method().c_str(),
+      curl_request->get_url());
+
+    http_client::CurlmLibuvContextSingleton::get_instance()->attach_request(
+      std::move(curl_request));
+  }
+
+  recovery_decision_protocol::RequestNodeInfo&
+  RecoveryDecisionProtocolSubsystem::get_node_info(kv::ReadOnlyTx& tx)
+  {
+    std::lock_guard<ds::Mutex> guard(recovery_decision_protocol_lock);
+
+    if (node_info_cache.has_value())
+    {
+      return node_info_cache.value();
+    }
+
+    auto* nodes_handle = tx.ro<Nodes>(Tables::NODES);
+    auto node_info_opt = nodes_handle->get(node_state->get_node_id());
+    if (!node_info_opt.has_value())
+    {
+      throw std::logic_error(fmt::format(
+        "Node {} not found in nodes table", node_state->get_node_id()));
+    }
+    {
+      std::lock_guard<ds::Mutex> ns_guard(node_state->lock);
+      node_info_cache = recovery_decision_protocol::RequestNodeInfo{
+        .quote_info = node_info_opt->quote_info,
+        .location = get_location(),
+        .service_cert_der =
+          ccf::crypto::cert_pem_to_der(node_state->network.identity->cert),
+      };
+    }
+    return node_info_cache.value();
+  }
+
+  void RecoveryDecisionProtocolSubsystem::send_gossip_unsafe(kv::ReadOnlyTx& tx)
+  {
+    auto& config = get_config();
+
+    LOG_TRACE_FMT("Broadcasting recovery-decision-protocol gossip");
+
+    recovery_decision_protocol::GossipRequest request;
+    request.info = get_node_info(tx);
+    request.txid = get_last_recovered_signed_txid();
+    nlohmann::json request_json = request;
+    const auto self_signed_node_cert =
+      node_state->get_self_signed_certificate();
+    const auto node_private_key = node_state->node_sign_kp->private_key_pem();
+
+    for (auto& target : config.expected_locations)
+    {
+      dispatch_authenticated_message(
+        request_json,
+        target,
+        "gossip",
+        self_signed_node_cert,
+        node_private_key);
+    }
+  }
+
+  void RecoveryDecisionProtocolSubsystem::send_vote_unsafe(
+    kv::ReadOnlyTx& tx, const recovery_decision_protocol::NodeInfo& node_info)
+  {
+    LOG_TRACE_FMT(
+      "Sending recovery-decision-protocol vote to {} at {}",
+      node_info.location.name,
+      node_info.location.address);
+
+    recovery_decision_protocol::TaggedWithNodeInfo request{
+      .info = get_node_info(tx)};
+    nlohmann::json request_json = request;
+    const auto self_signed_node_cert =
+      node_state->get_self_signed_certificate();
+
+    dispatch_authenticated_message(
+      request_json,
+      node_info.location,
+      "vote",
+      self_signed_node_cert,
+      node_state->node_sign_kp->private_key_pem());
+  }
+
+  recovery_decision_protocol::IAmOpenRequest&
+  RecoveryDecisionProtocolSubsystem::get_iamopen_request(kv::ReadOnlyTx& tx)
+  {
+    {
+      std::lock_guard<ds::Mutex> guard(recovery_decision_protocol_lock);
+      if (iamopen_request_cache.has_value())
+      {
+        return iamopen_request_cache.value();
+      }
+    }
+
+    auto previous_service_cert =
+      tx.ro(node_state->network.previous_service_identity)->get();
+    if (!previous_service_cert.has_value())
+    {
+      throw std::logic_error(
+        "Previous service identity not found in table but expected as "
+        "recovering");
+    }
+    auto previous_service_identity_fingerprint =
+      recovery_decision_protocol::service_fingerprint_from_pem(
+        previous_service_cert.value());
+
+    auto& node_info = get_node_info(tx);
+
+    {
+      std::lock_guard<ds::Mutex> guard(recovery_decision_protocol_lock);
+      iamopen_request_cache = recovery_decision_protocol::IAmOpenRequest{};
+      iamopen_request_cache->info = node_info;
+      iamopen_request_cache->prev_service_fingerprint =
+        previous_service_identity_fingerprint;
+      iamopen_request_cache->txid = get_last_recovered_signed_txid();
+    }
+
+    return iamopen_request_cache.value();
+  }
+
+  void RecoveryDecisionProtocolSubsystem::send_iamopen_unsafe(
+    ccf::kv::ReadOnlyTx& tx)
+  {
+    auto& config = get_config();
+    auto& location = get_location();
+
+    LOG_TRACE_FMT("Sending recovery-decision-protocol iamopen");
+
+    nlohmann::json request_json = get_iamopen_request(tx);
+    const auto self_signed_node_cert =
+      node_state->get_self_signed_certificate();
+    const auto node_private_key = node_state->node_sign_kp->private_key_pem();
+
+    for (auto& target : config.expected_locations)
+    {
+      if (target.name == location.name)
+      {
+        // Don't send to self
+        continue;
+      }
+      dispatch_authenticated_message(
+        request_json,
+        target,
+        "iamopen",
+        self_signed_node_cert,
+        node_private_key);
+    }
+  }
+
+  RecoveryDecisionProtocolConfig& RecoveryDecisionProtocolSubsystem::
+    get_config()
+  {
+    if (!node_state->config.sealing_recovery.has_value())
+    {
+      throw std::logic_error("Sealing recovery not configured");
+    }
+    auto& config =
+      node_state->config.sealing_recovery->recovery_decision_protocol;
+    if (!config.has_value())
+    {
+      throw std::logic_error("Recovery-decision-protocol not configured");
+    }
+    return config.value();
+  }
+
+  sealing_recovery::Location& RecoveryDecisionProtocolSubsystem::get_location()
+  {
+    if (!node_state->config.sealing_recovery.has_value())
+    {
+      throw std::logic_error("Sealing recovery not configured");
+    }
+    return node_state->config.sealing_recovery->location;
+  }
+
+  ccf::TxID RecoveryDecisionProtocolSubsystem::get_last_recovered_signed_txid()
+  {
+    auto recovery_seqno = node_state->last_recovered_signed_idx;
+    auto recovery_view = node_state->consensus->get_view(recovery_seqno);
+    // get_view returns VIEW_UNKNOWN=InvalidView if the view is not in the view
+    // history (too old or too new)
+    if (recovery_view == ccf::VIEW_UNKNOWN)
+    {
+      throw std::logic_error(fmt::format(
+        "Could not find view for last recovered signed seqno {}",
+        recovery_seqno));
+    }
+    return ccf::TxID{recovery_view, recovery_seqno};
+  }
+}

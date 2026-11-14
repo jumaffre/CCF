@@ -21,7 +21,7 @@ namespace http
       stream_id(stream_id)
     {}
 
-    http2::StreamId get_stream_id() const
+    [[nodiscard]] http2::StreamId get_stream_id() const
     {
       return stream_id;
     }
@@ -33,6 +33,14 @@ namespace http
     RequestPayloadTooLargeException(
       const std::string& msg, http2::StreamId stream_id = 0) :
       RequestTooLargeException(msg, stream_id)
+    {}
+  };
+
+  class RequestTargetTooLongException : public RequestTooLargeException
+  {
+  public:
+    explicit RequestTargetTooLongException(const std::string& msg) :
+      RequestTooLargeException(msg)
     {}
   };
 

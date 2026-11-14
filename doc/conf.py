@@ -16,14 +16,15 @@
 #
 import os
 import sys
+import shutil
 import subprocess
 import pathlib
 import re
 
 from docutils import nodes
 
-# To import generate_config_rst
-sys.path.insert(0, os.path.abspath("."))
+# Import local documentation helpers, also when using multiversion sources.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import generate_config_rst
 
@@ -31,8 +32,8 @@ import generate_config_rst
 # -- Project information -----------------------------------------------------
 
 project = "CCF"
-copyright = "2018, Microsoft Research"
-author = "Microsoft Research"
+copyright = "Microsoft"
+author = "Microsoft"
 
 # The short X.Y version
 version = ""
@@ -55,16 +56,17 @@ extensions = [
     "sphinx.ext.ifconfig",
     "sphinx.ext.viewcode",
     "breathe",
-    "sphinxcontrib.mermaid",
+    "sphinx_pele",
     "sphinx.ext.autosectionlabel",
     "sphinx.ext.githubpages",
     "sphinx_multiversion",
     "sphinx_copybutton",
     "sphinx.ext.autodoc",
     "sphinxcontrib.openapi",
-    "sphinx_panels",
+    "sphinx_design",
     "sphinx.ext.extlinks",
     "sphinx_inline_tabs",
+    "rustdoc",
 ]
 
 autosectionlabel_prefix_document = True
@@ -105,6 +107,9 @@ linkcheck_ignore = [
     r"https://github.com/.*#",
     r"../js/ccf-app.*",
     r"../doxygen/index.html",
+    r"../trace-viewer/index.html",
+    # The rustdoc role checks generated pages and anchors during HTML builds.
+    r"(?:\.\./)*rust/ccf_app/.*",
     r"https://nghttp2.org/.*",
     r"https://www.w3.org/Protocols/rfc2616/.*",
 ]
@@ -122,8 +127,33 @@ html_theme = "furo"
 # documentation.
 #
 html_theme_options = {
-    "light_logo": "ccf.svg",
-    "dark_logo": "ccf.svg",
+    "source_repository": "https://github.com/microsoft/CCF/",
+    "source_directory": "doc/",
+    "footer_icons": [
+        {
+            "name": "GitHub",
+            "url": "https://github.com/microsoft/CCF",
+            "html": """
+                <svg stroke="currentColor" fill="currentColor" stroke-width="0" viewBox="0 0 16 16">
+                  <path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"></path>
+                </svg>
+            """,
+            "class": "",
+        }
+    ],
+    # Dimmed slate dark mode, lighter than Furo's default near-black, so that
+    # diagrams with transparent backgrounds read well in both modes
+    "dark_css_variables": {
+        "color-background-primary": "#1e232b",
+        "color-background-secondary": "#252b34",
+        "color-background-hover": "#2c333dff",
+        "color-background-hover--transparent": "#2c333d00",
+        "color-background-border": "#39414c",
+        "color-background-item": "#4a5360",
+        "color-foreground-muted": "#8f949b",
+        "color-admonition-background": "#232932",
+        "color-card-background": "#232932",
+    },
 }
 
 # Add any paths that contain custom static files (such as style sheets) here,
@@ -175,9 +205,7 @@ latex_elements = {
 # Grouping the document tree into LaTeX files. List of tuples
 # (source start file, target name, title,
 #  author, documentclass [howto, manual, or own class]).
-latex_documents = [
-    (master_doc, "CCF.tex", "CCF Documentation", "Microsoft Research", "manual")
-]
+latex_documents = [(master_doc, "CCF.tex", "CCF Documentation", "Microsoft", "manual")]
 
 
 # -- Options for manual page output ------------------------------------------
@@ -199,7 +227,7 @@ texinfo_documents = [
         "CCF Documentation",
         author,
         "CCF",
-        "One line description of project.",
+        "Confidential Consortium Framework documentation.",
         "Miscellaneous",
     )
 ]
@@ -220,16 +248,23 @@ breathe_default_project = "CCF"
 
 # Set up multiversion extension
 
-smv_tag_whitelist = None
-smv_branch_whitelist = r"^(main)|(release\/([3-9]|\d\d\d*)\.x)$"
+smv_tag_whitelist = r'(?!.*)' # Match nothing, build no tags. Docs suggest using None, but this produces a Warning
+smv_branch_whitelist = r"^(main)|(release\/([7-9]|\d\d\d*)\.x)$"
 smv_remote_whitelist = None
 smv_outputdir_format = "{ref.name}"
 
 assert re.match(smv_branch_whitelist, "main")
-assert not re.match(smv_branch_whitelist, "release/1.x")
+assert not re.match(smv_branch_whitelist, "release/not-a-version")
 assert not re.match(smv_branch_whitelist, "release/2.x")
+assert re.match(smv_branch_whitelist, "release/7.x")
 assert re.match(smv_branch_whitelist, "release/100.x")
-assert not re.match(smv_branch_whitelist, "release/1.x_feature")
+assert not re.match(smv_branch_whitelist, "release/7.x_feature")
+
+# -- Warnings filter
+
+suppress_warnings = [
+    "autosectionlabel", # https://stackoverflow.com/a/77577337
+]
 
 # Intercept command line arguments passed by sphinx-multiversion to retrieve doc version.
 # This is a little hacky with sphinx-multiversion 0.2.4 and the `SPHINX_MULTIVERSION_NAME`
@@ -260,15 +295,9 @@ extlinks = {
 
 # Theme options
 
-html_logo = "_static/ccf.svg"
 html_favicon = "_static/favicon.ico"
 
-html_context = {
-    "github_user": "Microsoft",
-    "github_repo": "CCF",
-    "github_version": "main",
-    "doc_path": "doc/",
-}
+html_theme_options["source_branch"] = docs_version
 
 # Configuration for sphinxcontrib-httpdomain, without which the following error happens
 # ERROR: HTTP status code must be an integer (e.g. `200`) or start with an integer (e.g. `200 OK`);
@@ -286,37 +315,19 @@ spelling_lang = "en_UK"
 tokenizer_lang = "en_UK"
 spelling_word_list_filename = ["spelling_wordlist.txt"]
 
-# sphinxcontrib-mermaid options
-mermaid_init_js = """mermaid.initialize({startOnLoad:true});
-
-// Remove height from all mermaid diagrams
-window.addEventListener(
-  'load',
-  function() {
-    let nodes = document.querySelectorAll('.mermaid');
-    for (let i = 0; i < nodes.length; i++) {
-      const element = nodes[i];
-      const svg = element.firstChild;
-      svg.removeAttribute('height');
-    }
-  },
-  false
-);"""
-
-
 def typedoc_role(
     name: str, rawtext: str, text: str, lineno, inliner, options={}, content=[]
 ):
     """
     Supported syntaxes:
-    :typedoc:package:`ccf-app`
-    :typedoc:module:`ccf-app/global`
-    :typedoc:function:`ccf-app/crypto#wrapKey`
-    :typedoc:interface:`ccf-app/endpoints/Body`
-    :typedoc:class:`ccf-app/kv/TypedKvMap`
-    :typedoc:classmethod:`ccf-app/kv/TypedKvMap#delete`
-    :typedoc:interfacemethod:`ccf-app/endpoints/Body#json`
-    :typedoc:interface:`Body <ccf-app/endpoints/Body>`
+    :typedoc-package:`ccf-app`
+    :typedoc-module:`ccf-app/global`
+    :typedoc-function:`ccf-app/crypto#wrapKey`
+    :typedoc-interface:`ccf-app/endpoints/Body`
+    :typedoc-class:`ccf-app/kv/TypedKvMap`
+    :typedoc-classmethod:`ccf-app/kv/TypedKvMap#delete`
+    :typedoc-interfacemethod:`ccf-app/endpoints/Body#json`
+    :typedoc-interface:`Body <ccf-app/endpoints/Body>`
     """
     # check for custom label
     if "<" in text:
@@ -331,7 +342,7 @@ def typedoc_role(
 
     # translate role kind into typedoc subfolder
     # and add '()' for functions/methods
-    kind_name = name.replace("typedoc:", "")
+    kind_name = name.replace("typedoc-", "")
     is_kind_package = False
     if kind_name == "package":
         is_kind_package = True
@@ -358,10 +369,12 @@ def typedoc_role(
         element_path = ".".join(element_path)
         typedoc_path += f"/{kind_name}/{element_path}.html{url_hash}"
 
-    # construct final url relative to current page
-    source = inliner.document.attributes["source"]
-    rel_source = source.split("/doc/", 1)[1]
-    levels = rel_source.count("/")
+    # construct final url relative to current page. Use the Sphinx docname
+    # (always relative to the source root) rather than the filesystem path, so
+    # this works under sphinx-multiversion where sources live in a temporary
+    # checkout that differs from the conf.py location.
+    docname = inliner.document.settings.env.docname
+    levels = docname.count("/")
     refuri = "../" * levels + typedoc_path
 
     # build docutils node
@@ -370,6 +383,42 @@ def typedoc_role(
     ref_node += text_node
 
     return [ref_node], []
+
+
+def config_property_role(
+    name: str, rawtext: str, text: str, lineno, inliner, options={}, content=[]
+):
+    try:
+        prefix, val = text.rsplit(".", 1)
+        prefix = prefix + "."
+    except ValueError:
+        prefix, val = None, text
+
+    children = [
+        nodes.strong(
+            val,
+            val,
+            ids=[text],
+        ),
+        nodes.reference("#", "#", refid=text, classes=["headerlink"]),
+    ]
+    if prefix:
+        children.insert(
+            0,
+            nodes.emphasis(
+                prefix,
+                prefix,
+            ),
+        )
+
+    line = nodes.line(
+        "",
+        "",
+        *children,
+        classes=["configproperty"],
+    )
+
+    return [line], []
 
 
 def config_inited(app, config):
@@ -385,21 +434,6 @@ def config_inited(app, config):
         if app.config.smv_metadata_path:
             os.environ["SMV_METADATA_PATH"] = app.config.smv_metadata_path
             os.environ["SMV_CURRENT_VERSION"] = app.config.smv_current_version
-        subprocess.run(
-            ["sed", "-i", "s/\^4.2.3/4.2.4/g", "package.json"],
-            cwd=js_pkg_dir,
-            check=True,
-        )
-        subprocess.run(
-            ["sed", "-i", 's/"\^14\.14\.35"/"14\.17\.27"/g', "package.json"],
-            cwd=js_pkg_dir,
-            check=True,
-        )
-        subprocess.run(
-            ["npm", "install", "--save-exact", "colors@1.4.0"],
-            cwd=js_pkg_dir,
-            check=True,
-        )
         subprocess.run(
             ["npm", "install", "--no-package-lock", "--no-audit", "--no-fund"],
             cwd=js_pkg_dir,
@@ -420,13 +454,45 @@ def config_inited(app, config):
             "interfacemethod",
             "classmethod",
         ]:
-            app.add_role(f"typedoc:{kind}", typedoc_role)
+            app.add_role(f"typedoc-{kind}", typedoc_role)
+
+
+VERSION_SUBSTITUTIONS = {}
+
+
+def read_ccf_version(root_dir: pathlib.Path):
+    # Read the CCF release version of the documented sources from the Python
+    # SDK version, which is bumped with each release. This is read relative to
+    # the source directory so that each sphinx-multiversion build uses the
+    # version of its own branch.
+    pyproject_path = root_dir / "python" / "pyproject.toml"
+    if pyproject_path.is_file():
+        match = re.search(
+            r'^version\s*=\s*"([^"]+)"', pyproject_path.read_text(), re.MULTILINE
+        )
+        if match:
+            return match.group(1)
+    return None
+
+
+def make_version_substitutions(ccf_version: str):
+    return {
+        "|ccf_version|": ccf_version,
+        "|ccf_major_version|": ccf_version.split(".")[0],
+    }
+
+
+def substitute_versions(app, docname, source):
+    # Unlike rst_prolog substitutions, this also applies inside code blocks.
+    for token, value in VERSION_SUBSTITUTIONS.items():
+        source[0] = source[0].replace(token, value)
 
 
 def setup(app):
     if not os.environ.get("SKIP_JS"):
         app.connect("config-inited", config_inited)
 
+    app.add_role("configproperty", config_property_role)
     doc_dir = pathlib.Path(app.srcdir)  # CCF/doc/
     root_dir = pathlib.Path(os.path.abspath(doc_dir / ".."))  # CCF/
     out_dir = pathlib.Path(app.outdir)  # CCF/build/html
@@ -434,6 +500,15 @@ def setup(app):
     # import ccf python package to generate docs for this version
     python_path = os.path.abspath(doc_dir / "../python")
     sys.path.insert(0, python_path)
+
+    # |ccf_version| and |ccf_major_version| tokens in documentation sources
+    ccf_version = read_ccf_version(root_dir)
+    if ccf_version is None:
+        raise RuntimeError(
+            f"Could not read CCF version from {root_dir / 'python' / 'pyproject.toml'}"
+        )
+    VERSION_SUBSTITUTIONS.update(make_version_substitutions(ccf_version))
+    app.connect("source-read", substitute_versions)
 
     # doxygen
     breathe_projects["CCF"] = str(doc_dir / breathe_projects["CCF"])
@@ -446,8 +521,31 @@ def setup(app):
                 ["cp", "-r", str(doxygen_html_src), doxygen_html_dest], check=True
             )
 
+    # recovery trace viewer, in trees that have one: sphinx-multiversion also
+    # builds older refs, whose sources need not be in this checkout
+    replayer_dir = root_dir / "lean/disaster-recovery/replayer"
+    if not os.environ.get("SKIP_TRACE_VIEWER") and (replayer_dir / "viewer").is_dir():
+        package_dir = (
+            replayer_dir
+            if (replayer_dir / "lakefile.toml").is_file()
+            else replayer_dir.parent
+        )
+        subprocess.run(
+            ["lake", "build", "disaster-recovery-replay"], cwd=package_dir, check=True
+        )
+        subprocess.run(
+            [sys.executable, "viewer/build.py"], cwd=replayer_dir, check=True
+        )
+        viewer_dest = out_dir / "trace-viewer"
+        shutil.rmtree(viewer_dest, ignore_errors=True)
+        shutil.copytree(
+            replayer_dir / "viewer",
+            viewer_dest,
+            ignore=shutil.ignore_patterns("*.py", ".gitignore"),
+        )
+
     # configuration generator
-    input_file_path = doc_dir / "host_config_schema/cchost_config.json"
+    input_file_path = doc_dir / "host_config_schema/host_config.json"
     output_file_path = doc_dir / "operations/generated_config.rst"
 
     if os.path.exists(input_file_path):

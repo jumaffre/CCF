@@ -1,11 +1,12 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-from enum import Enum, auto
-import infra.concurrency
-from collections import Counter
 import time
+from collections import Counter
+from enum import Enum, auto
 
 from loguru import logger as LOG
+
+import infra.concurrency
 
 # How often each node in the network is polled
 DEFAULT_POLLING_INTERVAL_S = 1
@@ -122,7 +123,7 @@ class NetworkHealthWatcher(infra.concurrency.StoppableThread):
             )
         LOG.info("Recovery successfully detected")
 
-    def run(self):
+    def _run(self):
         """
         Monitor the health of the network. If the network is not stable for more than
         a specific period (election_timeout * election_timeout_factor), the health

@@ -6,18 +6,18 @@
 #include "kv/test/stub_consensus.h"
 
 // Needed by TestTransactionFetcher
-#include "kv/test/null_encryptor.h"
+#include "kv/null_encryptor.h"
 
-using MapA = kv::Map<std::string, std::string>;
+using MapA = ccf::kv::Map<std::string, std::string>;
 static MapA map_a("public:map_a");
 
-using MapB = kv::Map<size_t, size_t>;
+using MapB = ccf::kv::Map<size_t, size_t>;
 static MapB map_b("public:map_b");
 
-using ValueA = kv::Value<std::string>;
+using ValueA = ccf::kv::Value<std::string>;
 static ValueA value_a("public:value_a");
 
-using SetA = kv::Set<std::string>;
+using SetA = ccf::kv::Set<std::string>;
 static SetA set_a("public:set_a");
 
 static const std::chrono::milliseconds step_time(10);
@@ -25,17 +25,16 @@ static const std::chrono::milliseconds step_time(10);
 class TestTransactionFetcher : public ccf::indexing::TransactionFetcher
 {
 public:
-  std::shared_ptr<kv::NullTxEncryptor> encryptor =
-    std::make_shared<kv::NullTxEncryptor>();
+  std::shared_ptr<ccf::kv::NullTxEncryptor> encryptor =
+    std::make_shared<ccf::kv::NullTxEncryptor>();
 
   ccf::SeqNoCollection requested;
-  std::unordered_map<ccf::SeqNo, kv::ReadOnlyStorePtr> fetched_stores;
+  std::unordered_map<ccf::SeqNo, ccf::kv::ReadOnlyStorePtr> fetched_stores;
 
-  kv::ReadOnlyStorePtr deserialise_transaction(
+  ccf::kv::ReadOnlyStorePtr deserialise_transaction(
     ccf::SeqNo seqno, const uint8_t* data, size_t size)
   {
-    auto store = std::make_shared<kv::Store>(
-      false /* Do not start from very first seqno */,
+    auto store = std::make_shared<ccf::kv::Store>(
       true /* Make use of historical secrets */);
 
     store->set_encryptor(encryptor);
@@ -48,7 +47,7 @@ public:
     }
 
     auto result = exec->apply();
-    if (result == kv::ApplyResult::FAIL)
+    if (result == ccf::kv::ApplyResult::FAIL)
     {
       return nullptr;
     }
@@ -56,10 +55,10 @@ public:
     return store;
   }
 
-  std::vector<kv::ReadOnlyStorePtr> fetch_transactions(
+  std::vector<ccf::kv::ReadOnlyStorePtr> fetch_transactions(
     const ccf::SeqNoCollection& seqnos)
   {
-    std::vector<kv::ReadOnlyStorePtr> stores;
+    std::vector<ccf::kv::ReadOnlyStorePtr> stores;
 
     for (auto seqno : seqnos)
     {
@@ -87,11 +86,11 @@ class AllCommittableWrapper : public TConsensus
 public:
   using TConsensus::TConsensus;
 
-  bool replicate(const kv::BatchVector& entries_, ccf::View view) override
+  bool replicate(const ccf::kv::BatchVector& entries_, ccf::View view) override
   {
     // Rather than building a history that produces real signatures, we just
     // overwrite the entries here to say that everything is committable
-    kv::BatchVector entries(entries_);
+    ccf::kv::BatchVector entries(entries_);
     for (auto& [seqno, data, committable, hooks] : entries)
     {
       committable = true;
@@ -101,7 +100,8 @@ public:
   }
 };
 
-using AllCommittableConsensus = AllCommittableWrapper<kv::test::StubConsensus>;
+using AllCommittableConsensus =
+  AllCommittableWrapper<ccf::kv::test::StubConsensus>;
 
 using ExpectedSeqNos = std::set<ccf::SeqNo>;
 
@@ -161,7 +161,8 @@ static inline bool check_seqnos(
   return true;
 }
 
-using Action = std::function<bool(size_t, kv::Tx&)>;
+using Action = std::function<bool(size_t, ccf::kv::Tx&)>;
+
 struct ActionDesc
 {
   ExpectedSeqNos& expected;
@@ -169,7 +170,7 @@ struct ActionDesc
 };
 
 static inline bool create_transactions(
-  kv::Store& kv_store,
+  ccf::kv::Store& kv_store,
   const std::vector<ActionDesc>& actions,
   size_t count = ccf::indexing::Indexer::MAX_REQUESTABLE * 3)
 {
@@ -185,12 +186,12 @@ static inline bool create_transactions(
       }
     }
 
-    if (tx.commit() != kv::CommitResult::SUCCESS)
+    if (tx.commit() != ccf::kv::CommitResult::SUCCESS)
     {
       return false;
     }
 
-    const auto seqno = tx.get_txid()->version;
+    const auto seqno = tx.get_txid()->seqno;
 
     for (auto p_exp : modified)
     {

@@ -6,18 +6,51 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#define FMT_HEADER_ONLY
+#include <fmt/format.h>
 
 namespace serialized
 {
+  class InsufficientSpaceException : public std::exception
+  {
+  private:
+    std::string msg;
+
+  public:
+    InsufficientSpaceException(std::string msg_) : msg(std::move(msg_)) {}
+
+    [[nodiscard]] const char* what() const noexcept override
+    {
+      return msg.c_str();
+    }
+  };
+
   template <class T>
   T peek(const uint8_t*& data, size_t& size)
   {
-    if (size < sizeof(T))
-      throw std::logic_error(
-        "Insufficient space (peek<T>: " + std::to_string(size) + " < " +
-        std::to_string(sizeof(T)) + ")");
+    // This should only be used for numeric types and small structs
+    static constexpr auto max_size = 32u;
+    static_assert(sizeof(T) <= max_size);
 
+    if (size < sizeof(T))
+    {
+      throw InsufficientSpaceException(
+        fmt::format("Insufficient space (peek<T>: {} < {})", size, sizeof(T)));
+    }
+
+    static constexpr auto alignment = alignof(T);
+    if (reinterpret_cast<std::uintptr_t>(data) % alignment != 0)
+    {
+      // Data is not aligned - copy to scratch memory
+      alignas(T) uint8_t scratch[max_size];
+      std::memcpy(scratch, data, sizeof(T));
+      return *(T*)scratch;
+    }
+
+    // Cast directly from source memory
     return *(T*)data;
   }
 
@@ -25,9 +58,10 @@ namespace serialized
   T read(const uint8_t*& data, size_t& size)
   {
     if (size < sizeof(T))
-      throw std::logic_error(
-        "Insufficient space (read<T>: " + std::to_string(size) + " < " +
-        std::to_string(sizeof(T)) + ")");
+    {
+      throw InsufficientSpaceException(
+        fmt::format("Insufficient space (read<T>: {} < {})", size, sizeof(T)));
+    }
 
     T v;
     std::memcpy(reinterpret_cast<uint8_t*>(&v), data, sizeof(T));
@@ -39,7 +73,13 @@ namespace serialized
   template <>
   inline std::string read(const uint8_t*& data, size_t& size)
   {
-    size_t len = read<size_t>(data, size);
+    auto len = read<size_t>(data, size);
+    if (size < len)
+    {
+      throw InsufficientSpaceException(
+        fmt::format("Insufficient space (read string: {} < {})", size, len));
+    }
+
     std::string v(data, data + len);
     data += len;
     size -= len;
@@ -50,9 +90,10 @@ namespace serialized
     const uint8_t*& data, size_t& size, size_t block_size)
   {
     if (size < block_size)
-      throw std::logic_error(
-        "Insufficient space (read block: " + std::to_string(size) + " < " +
-        std::to_string(block_size) + ")");
+    {
+      throw InsufficientSpaceException(fmt::format(
+        "Insufficient space (read block: {} < {})", size, block_size));
+    }
 
     std::vector<uint8_t> v(data, data + block_size);
     data += block_size;
@@ -64,11 +105,12 @@ namespace serialized
   void write(uint8_t*& data, size_t& size, const T& v)
   {
     if (size < sizeof(T))
-      throw std::logic_error(
-        "Insufficient space (write<T>: " + std::to_string(size) + " < " +
-        std::to_string(sizeof(T)) + ")");
+    {
+      throw InsufficientSpaceException(
+        fmt::format("Insufficient space (write<T>: {} < {})", size, sizeof(T)));
+    }
 
-    const auto src = reinterpret_cast<const uint8_t*>(&v);
+    const auto* const src = reinterpret_cast<const uint8_t*>(&v);
     std::memcpy(data, src, sizeof(T));
     data += sizeof(T);
     size -= sizeof(T);
@@ -78,9 +120,10 @@ namespace serialized
     uint8_t*& data, size_t& size, const uint8_t* block, size_t block_size)
   {
     if (size < block_size)
-      throw std::logic_error(
-        "Insufficient space (write block: " + std::to_string(size) + " < " +
-        std::to_string(block_size) + ")");
+    {
+      throw InsufficientSpaceException(fmt::format(
+        "Insufficient space (write block: {} < {})", size, block_size));
+    }
 
     if (block_size > 0)
     {
@@ -93,28 +136,25 @@ namespace serialized
 
   inline void write(uint8_t*& data, size_t& size, const std::string& v)
   {
-    if (size < (sizeof(size_t) + v.size()))
-      throw std::logic_error(
-        "Insufficient space (write string: " + std::to_string(size) + " < " +
-        std::to_string(sizeof(size_t) + v.size()) + ")");
+    const auto string_size = sizeof(size_t) + v.size();
+    if (size < string_size)
+    {
+      throw InsufficientSpaceException(fmt::format(
+        "Insufficient space (write string: {} < {})", size, string_size));
+    }
 
     write(data, size, v.size());
-    write(data, size, (const uint8_t*)v.data(), v.size());
-  }
-
-  inline void write_lps(uint8_t*& data, size_t& size, const std::string& v)
-  {
-    write<uint16_t>(data, size, v.size());
-    write(data, size, (const uint8_t*)v.data(), v.size());
+    write(data, size, reinterpret_cast<const uint8_t*>(v.data()), v.size());
   }
 
   template <class T>
   T& overlay(const uint8_t*& data, size_t& size)
   {
     if (size < sizeof(T))
-      throw std::logic_error(
-        "Insufficient space (overlay<T>: " + std::to_string(size) + " < " +
-        std::to_string(sizeof(T)) + ")");
+    {
+      throw InsufficientSpaceException(fmt::format(
+        "Insufficient space (overlay<T>: {} < {})", size, sizeof(T)));
+    }
 
     T* v = (T*)data;
     data += sizeof(T);
@@ -125,9 +165,10 @@ namespace serialized
   inline void skip(const uint8_t*& data, size_t& size, size_t skip)
   {
     if (size < skip)
-      throw std::logic_error(
-        "Insufficient space (skip: " + std::to_string(size) + " < " +
-        std::to_string(skip) + ")");
+    {
+      throw InsufficientSpaceException(
+        fmt::format("Insufficient space (skip: {} < {})", size, skip));
+    }
 
     data += skip;
     size -= skip;

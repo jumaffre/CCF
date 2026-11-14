@@ -4,26 +4,26 @@
 #pragma once
 
 #include "ccf/ds/json.h"
-#include "ccf/ds/nonstd.h"
+#include "ccf/ds/net_address.h"
 #include "ccf/http_configuration.h"
-#include "ccf/service/acme_client_config.h"
+#include "ccf/service/operator_feature.h"
 
 #include <string>
 
 namespace ccf
 {
-  enum class Authority
+  enum class Authority : uint8_t
   {
     NODE,
     SERVICE,
-    ACME,
+    ACME, // DEPRECATED
     UNSECURED
   };
   DECLARE_JSON_ENUM(
     Authority,
     {{Authority::NODE, "Node"},
      {Authority::SERVICE, "Service"},
-     {Authority::ACME, "ACME"},
+     {Authority::ACME, "ACME"}, // DEPRECATED
      {Authority::UNSECURED, "Unsecured"}});
 
   using ApplicationProtocol = std::string;
@@ -32,17 +32,14 @@ namespace ccf
   {
     Authority authority;
 
-    std::optional<std::string> acme_configuration;
-
     bool operator==(const Endorsement& other) const
     {
-      return authority == other.authority &&
-        acme_configuration == other.acme_configuration;
+      return authority == other.authority;
     }
   };
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(Endorsement);
+
+  DECLARE_JSON_TYPE(Endorsement);
   DECLARE_JSON_REQUIRED_FIELDS(Endorsement, authority);
-  DECLARE_JSON_OPTIONAL_FIELDS(Endorsement, acme_configuration);
 
   struct NodeInfoNetwork_v1
   {
@@ -53,11 +50,34 @@ namespace ccf
     std::string rpcport;
     std::string pubport;
   };
+
   DECLARE_JSON_TYPE(NodeInfoNetwork_v1);
   DECLARE_JSON_REQUIRED_FIELDS(
     NodeInfoNetwork_v1, rpchost, pubhost, nodehost, nodeport, rpcport, pubport);
 
-  static constexpr auto PRIMARY_RPC_INTERFACE = "ccf.default_rpc_interface";
+  static constexpr auto PRIMARY_RPC_INTERFACE = "primary_rpc_interface";
+
+  enum class RedirectionResolutionKind : uint8_t
+  {
+    NodeByRole,
+    StaticAddress
+  };
+  DECLARE_JSON_ENUM(
+    RedirectionResolutionKind,
+    {{RedirectionResolutionKind::NodeByRole, "NodeByRole"},
+     {RedirectionResolutionKind::StaticAddress, "StaticAddress"}});
+
+  struct RedirectionResolverConfig
+  {
+    RedirectionResolutionKind kind = RedirectionResolutionKind::NodeByRole;
+    nlohmann::json target;
+
+    bool operator==(const RedirectionResolverConfig&) const = default;
+  };
+
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(RedirectionResolverConfig);
+  DECLARE_JSON_REQUIRED_FIELDS(RedirectionResolverConfig, kind);
+  DECLARE_JSON_OPTIONAL_FIELDS(RedirectionResolverConfig, target);
 
   /// Node network information
   struct NodeInfoNetwork_v2
@@ -94,6 +114,24 @@ namespace ccf
       /// Timeout for forwarded RPC calls (in milliseconds)
       std::optional<size_t> forwarding_timeout_ms = std::nullopt;
 
+      /// Features enabled for this interface. Any endpoint with required
+      /// features will be inaccessible (on this interface) if this does not
+      /// contain those features.
+      std::set<ccf::endpoints::OperatorFeature> enabled_operator_features;
+
+      // clang-tidy misattributes throwing aggregate initializers to implicit
+      // moves. NOLINTNEXTLINE(bugprone-exception-escape)
+      struct Redirections
+      {
+        RedirectionResolverConfig to_primary;
+        RedirectionResolverConfig to_backup{
+          RedirectionResolutionKind::NodeByRole, {{"role", "backup"}}};
+
+        bool operator==(const Redirections& other) const = default;
+      };
+
+      std::optional<Redirections> redirections = std::nullopt;
+
       bool operator==(const NetInterface& other) const
       {
         return bind_address == other.bind_address &&
@@ -104,7 +142,9 @@ namespace ccf
           endorsement == other.endorsement &&
           http_configuration == other.http_configuration &&
           accepted_endpoints == other.accepted_endpoints &&
-          forwarding_timeout_ms == other.forwarding_timeout_ms;
+          forwarding_timeout_ms == other.forwarding_timeout_ms &&
+          enabled_operator_features == other.enabled_operator_features &&
+          redirections == other.redirections;
       }
     };
 
@@ -114,22 +154,27 @@ namespace ccf
     /// Node-to-node network interface
     NetInterface node_to_node_interface;
 
-    /// RPC interfaces
-    RpcInterfaces rpc_interfaces;
-
-    /// ACME configuration description
-    struct ACME
+    struct NodeToNodeInterface
     {
-      /// Mapping of ACME client configuration names to configurations
-      std::map<std::string, ccf::ACMEClientConfig> configurations;
+      NetAddress bind_address;
+      NetAddress published_address;
 
-      bool operator==(const ACME&) const = default;
+      bool operator==(const NodeToNodeInterface&) const = default;
     };
 
-    /// ACME configuration
-    std::optional<ACME> acme = std::nullopt;
+    /// Reserved TLS endpoint metadata; no listener is created.
+    std::optional<NodeToNodeInterface> node_to_node_tls_interface =
+      std::nullopt;
+
+    /// RPC interfaces
+    RpcInterfaces rpc_interfaces;
   };
 
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(
+    NodeInfoNetwork_v2::NetInterface::Redirections);
+  DECLARE_JSON_REQUIRED_FIELDS(NodeInfoNetwork_v2::NetInterface::Redirections);
+  DECLARE_JSON_OPTIONAL_FIELDS(
+    NodeInfoNetwork_v2::NetInterface::Redirections, to_primary, to_backup);
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(NodeInfoNetwork_v2::NetInterface);
   DECLARE_JSON_REQUIRED_FIELDS(NodeInfoNetwork_v2::NetInterface, bind_address);
   DECLARE_JSON_OPTIONAL_FIELDS(
@@ -142,61 +187,42 @@ namespace ccf
     app_protocol,
     http_configuration,
     accepted_endpoints,
-    forwarding_timeout_ms);
-  DECLARE_JSON_TYPE(NodeInfoNetwork_v2::ACME);
-  DECLARE_JSON_REQUIRED_FIELDS(NodeInfoNetwork_v2::ACME, configurations);
+    forwarding_timeout_ms,
+    enabled_operator_features,
+    redirections);
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(
+    NodeInfoNetwork_v2::NodeToNodeInterface);
+  DECLARE_JSON_REQUIRED_FIELDS(
+    NodeInfoNetwork_v2::NodeToNodeInterface, bind_address);
+  DECLARE_JSON_OPTIONAL_FIELDS(
+    NodeInfoNetwork_v2::NodeToNodeInterface, published_address);
+
   DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(NodeInfoNetwork_v2);
   DECLARE_JSON_REQUIRED_FIELDS(
     NodeInfoNetwork_v2, node_to_node_interface, rpc_interfaces);
-  DECLARE_JSON_OPTIONAL_FIELDS(NodeInfoNetwork_v2, acme);
+  DECLARE_JSON_OPTIONAL_FIELDS(NodeInfoNetwork_v2, node_to_node_tls_interface);
 
   struct NodeInfoNetwork : public NodeInfoNetwork_v2
   {
     NodeInfoNetwork() = default;
+
     NodeInfoNetwork(const NodeInfoNetwork_v2& other) : NodeInfoNetwork_v2(other)
     {}
 
     bool operator==(const NodeInfoNetwork& other) const
     {
       return node_to_node_interface == other.node_to_node_interface &&
+        node_to_node_tls_interface == other.node_to_node_tls_interface &&
         rpc_interfaces == other.rpc_interfaces;
     }
   };
 
-  inline static std::pair<std::string, std::string> split_net_address(
-    const NodeInfoNetwork::NetAddress& addr)
-  {
-    auto [host, port] = nonstd::rsplit_1(addr, ":");
-    return std::make_pair(std::string(host), std::string(port));
-  }
-
-  inline static NodeInfoNetwork::NetAddress make_net_address(
-    const std::string& host, const std::string& port)
-  {
-    return fmt::format("{}:{}", host, port);
-  }
-
-  // The JSON representation of a NodeInfoNetwork is the union of a
-  // NodeInfoNetwork_v1 and a NodeInfoNetwork_v2. It contains the fields of
-  // both, so can be read as (or from!) either
+  // All NodeInfoNetwork read that may lead to re-serialization for
+  // write purposes must be v2 by now, so we only serialize as v2.
+  // If any v1 NodeInfoNetwork is read at all, it must be for historical
+  // query purposes, and does not need to be re-serialized to v2.
   inline void to_json(nlohmann::json& j, const NodeInfoNetwork& nin)
   {
-    {
-      NodeInfoNetwork_v1 v1;
-      std::tie(v1.nodehost, v1.nodeport) =
-        split_net_address(nin.node_to_node_interface.bind_address);
-
-      if (nin.rpc_interfaces.size() > 0)
-      {
-        const auto& primary_interface = nin.rpc_interfaces.begin()->second;
-        std::tie(v1.rpchost, v1.rpcport) =
-          split_net_address(primary_interface.bind_address);
-        std::tie(v1.pubhost, v1.pubport) =
-          split_net_address(primary_interface.published_address);
-      }
-      to_json(j, v1);
-    }
-
     to_json(j, (const NodeInfoNetwork_v2&)nin);
   }
 
@@ -208,12 +234,35 @@ namespace ccf
       from_json(j, v2);
       nin = NodeInfoNetwork(v2);
     }
-    catch (const JsonParseError& jpe)
+    catch (const ccf::JsonParseError& jpe)
     {
       NodeInfoNetwork_v1 v1;
-      from_json(j, v1);
+      try
+      {
+        if (
+          j.contains("rpc_interfaces") ||
+          j.contains("node_to_node_interface") ||
+          j.contains("node_to_node_tls_interface"))
+        {
+          // If these v2 fields are present, rethrow the error - the JSON is
+          // malformed for v2. Only proceed to parse as v1 if these fields are
+          // absent and the NodeInfoNetwork is a pure v1.
+          throw jpe;
+        }
+        from_json(j, v1);
+      }
+      catch (const ccf::JsonParseError& _)
+      {
+        // If this also fails to parse as a v1, then rethrow the earlier error.
+        // Configs should now be using v2, and this v1 parsing is just a
+        // backwards-compatibility shim, which does not get to return errors.
+        throw jpe;
+      }
 
       nin.node_to_node_interface.bind_address =
+        make_net_address(v1.nodehost, v1.nodeport);
+      // If published address is not explicitly set, default to bind address
+      nin.node_to_node_interface.published_address =
         make_net_address(v1.nodehost, v1.nodeport);
 
       NodeInfoNetwork::NetInterface primary_interface;
@@ -261,4 +310,5 @@ struct formatter<ccf::Authority>
     }
   }
 };
+
 FMT_END_NAMESPACE

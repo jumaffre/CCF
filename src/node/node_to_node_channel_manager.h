@@ -2,17 +2,20 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/pal/locking.h"
+#include "ccf/ds/locking.h"
 #include "channels.h"
+#include "ds/ccf_assert.h"
 #include "node/node_to_node.h"
+#include "node/node_transport.h"
+#include "tasks/periodic_task_owner.h"
 
 namespace ccf
 {
-  class NodeToNodeChannelManager : public NodeToNode
+  class NodeToNodeChannelManager : public NodeToNode,
+                                   public ccf::tasks::PeriodicTaskOwner
   {
   private:
-    ringbuffer::AbstractWriterFactory& writer_factory;
-    ringbuffer::WriterPtr to_host;
+    std::shared_ptr<AbstractNodeTransport> transport;
 
     struct ChannelInfo
     {
@@ -21,15 +24,16 @@ namespace ccf
     };
 
     std::unordered_map<NodeId, ChannelInfo> channels;
-    ccf::pal::Mutex lock; //< Protects access to channels map
+    ccf::ds::Mutex lock; //< Protects access to channels map
 
     struct ThisNode
     {
       NodeId node_id;
-      crypto::Pem service_cert;
-      crypto::KeyPairPtr node_kp;
-      std::optional<crypto::Pem> endorsed_node_cert = std::nullopt;
+      ccf::crypto::Pem service_cert;
+      ccf::crypto::ECKeyPairPtr node_kp;
+      std::optional<ccf::crypto::Pem> endorsed_node_cert = std::nullopt;
     };
+
     std::unique_ptr<ThisNode> this_node; //< Not available at construction, only
                                          // after calling initialize()
 
@@ -53,14 +57,13 @@ namespace ccf
         "Requested channel with self {}",
         peer_id);
 
-      CCF_ASSERT_FMT(
-        message_limit.has_value(),
-        "Node-to-node message limit has not yet been set");
+      if (!message_limit.has_value())
+      {
+        throw std::runtime_error(
+          "Node-to-node message limit has not yet been set");
+      }
 
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
-      CCF_ASSERT_FMT(
-        this_node != nullptr && this_node->endorsed_node_cert.has_value(),
-        "Endorsed node certificate has not yet been set");
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
 
       auto search = channels.find(peer_id);
       if (search != channels.end())
@@ -70,12 +73,26 @@ namespace ccf
         return channel_info.channel;
       }
 
+      if (this_node == nullptr)
+      {
+        throw std::runtime_error(
+          "Endorsed node certificate has not yet been set");
+      }
+
+      auto& endorsed_node_cert = this_node->endorsed_node_cert;
+      if (!endorsed_node_cert.has_value())
+      {
+        throw std::runtime_error(
+          "Cannot create node-to-node channel without endorsed node "
+          "certificate");
+      }
+
       // Create channel
       auto channel = std::make_shared<Channel>(
-        writer_factory,
+        transport,
         this_node->service_cert,
         this_node->node_kp,
-        this_node->endorsed_node_cert.value(),
+        *endorsed_node_cert,
         this_node->node_id,
         peer_id,
         message_limit.value());
@@ -86,16 +103,25 @@ namespace ccf
 
   public:
     NodeToNodeChannelManager(
-      ringbuffer::AbstractWriterFactory& writer_factory_) :
-      writer_factory(writer_factory_),
-      to_host(writer_factory_.create_writer_to_outside())
+      std::shared_ptr<AbstractNodeTransport> transport_) :
+      transport(std::move(transport_))
     {}
+
+    void register_periodic_tasks(
+      ccf::tasks::JobBoard& job_board, std::chrono::milliseconds period)
+    {
+      schedule_periodic_task(
+        job_board,
+        period,
+        [this](std::chrono::milliseconds elapsed) { tick(elapsed); },
+        "Node channel maintenance");
+    }
 
     void initialize(
       const NodeId& self_id,
-      const crypto::Pem& service_cert,
-      crypto::KeyPairPtr node_kp,
-      const std::optional<crypto::Pem>& node_cert) override
+      const ccf::crypto::Pem& service_cert,
+      ccf::crypto::ECKeyPairPtr node_kp,
+      const std::optional<ccf::crypto::Pem>& node_cert) override
     {
       CCF_ASSERT_FMT(
         this_node == nullptr,
@@ -113,13 +139,14 @@ namespace ccf
         return;
       }
 
-      this_node = std::unique_ptr<ThisNode>(
-        new ThisNode{self_id, service_cert, node_kp, node_cert});
+      this_node =
+        std::make_unique<ThisNode>(self_id, service_cert, node_kp, node_cert);
     }
 
-    void set_endorsed_node_cert(const crypto::Pem& endorsed_node_cert) override
+    void set_endorsed_node_cert(
+      const ccf::crypto::Pem& endorsed_node_cert) override
     {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
       this_node->endorsed_node_cert = endorsed_node_cert;
     }
 
@@ -135,7 +162,7 @@ namespace ccf
 
     void tick(std::chrono::milliseconds elapsed) override
     {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
 
       if (idle_timeout.has_value())
       {
@@ -163,22 +190,17 @@ namespace ccf
       }
     }
 
-    virtual void associate_node_address(
+    void associate_node_address(
       const NodeId& peer_id,
       const std::string& peer_hostname,
       const std::string& peer_service) override
     {
-      RINGBUFFER_WRITE_MESSAGE(
-        ccf::associate_node_address,
-        to_host,
-        peer_id.value(),
-        peer_hostname,
-        peer_service);
+      transport->associate_node_address(peer_id, peer_hostname, peer_service);
     }
 
     bool have_channel(const ccf::NodeId& nid) override
     {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
       return channels.find(nid) != channels.end();
     }
 
@@ -277,7 +299,7 @@ namespace ccf
 
     void close_channel(const NodeId& peer_id) override
     {
-      std::lock_guard<ccf::pal::Mutex> guard(lock);
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
 
       auto search = channels.find(peer_id);
       if (search != channels.end())

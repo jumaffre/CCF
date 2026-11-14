@@ -13,8 +13,6 @@ namespace ccf
   struct EntityId
   {
   public:
-    // The underlying value type should be blit-serialisable so that it can be
-    // written to and read from the ring buffer
     static constexpr size_t LENGTH = 64; // hex-encoded SHA-256 hash
     using Value = std::string; // < hex-encoded hash
 
@@ -24,22 +22,33 @@ namespace ccf
   public:
     EntityId() = default;
     EntityId(const EntityId& id_) = default;
+
     EntityId(const Value& id_) : id(id_) {}
+
     EntityId(Value&& id_) : id(std::move(id_)) {}
 
-    inline operator std::string() const
+    EntityId(EntityId&& id_) noexcept : id(std::move(id_)) {}
+
+    EntityId& operator=(EntityId&& other) = default;
+
+    operator std::string() const
     {
       return id;
     }
 
-    void operator=(const EntityId& other)
+    EntityId& operator=(const EntityId& other)
     {
-      id = other.id;
+      if (this != &other)
+      {
+        id = other.id;
+      }
+      return *this;
     }
 
-    void operator=(const Value& id_)
+    EntityId& operator=(const Value& id_)
     {
       id = id_;
+      return *this;
     }
 
     bool operator==(const EntityId& other) const
@@ -62,17 +71,17 @@ namespace ccf
       return id;
     }
 
-    const Value& value() const
+    [[nodiscard]] const Value& value() const
     {
       return id;
     }
 
-    char const* data() const
+    [[nodiscard]] char const* data() const
     {
       return id.data();
     }
 
-    size_t size() const
+    [[nodiscard]] size_t size() const
     {
       return id.size();
     }
@@ -94,7 +103,7 @@ namespace ccf
     }
     else
     {
-      throw JsonParseError(fmt::format(
+      throw ccf::JsonParseError(fmt::format(
         "{} should be hex-encoded string: {}",
         FmtExtender::ID_LABEL,
         j.dump()));
@@ -102,14 +111,16 @@ namespace ccf
   }
 
   template <typename FmtExtender>
-  inline std::string schema_name(const EntityId<FmtExtender>*)
+  inline std::string schema_name(
+    [[maybe_unused]] const EntityId<FmtExtender>* entity_id_type)
   {
     return FmtExtender::ID_LABEL;
   }
 
   template <typename FmtExtender>
   inline void fill_json_schema(
-    nlohmann::json& schema, const EntityId<FmtExtender>*)
+    nlohmann::json& schema,
+    [[maybe_unused]] const EntityId<FmtExtender>* entity_id_type)
   {
     schema["type"] = "string";
 
@@ -130,6 +141,7 @@ namespace ccf
 
     static constexpr auto ID_LABEL = "MemberId";
   };
+
   using MemberId = EntityId<MemberIdFormatter>;
 
   struct UserIdFormatter
@@ -141,6 +153,7 @@ namespace ccf
 
     static constexpr auto ID_LABEL = "UserId";
   };
+
   using UserId = EntityId<UserIdFormatter>;
 
   struct NodeIdFormatter
@@ -152,9 +165,11 @@ namespace ccf
 
     static constexpr auto ID_LABEL = "NodeId";
   };
+
   using NodeId = EntityId<NodeIdFormatter>;
 }
 
+// NOLINTBEGIN(cert-dcl58-cpp)
 namespace std
 {
   template <typename FmtExtender>
@@ -182,7 +197,10 @@ namespace std
   };
 }
 
+// NOLINTEND(cert-dcl58-cpp)
+
 FMT_BEGIN_NAMESPACE
+
 template <typename FmtExtender>
 struct formatter<ccf::EntityId<FmtExtender>>
 {
@@ -200,9 +218,10 @@ struct formatter<ccf::EntityId<FmtExtender>>
     return format_to(ctx.out(), "{}", ss.str());
   }
 };
+
 FMT_END_NAMESPACE
 
-namespace kv::serialisers
+namespace ccf::kv::serialisers
 {
   template <typename FmtExtender>
   struct BlitSerialiser<ccf::EntityId<FmtExtender>>

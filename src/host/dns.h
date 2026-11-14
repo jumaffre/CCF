@@ -2,8 +2,8 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ds/logger.h"
-#include "ccf/pal/locking.h"
+#include "ccf/ds/locking.h"
+#include "ds/internal_logger.h"
 
 #include <unordered_set>
 #include <uv.h>
@@ -11,7 +11,7 @@
 namespace asynchost
 {
   static std::unordered_set<uv_getaddrinfo_t*> pending_resolve_requests;
-  static ccf::pal::Mutex pending_resolve_requests_mtx;
+  static ccf::ds::Mutex pending_resolve_requests_mtx;
 
   class DNS
   {
@@ -23,13 +23,14 @@ namespace asynchost
       uv_getaddrinfo_cb cb,
       bool async)
     {
-      struct addrinfo hints;
+      addrinfo hints{};
       hints.ai_family = AF_UNSPEC;
       hints.ai_socktype = SOCK_STREAM;
       hints.ai_protocol = IPPROTO_TCP;
       hints.ai_flags = 0;
 
-      auto resolver = new uv_getaddrinfo_t;
+      // NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+      auto* resolver = new uv_getaddrinfo_t;
       resolver->data = ud;
 
       std::string host =
@@ -37,12 +38,12 @@ namespace asynchost
            host_.substr(1, host_.size() - 2) :
            host_);
 
-      int rc;
+      int rc = 0;
 
       if (async)
       {
         {
-          std::unique_lock<ccf::pal::Mutex> guard(pending_resolve_requests_mtx);
+          std::unique_lock<ccf::ds::Mutex> guard(pending_resolve_requests_mtx);
           pending_resolve_requests.insert(resolver);
         }
 
@@ -62,11 +63,11 @@ namespace asynchost
             service,
             uv_strerror(rc));
           {
-            std::unique_lock<ccf::pal::Mutex> guard(
+            std::unique_lock<ccf::ds::Mutex> guard(
               pending_resolve_requests_mtx);
             pending_resolve_requests.erase(resolver);
           }
-          delete resolver;
+          delete resolver; // NOLINT(cppcoreguidelines-owning-memory)
           return false;
         }
       }
@@ -86,7 +87,7 @@ namespace asynchost
             host,
             service,
             uv_strerror(rc));
-          delete resolver;
+          delete resolver; // NOLINT(cppcoreguidelines-owning-memory)
           return false;
         }
 

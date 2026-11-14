@@ -3,73 +3,93 @@ Cryptography API
 
 For convenience, CCF provides access to commonly used cryptographic primitives to applications.
 
-.. note:: This page describes the C++ API. For the API for TypeScript/JavaScript applications, see :typedoc:module:`ccf-app/crypto`.
+.. note:: This page describes the C++ API. For the API for TypeScript/JavaScript applications, see :typedoc-module:`ccf-app/crypto` .
 
 Hashing
 -------
 
-.. doxygenfunction:: crypto::sha256(const std::vector<uint8_t> &data)
+.. doxygenfunction:: ccf::crypto::sha256(const std::vector<uint8_t> &data)
   :project: CCF
 
-.. doxygenfunction:: crypto::hmac(MDType, const std::vector<uint8_t>&, const std::vector<uint8_t>&)
+.. doxygenfunction:: ccf::crypto::hmac(MDType, const std::span<const uint8_t>&, const std::span<const uint8_t>&)
   :project: CCF
 
-.. doxygenClass:: crypto::HashProvider
+.. doxygenClass:: ccf::crypto::HashProvider
   :project: CCF
   :members:
 
-.. doxygenfunction:: crypto::make_hash_provider
+.. doxygenfunction:: ccf::crypto::make_hash_provider
   :project: CCF
 
 
 Asymmetric Keys
 -----------------------
 
-CCF supports EC and RSA keys; public keys are held in (RSA)PublicKey objects and
-private keys in (RSA)KeyPair objects. (RSA)KeyPairs automatically generate random
-keys when constructed via :cpp:func:`KeyPairPtr crypto::make_key_pair(CurveID)` or
-:cpp:func:`RSAKeyPairPtr crypto::make_rsa_key_pair(size_t, size_t)`.
+CCF supports EC and RSA keys; public keys are held in [RSA|EC]PublicKey objects and private keys in [RSA|EC]KeyPair objects. [RSA|EC]KeyPair automatically generate random keys when constructed via :cpp:func:`ECKeyPairPtr ccf::crypto::make_ec_key_pair(CurveID)` or :cpp:func:`RSAKeyPairPtr ccf::crypto::make_rsa_key_pair(size_t, size_t)`.
 
-.. doxygenclass:: crypto::PublicKey
+.. doxygenclass:: ccf::crypto::ECPublicKey
   :project: CCF
   :members:
 
-.. doxygenclass:: crypto::KeyPair
+.. doxygenclass:: ccf::crypto::ECKeyPair
   :project: CCF
   :members:
 
-.. doxygenclass:: crypto::RSAPublicKey
+.. doxygenclass:: ccf::crypto::RSAPublicKey
   :project: CCF
   :members:
 
-.. doxygenclass:: crypto::RSAKeyPair
+.. doxygenclass:: ccf::crypto::RSAKeyPair
   :project: CCF
   :members:
 
-.. doxygenenum:: crypto::CurveID
+.. doxygenenum:: ccf::crypto::CurveID
   :project: CCF
 
-.. doxygenfunction:: crypto::make_key_pair(CurveID)
+.. doxygenfunction:: ccf::crypto::make_ec_key_pair(CurveID)
   :project: CCF
 
-.. doxygenfunction:: crypto::make_key_pair(const Pem&)
+.. doxygenfunction:: ccf::crypto::make_ec_key_pair(const Pem&)
   :project: CCF
 
-.. doxygenfunction:: crypto::make_rsa_key_pair(size_t, size_t)
+.. doxygenfunction:: ccf::crypto::make_rsa_key_pair(size_t, size_t)
+  :project: CCF
+
+ML-DSA Signing Keys
+~~~~~~~~~~~~~~~~~~~
+
+CCF supports ML-DSA (FIPS 204) keys with OpenSSL 3.5 or newer; public keys are held in MLDSAPublicKey objects and private keys in MLDSAKeyPair objects. Signatures are pure ML-DSA over the message, with an optional context string of at most 255 bytes.
+Private keys are exported in plaintext, so callers are responsible for protecting the returned buffers.
+
+.. doxygenclass:: ccf::crypto::MLDSAPublicKey
+  :project: CCF
+  :members:
+
+.. doxygenclass:: ccf::crypto::MLDSAKeyPair
+  :project: CCF
+  :members:
+
+.. doxygenenum:: ccf::crypto::MLDSAParameterSet
+  :project: CCF
+
+.. doxygenfunction:: ccf::crypto::make_mldsa_key_pair(MLDSAParameterSet)
+  :project: CCF
+
+.. doxygenfunction:: ccf::crypto::make_mldsa_key_pair(const Pem&, MLDSAParameterSet)
+  :project: CCF
+
+.. doxygenfunction:: ccf::crypto::make_mldsa_public_key(const Pem&, MLDSAParameterSet)
+  :project: CCF
+
+.. doxygenfunction:: ccf::crypto::make_mldsa_public_key_from_raw
   :project: CCF
 
 Symmetric Keys
 --------------------
 
-Currently, only AES-GCM is supported for symmetric encryption. New keys are generated via :cpp:func:`crypto::Entropy::random`
+Currently, only AES-GCM is supported for symmetric encryption. New keys are generated via :cpp:func:`ccf::crypto::Entropy::random`
 
-.. doxygenfunction:: crypto::aes_gcm_encrypt
-  :project: CCF
-
-.. doxygenfunction:: crypto::aes_gcm_decrypt
-  :project: CCF
-
-.. doxygenclass:: crypto::Entropy
+.. doxygenclass:: ccf::crypto::Entropy
   :project: CCF
   :members:
 
@@ -78,9 +98,29 @@ Signatures
 
 Verification of signatures is supported via the :cpp:class:`Verifier` class.
 
-.. doxygenclass:: crypto::Verifier
+.. doxygenclass:: ccf::crypto::Verifier
   :project: CCF
   :members:
+
+COSE Keys
+---------
+
+EC2 (P-256, P-384 or P-521), OKP (Ed25519), RSA and AKP (ML-DSA, RFC 9964) public keys can be held as COSE_Keys (RFC 9052), which are parsed, validated and encoded by :cpp:class:`ccf::crypto::COSEKey`, and verify COSE_Sign1 signatures through a verifier made by :cpp:func:`ccf::crypto::make_cose_verifier_from_key`.
+
+.. doxygenclass:: ccf::crypto::COSEKey
+  :project: CCF
+  :members:
+
+.. doxygenenum:: ccf::crypto::COSEKeyType
+  :project: CCF
+
+.. doxygenfunction:: ccf::crypto::make_cose_verifier_from_key(const COSEKey&)
+  :project: CCF
+
+An application that has already parsed a certificate with OpenSSL, for example to validate its chain, can take its key without parsing the certificate again.
+
+.. doxygenfunction:: ccf::crypto::OpenSSL::cose_key_from_x509
+  :project: CCF
 
 
 Key Wrapping
@@ -88,36 +128,36 @@ Key Wrapping
 
 PKCS11 2.1.8 CKM_RSA_PKCS_OAEP
 
-.. doxygenfunction:: crypto::ckm_rsa_pkcs_oaep_wrap(RSAPublicKeyPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_pkcs_oaep_wrap(RSAPublicKeyPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF
 
-.. doxygenfunction:: crypto::ckm_rsa_pkcs_oaep_wrap(const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_pkcs_oaep_wrap(const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF
 
-.. doxygenfunction:: crypto::ckm_rsa_pkcs_oaep_unwrap(RSAKeyPairPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_pkcs_oaep_unwrap(RSAKeyPairPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF
 
-.. doxygenfunction:: crypto::ckm_rsa_pkcs_oaep_unwrap(const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_pkcs_oaep_unwrap(const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF
 
 PKCS11 2.14.3 CKM_AES_KEY_WRAP_PAD (RFC 5649)
 
-.. doxygenfunction:: crypto::ckm_aes_key_wrap_pad
+.. doxygenfunction:: ccf::crypto::ckm_aes_key_wrap_pad
   :project: CCF
 
-.. doxygenfunction:: crypto::ckm_aes_key_unwrap_pad
+.. doxygenfunction:: ccf::crypto::ckm_aes_key_unwrap_pad
   :project: CCF
 
 PKCS11 2.1.21 CKM_RSA_AES_KEY_WRAP
 
-.. doxygenfunction:: crypto::ckm_rsa_aes_key_wrap(size_t, RSAPublicKeyPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_aes_key_wrap(size_t, RSAPublicKeyPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF
 
-.. doxygenfunction:: crypto::ckm_rsa_aes_key_wrap(size_t, const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_aes_key_wrap(size_t, const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF
 
-.. doxygenfunction:: crypto::ckm_rsa_aes_key_unwrap(RSAKeyPairPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_aes_key_unwrap(RSAKeyPairPtr, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF
 
-.. doxygenfunction:: crypto::ckm_rsa_aes_key_unwrap(const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
+.. doxygenfunction:: ccf::crypto::ckm_rsa_aes_key_unwrap(const Pem&, const std::vector<uint8_t>&, const std::optional<std::vector<uint8_t>>&)
   :project: CCF

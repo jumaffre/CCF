@@ -1,0 +1,153 @@
+#!/bin/bash
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the Apache 2.0 License.
+
+set -exo pipefail
+
+H2SPEC_VERSION="v2.6.0"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+retry() {
+    local description=$1
+    shift
+
+    if [[ -z ${CI+x} ]]; then
+        "$@"
+        return
+    fi
+
+    local attempt=1
+    local delay
+    local max_attempts=5
+    local status
+    while true; do
+        # Calling a function from an if condition disables errexit within it,
+        # so a later successful command can mask an earlier failure.
+        set +e
+        (
+            set -e
+            "$@"
+        )
+        status=$?
+        set -e
+
+        if (( status == 0 )); then
+            return
+        fi
+
+        if (( attempt == max_attempts )); then
+            echo "'$description' failed after $max_attempts attempts"
+            return 1
+        fi
+
+        if (( attempt == 1 )); then
+            delay=5
+        else
+            delay=30
+        fi
+
+        echo "'$description' failed on attempt $attempt. Retrying in ${delay}s..."
+        sleep "$delay"
+        attempt=$(( attempt + 1 ))
+    done
+}
+
+install_source_control() {
+    # Source control and tools used by this script.
+    dnf -y install  \
+        git  \
+        ca-certificates  \
+        curl  \
+        tar  \
+        gzip
+}
+
+install_build_dependencies() {
+    # To build CCF. Azure Linux 4 uses more explicit package names than Azure
+    # Linux 3: build-essential is not present, and the curl/nghttp2 development
+    # packages are named libcurl-devel and libnghttp2-devel.
+    dnf -y install  \
+        gcc  \
+        gcc-c++  \
+        make  \
+        binutils  \
+        clang  \
+        cmake  \
+        ninja-build  \
+        patch  \
+        which  \
+        openssl  \
+        openssl-devel  \
+        libuv-devel  \
+        libnghttp2-devel  \
+        libcurl-devel  \
+        doxygen  \
+        clang-tools-extra-devel  \
+        rust  \
+        cargo  \
+        libstdc++-devel
+}
+
+install_test_dependencies() {
+    local packages=(
+        # To run standard tests
+        lldb
+        expect
+        jq
+        # Extra-dependency for CDDL schema checker
+        rubygems
+        # Release (extended) tests
+        procps-ng
+        # protocoltest
+        bind-utils
+        strace
+    )
+    dnf -y install "${packages[@]}" &&
+    gem install cddl
+}
+
+install_h2spec() {
+    if ! curl -L --output h2spec_linux_amd64.tar.gz https://github.com/summerwind/h2spec/releases/download/$H2SPEC_VERSION/h2spec_linux_amd64.tar.gz; then
+        echo "Failed to download h2spec"
+        return 1
+    fi
+
+    tar -xvf h2spec_linux_amd64.tar.gz &&
+    mkdir -p /opt/h2spec &&
+    mv h2spec /opt/h2spec/h2spec &&
+    rm h2spec_linux_amd64.tar.gz
+}
+
+install_node() {
+    # The Azure Linux 4 package repositories currently provide Node.js 22. The
+    # JS packages in this repository require Node.js >= 20.
+    dnf -y install  \
+        nodejs  \
+        nodejs-npm
+
+    local node_major
+    node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
+    if (( node_major < 20 )); then
+        echo "Unsupported Node.js version $(node --version); expected >= 20" >&2
+        return 1
+    fi
+}
+
+install_packaging_and_python() {
+    local packages=(
+        # For packaging
+        rpm-build
+        # For end to end tests and scripts
+        python3
+        python3-devel
+    )
+    dnf -y install "${packages[@]}"
+    bash "$SCRIPT_DIR/install_uv.sh" /usr/local/bin
+}
+
+retry "Source control dependencies" install_source_control
+retry "Build dependencies" install_build_dependencies
+retry "Test dependencies" install_test_dependencies
+retry "Node.js installation" install_node
+retry "h2spec installation" install_h2spec
+retry "Packaging and Python dependencies" install_packaging_and_python

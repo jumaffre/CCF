@@ -8,8 +8,8 @@ This page documents the components of a bundle and the JavaScript API available 
 
 .. note::
     Modern JavaScript app development typically makes use of
-    `Node.js <https://nodejs.org/>`_,
-    `npm <https://www.npmjs.com/>`_, and
+    `Node.js <https://nodejs.org/en>`_,
+    `npm <https://docs.npmjs.com/downloading-and-installing-node-js-and-npm/>`_, and
     `TypeScript <https://www.typescriptlang.org/>`_.
     CCF provides an example app built with these tools.
     They involve a `build` step that generates an app bundle suitable for CCF.
@@ -46,7 +46,6 @@ The ``app.json`` file of an app bundle has the following structure:
           "post": {
             "js_module": "app.js",
             "js_function": "foo_post",
-            "forwarding_required": "never",
             "authn_policies": ["user_cert"],
             "mode": "readonly",
             "openapi": {
@@ -63,22 +62,42 @@ The ``app.json`` file of an app bundle has the following structure:
 Each endpoint object contains the following information:
 
 - ``"js_module"``: The path to the module containing the endpoint handler, relative to the ``src/`` folder.
-- ``"js_function"``: The name of the endpoint handler function. This must be the name of a function exported by
-  the ``js_module``.
-- ``"authn_policies"``: A list of :ref:`authentication policies <build_apps/auth/index:User Authentication>` to be applied before the endpoint
-  is executed. An empty list indicates an unauthenticated endpoint which can be called by anyone. Possible entries are:
+- ``"js_function"``: The name of the endpoint handler function. This must be the name of a function exported by the ``js_module``.
+- ``"authn_policies"``: A list of :ref:`authentication policies <build_apps/auth/index:User Authentication>` to be applied before the endpoint is executed. An empty list indicates an unauthenticated endpoint which can be called by anyone. Possible entries are:
 
   - ``"user_cert"``
   - ``"member_cert"``
+  - ``"any_cert"``
   - ``"jwt"``
   - ``"user_cose_sign1"``
   - ``"no_auth"``
 
-- ``"forwarding_required"``: A string indicating whether the endpoint is always forwarded, or whether it is safe to sometimes execute on followers. Possible values are:
+.. _allofauthnpolicy:
+.. note::
+    This tests each policy in the list in-order, and passes if any single policy passes (returning the corresponding identity).
+    To combine policies so that they must `all` pass, you may instead pass an object with an ``all_of`` key as an element of this list.
+    For example, this endpoint will test (in order of preference) for `a member cert`, then `a user cert AND a JWT`, then `a JWT`:
+
+    .. code-block:: json
+
+        {
+          "authn_policies": [
+            "member_cert",
+            {
+              "all_of": ["user_cert", "jwt"]
+            },
+            "jwt"
+          ]
+        }
+
+- ``"forwarding_required"``: An optional, deprecated string indicating whether the endpoint is always forwarded, or whether it is safe to sometimes execute on followers. Possible values are:
 
   - ``"always"``
   - ``"sometimes"``
   - ``"never"``
+
+  When omitted, the legacy forwarding policy is inferred from ``"redirection_strategy"``: ``"to_primary"`` implies ``"always"``, while ``"none"`` and ``"to_backup"`` imply ``"never"``. If neither field is supplied, the defaults are ``"to_primary"`` and ``"always"``. Explicit legacy policies, including ``"sometimes"``, are preserved in stored records and governance responses. Forwarding is deprecated and will be removed in CCF 8.0.
+  New applications should explicitly set ``"redirection_strategy"`` to ``"none"``, ``"to_primary"``, or ``"to_backup"`` as appropriate, and enable redirects on their interfaces. Use version-matched application bundles when upgrading from older releases which require ``"forwarding_required"``. See :doc:`/releases/fwd_to_redirect`.
 
 - ``"mode"``: A string indicating whether the endpoint requires read/write or read-only access to the Key-Value Store, or whether it is a historical endpoint that sees the state written in a specific transaction. Possible values are:
 
@@ -86,12 +105,10 @@ Each endpoint object contains the following information:
   - ``"readonly"``
   - ``"historical"``
 
-.. note:: "sometimes" is a good default value for most endpoints. The node that receives the request will forward only to preserve session consistency (a previous transaction was already forwarded), or because the transaction cannot be executed locally (it involves a write, and the node is a backup). "always" is a good setting for endpoints that always write to the KV, because it saves attempting the transaction on a backup before forwarding.
+.. note:: The explicit legacy policy ``"sometimes"`` forwards only to preserve session consistency (a previous transaction was already forwarded), or because the transaction cannot be executed locally (it involves a write, and the node is a backup). New applications should select an appropriate redirection strategy instead.
    
-- ``"openapi"``:  An `OpenAPI Operation Object <https://swagger.io/specification/#operation-object>`_
-  without `references <https://swagger.io/specification/#reference-object>`_. This is descriptive but not
-  enforced - it will be inserted into the generated OpenAPI document for this service, but will not restrict the
-  types of the endpoint's requests or responses.
+- ``"openapi"``:  An `OpenAPI Operation Object <https://swagger.io/specification/#operation-object>`_ without `references <https://swagger.io/specification/#reference-object>`_.
+  This is descriptive but not enforced - it will be inserted into the generated OpenAPI document for this service, but will not restrict the types of the endpoint's requests or responses.
 
 You can find an example metadata file at :ccf_repo:`tests/js-app-bundle/app.json` in the CCF git repository.
 
@@ -101,11 +118,10 @@ JavaScript API
 Globals
 ~~~~~~~
 
-JavaScript provides a set of built-in
-`global functions, objects, and values <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects>`_.
+JavaScript provides a set of built-in `global functions, objects, and values <https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects>`_.
 
 CCF provides the additional global variable ``ccf`` to access native CCF functionality.
-It is an object implementing the :typedoc:interface:`CCF <ccf-app/global/CCF>` interface.
+It is an object implementing the :typedoc-interface:`CCF <ccf-app/global/CCF>` interface.
 
 .. note::
   `Web APIs <https://developer.mozilla.org/en-US/docs/Web/API>`_ are not available.
@@ -113,7 +129,7 @@ It is an object implementing the :typedoc:interface:`CCF <ccf-app/global/CCF>` i
 Endpoint handlers
 ~~~~~~~~~~~~~~~~~
 
-An endpoint handler is an exported function that receives a :typedoc:interface:`Request <ccf-app/endpoints/Request>` object, returns a :typedoc:interface:`Response <ccf-app/endpoints/Response>` object, and is referenced in the ``app.json`` file of the app bundle (see above).
+An endpoint handler is an exported function that receives a :typedoc-interface:`Request <ccf-app/endpoints/Request>` object, returns a :typedoc-interface:`Response <ccf-app/endpoints/Response>` object, and is referenced in the ``app.json`` file of the app bundle (see above).
 
 See the following handler from the example app bundle in the :ccf_repo:`tests/js-app-bundle/` folder of the CCF git repository. It validates the request body and returns the result of a mathematical operation:
 
@@ -123,11 +139,13 @@ See the following handler from the example app bundle in the :ccf_repo:`tests/js
 Accessing the current date and time
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Code executing inside the enclave does not have access to a trusted time source. To prevent accidental errors (eg - relying on an in-enclave timestamp for tamper-proof ordering), the standard ``Date`` API is stubbed out by default - ``Date.now()`` will always return ``0``.
+Code executing inside the node's TEE does not have access to a trusted time source.
+``Date.now()`` returns the current time provided by the node's operating system clock, which the untrusted host can influence.
+The accuracy of this time is not covered by attestation, so it should not be relied upon for tamper-proof ordering.
 
 In many places where timestamps are desired, they should come from the outside with user requests - the accuracy of this timestamp is then considered a claim by a specific user, and the application logic is a purely functional transformation of those external inputs which does not generate unique claims of its own.
 
-To ease porting of existing apps, and for logging scenarios, there is an option to retrieve the current time from the host. When the executing CCF node is run by an honest operator this will be kept up-to-date, but the accuracy of this is not covered by any attestation and as such these times should not be relied upon. To enable use of this untrusted time, call ``ccf.enableUntrustedDateTime(true)`` at any point in your application code, including at the global scope. After this is enabled, calls to ``Date.now()`` will retrieve the current time as specified by the untrusted host. This behaviour can also be revoked by a call to ``ccf.enableUntrustedDateTime(false)``, allowing the untrusted behaviour to be tightly scoped, and explicitly opted in to at each call point.
+The ``ccf.enableUntrustedDateTime`` API is deprecated and has no effect.
 
 Execution metrics
 ~~~~~~~~~~~~~~~~~
@@ -142,7 +160,9 @@ These are designed to aid debugging, as a starting point for building operationa
 
 .. note:: The execution time is only precise within a few milliseconds, and relies on the time provided by the untrusted host. It should be used for comparing the execution time between different requests, and as an approximation of real execution time, but will not help distinguish requests which complete in under 1ms.
 
-Some applications may not wish to log this information to the untrusted host (for example, if the frequency of each request type is considered confidential). This logging can be disabled by a call to ``ccf.enableMetricsLogging(false)`` at any point in the application code. This could be at the global scope to disable this logging for all calls, or within a single request handler to selectively mute that request.
+Some applications may not wish to expose this information in node logs, which are written outside the TEE and are visible to the untrusted host (for example, if the frequency of each request type is considered confidential).
+This logging can be disabled by a call to ``ccf.enableMetricsLogging(false)`` at any point in the application code.
+This could be at the global scope to disable this logging for all calls, or within a single request handler to selectively mute that request.
 
 Deployment
 ----------
@@ -164,7 +184,6 @@ For instance a proposal which deploys the example app above would look like:
                     "post": {
                       "js_module": "math.js",
                       "js_function": "compute",
-                      "forwarding_required": "never",
                       "authn_policies": [
                         "user_cert"
                       ],
@@ -250,7 +269,6 @@ For instance a proposal which deploys the example app above would look like:
                     "get": {
                       "js_module": "math.js",
                       "js_function": "compute2",
-                      "forwarding_required": "never",
                       "authn_policies": [
                         "user_cert"
                       ],
@@ -319,8 +337,7 @@ The key fields are:
 Once :ref:`submitted and accepted <governance/proposals:Submitting a New Proposal>`, a ``set_js_app`` proposal atomically (re-)deploys the complete JavaScript application.
 Any existing application endpoints and JavaScript modules are removed.
 
-If you are using ``npm`` or similar to build your app it may make sense to convert your app into a proposal-ready JSON bundle during packaging.
-For an example of how this could be done, see :ccf_repo:`tests/npm-app/build_bundle.js` from one of CCF's test applications, called by ``npm build`` from the corresponding :ccf_repo:`tests/npm-app/package.json`.
+If you are using ``npm`` to build your app, we package a `ccf-build-bundle` script alongside `ccf-app`. This can be run using `npx --package @microsoft/ccf-app ccf-build-bundle path/to/root/of/app` to package the `app.json` and all javascript modules under `src` into a proposal-ready JSON bundle.
 
 Bytecode cache
 ~~~~~~~~~~~~~~
@@ -354,7 +371,7 @@ Note that this removes the sandboxing protections described above. If the conten
 
 This behaviour is controlled in ``app.json``, with the ``"interpreter_reuse"`` property on each endpoint. The default behaviour, taken when the field is omitted, is to avoid any interpreter reuse, providing strict sandboxing safety. To reuse an interpreter, set ``"interpreter_reuse"`` to an object of the form ``{"key": "foo"}``, where ``foo`` is an arbitrary, app-defined string. Interpreters will be shared between endpoints where this string matches. For instance:
 
-.. code-block:: json
+.. code-block:: yaml
 
     {
       "endpoints": {

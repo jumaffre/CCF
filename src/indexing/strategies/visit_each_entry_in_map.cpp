@@ -14,24 +14,24 @@ namespace ccf::indexing::strategies
   {}
 
   void VisitEachEntryInMap::handle_committed_transaction(
-    const ccf::TxID& tx_id, const kv::ReadOnlyStorePtr& store)
+    const ccf::TxID& tx_id, const ccf::kv::ReadOnlyStorePtr& store)
   {
     // NB: Get an untyped view over the map with the same name. This saves
     // deserialisation here, where we hand on the raw key and value.
     auto tx = store->create_read_only_tx();
-    auto handle = tx.ro<kv::untyped::Map>(map_name);
+    auto* handle = tx.ro<ccf::kv::untyped::Map>(map_name);
 
     handle->foreach([this, &tx_id](const auto& k, const auto& v) {
       visit_entry(tx_id, k, v);
       return true;
     });
-    std::lock_guard<ccf::pal::Mutex> guard(current_txid_lock);
+    std::lock_guard<ccf::ds::Mutex> guard(current_txid_lock);
     current_txid = tx_id;
   }
 
   std::optional<ccf::SeqNo> VisitEachEntryInMap::next_requested()
   {
-    std::lock_guard<ccf::pal::Mutex> guard(current_txid_lock);
+    std::lock_guard<ccf::ds::Mutex> guard(current_txid_lock);
     return current_txid.seqno + 1;
   }
 
@@ -45,7 +45,7 @@ namespace ccf::indexing::strategies
 
   ccf::TxID VisitEachEntryInMap::get_indexed_watermark()
   {
-    std::lock_guard<ccf::pal::Mutex> guard(current_txid_lock);
+    std::lock_guard<ccf::ds::Mutex> guard(current_txid_lock);
     return current_txid;
   }
 }

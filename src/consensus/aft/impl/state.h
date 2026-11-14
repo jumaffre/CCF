@@ -2,14 +2,15 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/crypto/key_pair.h"
 #include "ccf/crypto/verifier.h"
-#include "ccf/ds/logger.h"
-#include "ccf/pal/locking.h"
+#include "ccf/ds/locking.h"
 #include "ccf/tx_status.h"
-#include "consensus/aft/raft_types.h"
+#include "consensus/aft/cft_types.h"
+#include "ds/internal_logger.h"
 #include "kv/kv_types.h"
 
+#include <atomic>
+#include <deque>
 #include <map>
 #include <set>
 
@@ -18,12 +19,12 @@ namespace aft
   class ViewHistory
   {
     // Entry i stores the first version in view i+1
-    std::vector<kv::Version> views;
+    std::vector<ccf::kv::Version> views;
 
   public:
     static constexpr ccf::View InvalidView = ccf::VIEW_UNKNOWN;
 
-    void initialise(const std::vector<kv::Version>& terms_)
+    void initialise(const std::vector<ccf::kv::Version>& terms_)
     {
       views.clear();
       for (size_t i = 0; i < terms_.size(); ++i)
@@ -33,7 +34,7 @@ namespace aft
       LOG_DEBUG_FMT("Initialised views: {}", fmt::join(views, ", "));
     }
 
-    void update(kv::Version idx, ccf::View view)
+    void update(ccf::kv::Version idx, ccf::View view)
     {
       LOG_DEBUG_FMT("Updating view to: {} at version: {}", view, idx);
       if (!views.empty())
@@ -55,7 +56,7 @@ namespace aft
       LOG_DEBUG_FMT("Resulting views: {}", fmt::join(views, ", "));
     }
 
-    ccf::View view_at(kv::Version idx)
+    [[nodiscard]] ccf::View view_at(ccf::kv::Version idx) const
     {
       auto it = upper_bound(views.begin(), views.end(), idx);
 
@@ -68,11 +69,11 @@ namespace aft
       return (it - views.begin());
     }
 
-    kv::Version start_of_view(ccf::View view)
+    [[nodiscard]] ccf::kv::Version start_of_view(ccf::View view) const
     {
       if (view > views.size() || view == InvalidView)
       {
-        return kv::NoVersion;
+        return ccf::kv::NoVersion;
       }
 
       // NB: If views == {5, 10, 10}, then view 2 doesn't start at 10. View 2
@@ -80,23 +81,23 @@ namespace aft
       const auto tentative = views[view - 1];
       if (view + 1 <= views.size() && views[view] == tentative)
       {
-        return kv::NoVersion;
+        return ccf::kv::NoVersion;
       }
       return tentative;
     }
 
-    kv::Version end_of_view(ccf::View view)
+    [[nodiscard]] ccf::kv::Version end_of_view(ccf::View view) const
     {
       // If this view has no start (potentially because it contains no
       // transactions), then it can't have an end
-      if (start_of_view(view) == kv::NoVersion)
+      if (start_of_view(view) == ccf::kv::NoVersion)
       {
-        return kv::NoVersion;
+        return ccf::kv::NoVersion;
       }
 
       if (view >= views.size() || view == InvalidView)
       {
-        return kv::NoVersion;
+        return ccf::kv::NoVersion;
       }
 
       // Otherwise the end of this view is the transaction before (- 1) the
@@ -104,14 +105,15 @@ namespace aft
       return views[view] - 1;
     }
 
-    std::vector<kv::Version> get_history_until(
-      kv::Version idx = std::numeric_limits<kv::Version>::max())
+    [[nodiscard]] std::vector<ccf::kv::Version> get_history_until(
+      ccf::kv::Version idx = std::numeric_limits<ccf::kv::Version>::max()) const
     {
       return {views.begin(), std::upper_bound(views.begin(), views.end(), idx)};
     }
 
     // view should be non-zero as views start at one in here
-    std::vector<kv::Version> get_history_since(uint64_t view)
+    [[nodiscard]] std::vector<ccf::kv::Version> get_history_since(
+      uint64_t view) const
     {
       if (view > views.size())
       {
@@ -120,7 +122,7 @@ namespace aft
       return {views.begin() + view - 1, views.end()};
     }
 
-    void rollback(kv::Version idx)
+    void rollback(ccf::kv::Version idx)
     {
       auto it = upper_bound(views.begin(), views.end(), idx);
       views.erase(it, views.end());
@@ -129,43 +131,64 @@ namespace aft
     }
   };
 
-  class Replica
+  // Copyable leadership state with atomic reads and writes.
+  class AtomicLeadershipState
   {
+    std::atomic<ccf::kv::LeadershipState> value;
+
   public:
-    Replica(const ccf::NodeId& id_, const std::vector<uint8_t>& cert_) :
-      id(id_),
-      verifier(crypto::make_unique_verifier(cert_))
+    AtomicLeadershipState(
+      ccf::kv::LeadershipState value_ = ccf::kv::LeadershipState::None) :
+      value(value_)
     {}
 
-    ccf::NodeId get_id() const
+    AtomicLeadershipState(const AtomicLeadershipState& other) :
+      value(other.load())
+    {}
+
+    AtomicLeadershipState& operator=(const AtomicLeadershipState& other)
     {
-      return id;
+      if (this != &other)
+      {
+        store(other.load());
+      }
+      return *this;
     }
 
-  private:
-    ccf::NodeId id;
-    crypto::VerifierUniquePtr verifier;
+    [[nodiscard]] ccf::kv::LeadershipState load() const
+    {
+      return value.load(std::memory_order_acquire);
+    }
+
+    void store(ccf::kv::LeadershipState value_)
+    {
+      value.store(value_, std::memory_order_release);
+    }
   };
 
   struct State
   {
-    State(const ccf::NodeId& node_id_) : node_id(node_id_) {}
+    State(ccf::NodeId node_id_) : node_id(std::move(node_id_)) {}
 
-    ccf::pal::Mutex lock;
+    State() = default;
+
+    ccf::ds::Mutex lock;
 
     ccf::NodeId node_id;
     ccf::View current_view = 0;
-    kv::Version last_idx = 0;
-    kv::Version commit_idx = 0;
-    kv::Version watermark_idx = 0;
+    ccf::kv::Version last_idx = 0;
+    ccf::kv::Version commit_idx = 0;
     ViewHistory view_history;
-    kv::Version new_view_idx = 0;
+
+    // Indices that are eligible for global commit, from a Node's perspective
+    std::deque<Index> committable_indices;
 
     // Replicas start in leadership state Follower. Apart from a single forced
     // transition from Follower to Leader on the initial node at startup,
     // the state machine is made up of the following transitions:
     //
-    // Follower -> Candidate, when election timeout expires
+    // Follower -> PreVoteCandidate, when election timeout expires
+    // PreVoteCandidate -> Candidate, upon collecting enough pre-votes
     // Follower -> Retired, when commit advances past the last config containing
     // the node
     // Candidate -> Leader, upon collecting enough votes
@@ -173,18 +196,26 @@ namespace aft
     // the node
     // Leader -> Follower, when receiving entries for a newer term
     // Candidate -> Follower, when receiving entries for a newer term
-    kv::LeadershipState leadership_state = kv::LeadershipState::None;
-    kv::MembershipState membership_state = kv::MembershipState::Active;
+    //
+    // Written only under `lock`, but read without it by the unsynchronised
+    // accessors (is_primary(), is_candidate(), ...) which callers outside
+    // CFT rely on. Atomic so those reads are not data races. Taking
+    // `lock` in those accessors instead is not an option: Store::commit()
+    // calls is_primary() while holding the KV version lock, and Aft calls
+    // into the Store from under `lock`, so locking here would invert an
+    // existing lock order.
+    AtomicLeadershipState leadership_state;
+    ccf::kv::MembershipState membership_state =
+      ccf::kv::MembershipState::Active;
+
+    std::optional<ccf::kv::RetirementPhase> retirement_phase = std::nullopt;
+    // Index at which this node observes its retirement
+    std::optional<ccf::SeqNo> retirement_idx = std::nullopt;
+    // Earliest index at which this node's retirement can be committed
+    std::optional<ccf::SeqNo> retirement_committable_idx = std::nullopt;
+    // Index at which this node observes its retired_committed, only set when
+    // that index itself is committed
+    std::optional<ccf::SeqNo> retired_committed_idx = std::nullopt;
   };
-  DECLARE_JSON_TYPE(State);
-  DECLARE_JSON_REQUIRED_FIELDS(
-    State,
-    node_id,
-    current_view,
-    last_idx,
-    commit_idx,
-    watermark_idx,
-    new_view_idx,
-    leadership_state,
-    membership_state);
+
 }

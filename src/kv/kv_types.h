@@ -3,26 +3,42 @@
 #pragma once
 
 #include "ccf/claims_digest.h"
+#include "ccf/cose_signatures_config.h"
 #include "ccf/crypto/hash_bytes.h"
+#include "ccf/crypto/mldsa_key_pair.h"
 #include "ccf/crypto/pem.h"
+#include "ccf/ds/hex.h"
+#include "ccf/ds/json.h"
+#include "ccf/ds/net_address.h"
 #include "ccf/ds/nonstd.h"
 #include "ccf/entity_id.h"
 #include "ccf/kv/get_name.h"
 #include "ccf/kv/hooks.h"
+#include "ccf/kv/serialisers/serialised_entry.h"
 #include "ccf/kv/version.h"
+#include "ccf/reconfiguration_type.h"
 #include "ccf/tx_id.h"
-#include "enclave/consensus_type.h"
-#include "enclave/reconfiguration_type.h"
-#include "serialiser_declare.h"
+#include "ccf/tx_status.h"
+#include "crypto/openssl/ec_key_pair.h"
+#include "kv/ledger_chunker_interface.h"
+#include "serialised_entry_format.h"
 
+#include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <list>
+#include <map>
 #include <memory>
+#include <optional>
 #include <set>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -31,12 +47,7 @@ namespace ccf
   struct PrimarySignature;
 }
 
-namespace aft
-{
-  struct Request;
-}
-
-namespace kv
+namespace ccf::kv
 {
   // Term describes an epoch of Versions. It is incremented when global kv's
   // writer(s) changes. Term and Version combined give a unique identifier for
@@ -44,36 +55,6 @@ namespace kv
   // TermHistory
   using Term = uint64_t;
   using NodeId = ccf::NodeId;
-
-  struct TxID
-  {
-    Term term = 0;
-    Version version = 0;
-
-    TxID() = default;
-    TxID(Term t, Version v) : term(t), version(v) {}
-
-    // Would like to remove these duplicate types, but for now we just do free
-    // conversion
-    TxID(const ccf::TxID& other) : term(other.view), version(other.seqno) {}
-
-    operator ccf::TxID() const
-    {
-      return {term, version};
-    }
-
-    bool operator==(const TxID& other) const
-    {
-      return term == other.term && version == other.version;
-    }
-
-    std::string str() const
-    {
-      return fmt::format("{}.{}", term, version);
-    }
-  };
-  DECLARE_JSON_TYPE(TxID);
-  DECLARE_JSON_REQUIRED_FIELDS(TxID, term, version)
 
   using ReconfigurationId = uint64_t;
 
@@ -86,9 +67,9 @@ namespace kv
 
       NodeInfo() = default;
 
-      NodeInfo(const std::string& hostname_, const std::string& port_) :
-        hostname(hostname_),
-        port(port_)
+      NodeInfo(std::string hostname_, std::string port_) :
+        hostname(std::move(hostname_)),
+        port(std::move(port_))
       {}
 
       bool operator==(const NodeInfo& other) const
@@ -99,31 +80,31 @@ namespace kv
 
     using Nodes = std::map<NodeId, NodeInfo>;
 
-    ccf::SeqNo idx;
+    ccf::SeqNo idx = 0;
     Nodes nodes;
-    ReconfigurationId rid;
+    ReconfigurationId rid = 0;
   };
 
   inline void to_json(nlohmann::json& j, const Configuration::NodeInfo& ni)
   {
-    j["address"] = fmt::format("{}:{}", ni.hostname, ni.port);
+    j["address"] = ccf::make_net_address(ni.hostname, ni.port);
   }
 
   inline void from_json(const nlohmann::json& j, Configuration::NodeInfo& ni)
   {
     const std::string addr(j["address"]);
-    const auto& [h, p] = nonstd::split_1(addr, ":");
+    const auto& [h, p] = ccf::split_net_address(addr);
     ni.hostname = h;
     ni.port = p;
   }
 
-  inline std::string schema_name(const Configuration::NodeInfo*)
+  inline std::string schema_name(const Configuration::NodeInfo* /*unused*/)
   {
     return "Configuration__NodeInfo";
   }
 
   inline void fill_json_schema(
-    nlohmann::json& schema, const Configuration::NodeInfo*)
+    nlohmann::json& schema, const Configuration::NodeInfo* /*unused*/)
   {
     schema["type"] = "object";
     schema["required"] = nlohmann::json::array();
@@ -133,11 +114,12 @@ namespace kv
     schema["properties"]["address"]["$ref"] = "#/components/schemas/string";
   }
 
-  enum class LeadershipState
+  enum class LeadershipState : uint8_t
   {
     None,
     Leader,
     Follower,
+    PreVoteCandidate,
     Candidate,
   };
 
@@ -146,9 +128,10 @@ namespace kv
     {{LeadershipState::None, "None"},
      {LeadershipState::Leader, "Leader"},
      {LeadershipState::Follower, "Follower"},
+     {LeadershipState::PreVoteCandidate, "PreVoteCandidate"},
      {LeadershipState::Candidate, "Candidate"}});
 
-  enum class MembershipState
+  enum class MembershipState : uint8_t
   {
     Active,
     Retired
@@ -159,20 +142,20 @@ namespace kv
     {{MembershipState::Active, "Active"},
      {MembershipState::Retired, "Retired"}});
 
-  enum class RetirementPhase
+  enum class RetirementPhase : uint8_t
   {
-    Committed = 0,
     Ordered = 1,
     Signed = 2,
-    Completed = 3
+    Completed = 3,
+    RetiredCommitted = 4,
   };
 
   DECLARE_JSON_ENUM(
     RetirementPhase,
-    {{RetirementPhase::Committed, "Committed"},
-     {RetirementPhase::Ordered, "Ordered"},
+    {{RetirementPhase::Ordered, "Ordered"},
      {RetirementPhase::Signed, "Signed"},
-     {RetirementPhase::Completed, "Completed"}});
+     {RetirementPhase::Completed, "Completed"},
+     {RetirementPhase::RetiredCommitted, "RetiredCommitted"}});
 
   DECLARE_JSON_TYPE(Configuration);
   DECLARE_JSON_REQUIRED_FIELDS(Configuration, idx, nodes, rid);
@@ -185,14 +168,14 @@ namespace kv
       size_t last_received_ms;
     };
 
-    std::vector<Configuration> configs = {};
-    std::unordered_map<ccf::NodeId, Ack> acks = {};
-    MembershipState membership_state;
+    std::vector<Configuration> configs;
+    std::unordered_map<ccf::NodeId, Ack> acks;
+    MembershipState membership_state{};
     std::optional<LeadershipState> leadership_state = std::nullopt;
     std::optional<RetirementPhase> retirement_phase = std::nullopt;
     std::optional<std::unordered_map<ccf::NodeId, ccf::SeqNo>> learners =
       std::nullopt;
-    std::optional<ReconfigurationType> reconfiguration_type = std::nullopt;
+    std::optional<ccf::ReconfigurationType> reconfiguration_type = std::nullopt;
     std::optional<ccf::NodeId> primary_id = std::nullopt;
     ccf::View current_view = 0;
     bool ticking = false;
@@ -217,22 +200,21 @@ namespace kv
     leadership_state,
     retirement_phase);
 
-  struct ConsensusParameters
-  {
-    ReconfigurationType reconfiguration_type;
-  };
-
   class ConfigurableConsensus
   {
   public:
+    virtual ~ConfigurableConsensus() = default;
     virtual void add_configuration(
-      ccf::SeqNo seqno,
-      const Configuration::Nodes& conf,
-      const std::unordered_set<NodeId>& learners = {},
-      const std::unordered_set<NodeId>& retired_nodes = {}) = 0;
+      ccf::SeqNo seqno, const Configuration::Nodes& conf) = 0;
     virtual Configuration::Nodes get_latest_configuration() = 0;
-    virtual Configuration::Nodes get_latest_configuration_unsafe() const = 0;
+    [[nodiscard]] virtual Configuration::Nodes get_latest_configuration_unsafe()
+      const = 0;
     virtual ConsensusDetails get_details() = 0;
+    // Trace that the transaction at seqno sets retired_committed on node_ids.
+    // Must not change consensus state: set_retired_committed does that once
+    // the transaction is globally committed.
+    virtual void trace_retired_committed_tx(
+      ccf::SeqNo seqno, const std::vector<NodeId>& node_ids) = 0;
   };
 
   using BatchVector = std::vector<std::tuple<
@@ -241,21 +223,21 @@ namespace kv
     bool,
     std::shared_ptr<ConsensusHookPtrs>>>;
 
-  enum CommitResult
+  enum CommitResult : uint8_t
   {
     SUCCESS = 1,
     FAIL_CONFLICT = 2,
     FAIL_NO_REPLICATE = 3
   };
 
-  enum SecurityDomain
+  enum SecurityDomain : uint8_t
   {
     PUBLIC, // Public domain indicates the version and always appears first
     PRIVATE,
     SECURITY_DOMAIN_MAX
   };
 
-  enum AccessCategory
+  enum AccessCategory : uint8_t
   {
     INTERNAL,
     GOVERNANCE,
@@ -334,16 +316,70 @@ namespace kv
     return {security_domain, access_category};
   }
 
-  enum ApplyResult
+  using SerialisedKey = ccf::kv::serialisers::SerialisedEntry;
+  using SerialisedValue = ccf::kv::serialisers::SerialisedEntry;
+
+  class KvStoreSerialiser
+  {
+  public:
+    virtual ~KvStoreSerialiser() = default;
+
+    virtual void start_map(const std::string& name, SecurityDomain domain) = 0;
+    virtual void serialise_raw(const std::vector<uint8_t>& raw) = 0;
+    // Appends a size-prefixed payload of the given size, written in place by
+    // fill, to avoid an intermediate copy of large payloads. fill is passed
+    // the payload's span, of exactly size bytes, and must write all of it.
+    // Serialisers which only measure sizes do not call fill.
+    virtual void serialise_raw_in_place(
+      size_t size, const std::function<void(std::span<uint8_t>)>& fill) = 0;
+    virtual void serialise_view_history(
+      const std::vector<Version>& view_history) = 0;
+    virtual void serialise_entry_version(const Version& version) = 0;
+    virtual void serialise_count_header(uint64_t ctr) = 0;
+    virtual void serialise_write(
+      const SerialisedKey& k, const SerialisedValue& v) = 0;
+    virtual void serialise_remove(const SerialisedKey& k) = 0;
+    virtual std::vector<uint8_t> get_raw_data() = 0;
+    virtual std::vector<uint8_t> serialise_domains(
+      const std::vector<uint8_t>& serialised_public_domain,
+      const std::vector<uint8_t>& serialised_private_domain = {}) = 0;
+  };
+
+  class KvStoreDeserialiser
+  {
+  public:
+    virtual ~KvStoreDeserialiser() = default;
+
+    virtual ccf::ClaimsDigest&& consume_claims_digest() = 0;
+    virtual std::optional<ccf::crypto::Sha256Hash>&&
+    consume_commit_evidence_digest() = 0;
+    virtual std::optional<Version> init(
+      const uint8_t* data,
+      size_t size,
+      ccf::kv::Term& term,
+      EntryFlags& flags,
+      bool historical_hint = false) = 0;
+    virtual std::optional<std::string> start_map() = 0;
+    virtual Version deserialise_entry_version() = 0;
+    virtual uint64_t deserialise_read_header() = 0;
+    virtual std::tuple<SerialisedKey, Version> deserialise_read() = 0;
+    virtual uint64_t deserialise_write_header() = 0;
+    virtual std::tuple<SerialisedKey, SerialisedValue> deserialise_write() = 0;
+    virtual std::vector<uint8_t> deserialise_raw() = 0;
+    // As deserialise_raw(), without copying. The returned span is only valid
+    // while both the deserialiser and the data it was initialised with are.
+    virtual std::span<const uint8_t> deserialise_raw_span() = 0;
+    virtual std::vector<Version> deserialise_view_history() = 0;
+    virtual uint64_t deserialise_remove_header() = 0;
+    virtual SerialisedKey deserialise_remove() = 0;
+    virtual bool end() = 0;
+  };
+
+  enum ApplyResult : uint8_t
   {
     PASS = 1,
     PASS_SIGNATURE = 2,
-    PASS_BACKUP_SIGNATURE = 3,
-    PASS_BACKUP_SIGNATURE_SEND_ACK = 4,
-    PASS_NONCES = 5,
-    PASS_NEW_VIEW = 6,
     PASS_ENCRYPTED_PAST_LEDGER_SECRET = 8,
-    PASS_APPLY = 9,
     FAIL = 10
   };
 
@@ -353,64 +389,33 @@ namespace kv
     std::string msg;
 
   public:
-    KvSerialiserException(const std::string& msg_) : msg(msg_) {}
+    KvSerialiserException(std::string msg_) : msg(std::move(msg_)) {}
 
-    virtual const char* what() const throw()
+    [[nodiscard]] const char* what() const noexcept override
     {
       return msg.c_str();
     }
   };
 
+  class MaxTransactionSizeExceeded : public std::logic_error
+  {
+  public:
+    MaxTransactionSizeExceeded(const std::string& msg) : std::logic_error(msg)
+    {}
+  };
+
   class TxHistory
   {
   public:
-    using RequestID = std::tuple<
-      size_t /* Client Session ID */,
-      size_t /* Request sequence number */>;
-
-    struct RequestCallbackArgs
-    {
-      RequestID rid;
-      std::vector<uint8_t> request;
-      std::vector<uint8_t> caller_cert;
-      uint8_t frame_format;
-    };
-
-    struct ResultCallbackArgs
-    {
-      RequestID rid;
-      Version version;
-      crypto::Sha256Hash replicated_state_merkle_root;
-    };
-
-    struct ResponseCallbackArgs
-    {
-      RequestID rid;
-      std::vector<uint8_t> response;
-    };
-
-    enum class Result
-    {
-      FAIL = 0,
-      OK,
-      SEND_SIG_RECEIPT_ACK,
-      SEND_REPLY_AND_NONCE
-    };
-
-    virtual ~TxHistory() {}
-    virtual Result verify_and_sign(
-      ccf::PrimarySignature& signature,
-      Term* term,
-      kv::Configuration::Nodes& nodes) = 0;
-    virtual bool verify(
-      Term* term = nullptr, ccf::PrimarySignature* sig = nullptr) = 0;
+    virtual ~TxHistory() = default;
+    virtual bool verify_root_signatures(ccf::kv::Version version) = 0;
     virtual void try_emit_signature() = 0;
     virtual void emit_signature() = 0;
-    virtual crypto::Sha256Hash get_replicated_state_root() = 0;
+    virtual ccf::crypto::Sha256Hash get_replicated_state_root() = 0;
     virtual std::tuple<
-      kv::TxID /* TxID of last transaction seen by history */,
-      crypto::Sha256Hash /* root as of TxID */,
-      kv::Term /* term_of_next_version */>
+      ccf::TxID /* TxID of last transaction seen by history */,
+      ccf::crypto::Sha256Hash /* root as of TxID */,
+      ccf::kv::Term /* term_of_next_version */>
     get_replicated_state_txid_and_root() = 0;
     virtual std::vector<uint8_t> get_proof(Version v) = 0;
     virtual bool verify_proof(const std::vector<uint8_t>& proof) = 0;
@@ -419,30 +424,42 @@ namespace kv
     virtual std::vector<uint8_t> get_raw_leaf(uint64_t index) = 0;
     virtual void append(const std::vector<uint8_t>& data) = 0;
     virtual void append_entry(
-      const crypto::Sha256Hash& digest,
-      std::optional<kv::Term> expected_term = std::nullopt) = 0;
+      const ccf::crypto::Sha256Hash& digest,
+      std::optional<ccf::kv::Term> expected_term = std::nullopt) = 0;
     virtual void rollback(
-      const kv::TxID& tx_id, kv::Term term_of_next_version_) = 0;
+      const ccf::TxID& tx_id, ccf::kv::Term term_of_next_version_) = 0;
     virtual void compact(Version v) = 0;
-    virtual void set_term(kv::Term) = 0;
+    virtual void set_term(ccf::kv::Term) = 0;
     virtual std::vector<uint8_t> serialise_tree(size_t to) = 0;
-    virtual void set_endorsed_certificate(const crypto::Pem& cert) = 0;
+    virtual void set_endorsed_certificate(const ccf::crypto::Pem& cert) = 0;
+    // Called once the node is part of the network and may sign. Also enables
+    // on-demand signatures via try_emit_signature(), which are suppressed
+    // until then.
     virtual void start_signature_emit_timer() = 0;
+    // pq_keypair is nullptr for a service without an ML-DSA identity.
+    virtual void set_service_signing_identity(
+      std::shared_ptr<ccf::crypto::ECKeyPair_OpenSSL> keypair,
+      ccf::crypto::MLDSAKeyPairPtr pq_keypair,
+      const COSESignaturesConfig& cose_signatures) = 0;
+    virtual const ccf::COSESignaturesConfig& get_cose_signatures_config() = 0;
   };
 
   class Consensus : public ConfigurableConsensus
   {
   public:
-    virtual ~Consensus() {}
+    ~Consensus() override = default;
 
     virtual NodeId id() = 0;
     virtual bool is_primary() = 0;
     virtual bool is_backup() = 0;
     virtual bool is_candidate() = 0;
     virtual bool can_replicate() = 0;
-    virtual bool is_at_max_capacity() = 0;
 
-    enum class SignatureDisposition
+    // Whether frontends should shed new requests due to local overload.
+    // This does not prevent consensus from processing replication traffic.
+    virtual bool should_apply_backpressure() = 0;
+
+    enum class SignatureDisposition : uint8_t
     {
       CANT_REPLICATE,
       CAN_SIGN,
@@ -459,8 +476,6 @@ namespace kv
     virtual bool replicate(const BatchVector& entries, ccf::View view) = 0;
     virtual std::pair<ccf::View, ccf::SeqNo> get_committed_txid() = 0;
 
-    virtual ccf::SeqNo get_previous_committable_seqno() = 0;
-
     virtual ccf::View get_view(ccf::SeqNo seqno) = 0;
     virtual ccf::View get_view() = 0;
     virtual std::vector<ccf::SeqNo> get_view_history(
@@ -470,13 +485,41 @@ namespace kv
     virtual ccf::SeqNo get_committed_seqno() = 0;
     virtual std::optional<NodeId> primary() = 0;
 
+    // The caller authenticates the sender and message before dispatch. The
+    // message contains only the CCF consensus protocol message struct; the
+    // payload contains appended ledger entries, which still require ledger
+    // validation. Both views are borrowed for the duration of this call.
     virtual void recv_message(
-      const NodeId& from, const uint8_t* data, size_t size) = 0;
+      const NodeId& from,
+      std::span<const uint8_t> message,
+      std::span<const uint8_t> payload = {}) = 0;
 
-    virtual void periodic(std::chrono::milliseconds) {}
-    virtual void periodic_end() {}
+    virtual void periodic(std::chrono::milliseconds /*elapsed*/) {}
 
     virtual void enable_all_domains() {}
+
+    virtual void set_retired_committed(
+      ccf::SeqNo /*seqno*/, const std::vector<NodeId>& node_ids)
+    {}
+
+    // Called once the deletion of these nodes from the service's node table
+    // is globally committed, for instance when a recovery deletes the
+    // previous service's nodes without retiring them first.
+    virtual void remove_deleted_nodes(
+      ccf::SeqNo /*seqno*/, const std::vector<NodeId>& /*node_ids*/)
+    {}
+
+    virtual void nominate_successor() {}
+
+    ccf::TxStatus evaluate_tx_status(
+      ccf::View target_view, ccf::SeqNo target_seqno)
+    {
+      const auto local_view = get_view(target_seqno);
+      const auto [committed_view, committed_seqno] = get_committed_txid();
+
+      return ccf::evaluate_tx_status(
+        target_view, target_seqno, local_view, committed_view, committed_seqno);
+    }
   };
 
   struct PendingTxInfo
@@ -484,14 +527,14 @@ namespace kv
     CommitResult success;
     std::vector<uint8_t> data;
     ccf::ClaimsDigest claims_digest;
-    crypto::Sha256Hash commit_evidence_digest;
+    ccf::crypto::Sha256Hash commit_evidence_digest;
     std::vector<ConsensusHookPtr> hooks;
 
     PendingTxInfo(
       CommitResult success_,
       std::vector<uint8_t>&& data_,
       ccf::ClaimsDigest&& claims_digest_,
-      crypto::Sha256Hash&& commit_evidence_digest_,
+      ccf::crypto::Sha256Hash&& commit_evidence_digest_,
       std::vector<ConsensusHookPtr>&& hooks_) :
       success(success_),
       data(std::move(data_)),
@@ -513,14 +556,14 @@ namespace kv
   private:
     std::vector<uint8_t> data;
     ccf::ClaimsDigest claims_digest;
-    crypto::Sha256Hash commit_evidence_digest;
+    ccf::crypto::Sha256Hash commit_evidence_digest;
     ConsensusHookPtrs hooks;
 
   public:
     MovePendingTx(
       std::vector<uint8_t>&& data_,
       ccf::ClaimsDigest&& claims_digest_,
-      crypto::Sha256Hash&& commit_evidence_digest_,
+      ccf::crypto::Sha256Hash&& commit_evidence_digest_,
       ConsensusHookPtrs&& hooks_) :
       data(std::move(data_)),
       claims_digest(std::move(claims_digest_)),
@@ -530,28 +573,82 @@ namespace kv
 
     PendingTxInfo call() override
     {
-      return PendingTxInfo(
+      return {
         CommitResult::SUCCESS,
         std::move(data),
         std::move(claims_digest),
         std::move(commit_evidence_digest),
-        std::move(hooks));
+        std::move(hooks)};
     }
   };
 
   class AbstractTxEncryptor
   {
   public:
-    virtual ~AbstractTxEncryptor() {}
+    virtual ~AbstractTxEncryptor() = default;
 
     virtual bool encrypt(
       const std::vector<uint8_t>& plain,
       const std::vector<uint8_t>& additional_data,
       std::vector<uint8_t>& serialised_header,
       std::vector<uint8_t>& cipher,
-      const TxID& tx_id,
+      const ccf::TxID& tx_id,
       EntryType entry_type = EntryType::WriteSet,
       bool historical_hint = false) = 0;
+
+    // As above, writing into the given spans. plain and cipher may be the same
+    // buffer (in-place encryption), but must otherwise not overlap each other,
+    // serialised_header or additional_data. Implementations must support
+    // in-place encryption: this default implementation copies plain first.
+    virtual bool encrypt(
+      std::span<const uint8_t> plain,
+      std::span<const uint8_t> additional_data,
+      std::span<uint8_t> serialised_header,
+      std::span<uint8_t> cipher,
+      const ccf::TxID& tx_id,
+      EntryType entry_type = EntryType::WriteSet,
+      bool historical_hint = false)
+    {
+      std::vector<uint8_t> plain_bytes;
+      std::vector<uint8_t> aad_bytes;
+      if (!plain.empty())
+      {
+        plain_bytes.assign(plain.begin(), plain.end());
+      }
+      if (!additional_data.empty())
+      {
+        aad_bytes.assign(additional_data.begin(), additional_data.end());
+      }
+      std::vector<uint8_t> header;
+      std::vector<uint8_t> output;
+      if (!encrypt(
+            plain_bytes,
+            aad_bytes,
+            header,
+            output,
+            tx_id,
+            entry_type,
+            historical_hint))
+      {
+        return false;
+      }
+      if (
+        header.size() != serialised_header.size() ||
+        output.size() != cipher.size())
+      {
+        throw std::logic_error("Incorrect transaction encryption output size");
+      }
+      if (!header.empty())
+      {
+        std::copy(header.begin(), header.end(), serialised_header.begin());
+      }
+      if (!output.empty())
+      {
+        std::copy(output.begin(), output.end(), cipher.begin());
+      }
+      return true;
+    }
+
     virtual bool decrypt(
       const std::vector<uint8_t>& cipher,
       const std::vector<uint8_t>& additional_data,
@@ -561,25 +658,90 @@ namespace kv
       Term& term,
       bool historical_hint = false) = 0;
 
+    // Implementations should override this to avoid copying the inputs, which
+    // may be as large as a snapshot.
+    virtual bool decrypt(
+      std::span<const uint8_t> cipher,
+      std::span<const uint8_t> additional_data,
+      std::span<const uint8_t> serialised_header,
+      std::vector<uint8_t>& plain,
+      Version version,
+      Term& term,
+      bool historical_hint = false)
+    {
+      return decrypt(
+        std::vector<uint8_t>(cipher.begin(), cipher.end()),
+        std::vector<uint8_t>(additional_data.begin(), additional_data.end()),
+        std::vector<uint8_t>(
+          serialised_header.begin(), serialised_header.end()),
+        plain,
+        version,
+        term,
+        historical_hint);
+    }
+
+    // Decrypts data in place, replacing the ciphertext with the plaintext.
+    // data must not overlap additional_data or serialised_header. If this
+    // returns false, data holds no unauthenticated plaintext, but its contents
+    // are otherwise unspecified. Implementations should override this to avoid
+    // a second buffer of data's size: this default decrypts into one, and
+    // copies the plaintext back.
+    virtual bool decrypt_in_place(
+      std::span<uint8_t> data,
+      std::span<const uint8_t> additional_data,
+      std::span<const uint8_t> serialised_header,
+      Version version,
+      Term& term,
+      bool historical_hint = false)
+    {
+      std::vector<uint8_t> plain;
+      if (
+        !decrypt(
+          std::span<const uint8_t>(data),
+          additional_data,
+          serialised_header,
+          plain,
+          version,
+          term,
+          historical_hint) ||
+        plain.size() != data.size())
+      {
+        return false;
+      }
+      std::copy(plain.begin(), plain.end(), data.begin());
+      return true;
+    }
+
     virtual void rollback(Version version) = 0;
 
     virtual size_t get_header_length() = 0;
     virtual uint64_t get_term(const uint8_t* data, size_t size) = 0;
 
-    virtual crypto::HashBytes get_commit_nonce(
-      const TxID& tx_id, bool historical_hint = false) = 0;
+    virtual ccf::crypto::HashBytes get_commit_nonce(
+      const ccf::TxID& tx_id, bool historical_hint = false) = 0;
+
+    std::string get_commit_evidence(
+      const ccf::TxID& tx_id, bool historical_hint = false)
+    {
+      auto nonce = get_commit_nonce(tx_id, historical_hint);
+      return fmt::format(
+        "ce:{}.{}:{}", tx_id.view, tx_id.seqno, ccf::ds::to_hex(nonce));
+    }
   };
+
   using EncryptorPtr = std::shared_ptr<AbstractTxEncryptor>;
 
   class AbstractSnapshotter
   {
   public:
-    virtual ~AbstractSnapshotter(){};
+    virtual ~AbstractSnapshotter() = default;
 
-    virtual bool record_committable(kv::Version v) = 0;
-    virtual void commit(kv::Version v, bool generate_snapshot) = 0;
-    virtual void rollback(kv::Version v) = 0;
+    virtual bool record_committable(ccf::kv::Version v) = 0;
+    virtual bool should_schedule_snapshot(ccf::kv::Version v) = 0;
+    virtual void commit(ccf::kv::Version v, bool generate_snapshot) = 0;
+    virtual void rollback(ccf::kv::Version v) = 0;
   };
+
   using SnapshotterPtr = std::shared_ptr<AbstractSnapshotter>;
 
   class AbstractChangeSet
@@ -587,7 +749,7 @@ namespace kv
   public:
     virtual ~AbstractChangeSet() = default;
 
-    virtual bool has_writes() const = 0;
+    [[nodiscard]] virtual bool has_writes() const = 0;
   };
 
   class AbstractCommitter
@@ -596,15 +758,13 @@ namespace kv
     virtual ~AbstractCommitter() = default;
 
     virtual bool has_writes() = 0;
-    virtual bool prepare(bool track_commits) = 0;
-    virtual void commit(
-      Version v,
-      bool track_read_versions,
-      bool track_deletes_on_missing_keys) = 0;
+    virtual bool prepare() = 0;
+    virtual void commit(Version v, bool track_deletes_on_missing_keys) = 0;
     virtual ConsensusHookPtr post_commit() = 0;
   };
 
   class AbstractStore;
+
   class AbstractMap : public std::enable_shared_from_this<AbstractMap>,
                       public GetName
   {
@@ -614,20 +774,18 @@ namespace kv
     public:
       virtual ~Snapshot() = default;
       virtual void serialise(KvStoreSerialiser& s) = 0;
-      virtual SecurityDomain get_security_domain() const = 0;
+      [[nodiscard]] virtual SecurityDomain get_security_domain() const = 0;
     };
 
     using GetName::GetName;
-    virtual ~AbstractMap() {}
+    ~AbstractMap() override = default;
 
     virtual std::unique_ptr<AbstractCommitter> create_committer(
       AbstractChangeSet* changes) = 0;
 
     virtual AbstractStore* get_store() = 0;
     virtual void serialise_changes(
-      const AbstractChangeSet* changes,
-      KvStoreSerialiser& s,
-      bool include_reads) = 0;
+      const AbstractChangeSet* changes, KvStoreSerialiser& s) = 0;
     virtual void compact(Version v) = 0;
     virtual std::unique_ptr<Snapshot> snapshot(Version v) = 0;
     virtual void post_compact() = 0;
@@ -636,9 +794,6 @@ namespace kv
     virtual void unlock() = 0;
     virtual SecurityDomain get_security_domain() = 0;
     virtual void clear() = 0;
-
-    virtual AbstractMap* clone(AbstractStore* store) = 0;
-    virtual void swap(AbstractMap* map) = 0;
   };
 
   class Tx;
@@ -647,32 +802,15 @@ namespace kv
   {
   public:
     virtual ~AbstractExecutionWrapper() = default;
-    virtual kv::ApplyResult apply(
+    virtual ccf::kv::ApplyResult apply(
       bool track_deletes_on_missing_keys = false) = 0;
-    virtual kv::ConsensusHookPtrs& get_hooks() = 0;
+    virtual ccf::kv::ConsensusHookPtrs& get_hooks() = 0;
     virtual const std::vector<uint8_t>& get_entry() = 0;
-    virtual kv::Term get_term() = 0;
-    virtual kv::Version get_index() = 0;
-    virtual bool support_async_execution() = 0;
-    virtual bool is_public_only() = 0;
+    virtual ccf::kv::Term get_term() = 0;
+    virtual ccf::kv::Version get_index() = 0;
     virtual ccf::ClaimsDigest&& consume_claims_digest() = 0;
-    virtual std::optional<crypto::Sha256Hash>&&
+    virtual std::optional<ccf::crypto::Sha256Hash>&&
     consume_commit_evidence_digest() = 0;
-
-    // Setting a short rollback is a work around that should be fixed
-    // shortly. In BFT mode when we deserialize and realize we need to
-    // create a new map we remember this. If we need to create the same
-    // map multiple times (for tx in the same group of append entries) the
-    // first create successes but the second fails because the map is
-    // already there. This works around the problem by stopping just
-    // before the 2nd create (which failed at this point) and when the
-    // primary resends the append entries we will succeed as the map is
-    // already there. This will only occur on BFT startup so not a perf
-    // problem but still need to be resolved.
-    //
-    // Thus, a large rollback is one which did not result from the map creating
-    // issue. https://github.com/microsoft/CCF/issues/2799
-    virtual bool should_rollback_to_last_committed() = 0;
   };
 
   class AbstractStore
@@ -682,23 +820,23 @@ namespace kv
     {
     public:
       virtual ~AbstractSnapshot() = default;
-      virtual Version get_version() const = 0;
+      [[nodiscard]] virtual Version get_version() const = 0;
       virtual std::vector<uint8_t> serialise(
         const std::shared_ptr<AbstractTxEncryptor>& encryptor) = 0;
     };
 
-    virtual ~AbstractStore() {}
+    virtual ~AbstractStore() = default;
 
     virtual void lock_map_set() = 0;
     virtual void unlock_map_set() = 0;
 
-    virtual Version next_version() = 0;
-    virtual std::tuple<Version, Version> next_version(bool commit_new_map) = 0;
-    virtual TxID next_txid() = 0;
+    virtual std::optional<std::tuple<Version, Version>> next_version(
+      Term expected_commit_term) = 0;
+    virtual ccf::TxID next_txid() = 0;
 
     virtual Version current_version() = 0;
-    virtual TxID current_txid() = 0;
-    virtual std::pair<TxID, Term> current_txid_and_commit_term() = 0;
+    virtual ccf::TxID current_txid() = 0;
+    virtual std::pair<ccf::TxID, Term> current_txid_and_commit_term() = 0;
 
     virtual Version compacted_version() = 0;
     virtual Term commit_view() = 0;
@@ -712,19 +850,29 @@ namespace kv
 
     virtual std::shared_ptr<Consensus> get_consensus() = 0;
     virtual std::shared_ptr<TxHistory> get_history() = 0;
+    virtual std::shared_ptr<ILedgerChunker> get_chunker() = 0;
     virtual EncryptorPtr get_encryptor() = 0;
+    [[nodiscard]] virtual size_t get_max_transaction_size() const = 0;
     virtual std::unique_ptr<AbstractExecutionWrapper> deserialize(
       const std::vector<uint8_t>& data,
       bool public_only = false,
-      const std::optional<TxID>& expected_txid = std::nullopt) = 0;
+      const std::optional<ccf::TxID>& expected_txid = std::nullopt) = 0;
     virtual void compact(Version v) = 0;
-    virtual void rollback(const TxID& tx_id, Term write_term_) = 0;
+    virtual void rollback(const ccf::TxID& tx_id, Term write_term_) = 0;
     virtual void initialise_term(Term t) = 0;
     virtual CommitResult commit(
-      const TxID& txid,
+      const ccf::TxID& txid,
       std::unique_ptr<PendingTx> pending_tx,
       bool globally_committable) = 0;
     virtual bool check_rollback_count(Version count) = 0;
+    virtual bool apply_tx_flags(
+      Version version,
+      Term expected_term,
+      Version expected_rollback_count,
+      bool force_ledger_chunk,
+      bool snapshot_at_next_signature) = 0;
+    virtual std::optional<bool> should_create_ledger_chunk_for_reserved_tx(
+      Version version, Term expected_term, Version expected_rollback_count) = 0;
 
     virtual std::unique_ptr<AbstractSnapshot> snapshot_unsafe_maps(
       Version v) = 0;
@@ -738,23 +886,21 @@ namespace kv
       ConsensusHookPtrs& hooks,
       std::vector<Version>* view_history = nullptr,
       bool public_only = false) = 0;
-    virtual bool must_force_ledger_chunk(Version version) = 0;
-    virtual bool must_force_ledger_chunk_unsafe(Version version) = 0;
+    virtual bool should_create_ledger_chunk(Version version) = 0;
+    virtual bool should_create_ledger_chunk_unsafe(Version version) = 0;
 
     virtual size_t committable_gap() = 0;
 
-    enum class Flag : uint8_t
+    enum class StoreFlag : uint8_t
     {
-      LEDGER_CHUNK_AT_NEXT_SIGNATURE = 0x01,
       SNAPSHOT_AT_NEXT_SIGNATURE = 0x02
     };
 
-    virtual void set_flag(Flag f) = 0;
-    virtual void unset_flag(Flag f) = 0;
-    virtual bool flag_enabled(Flag f) = 0;
-    virtual void set_flag_unsafe(Flag f) = 0;
-    virtual void unset_flag_unsafe(Flag f) = 0;
-    virtual bool flag_enabled_unsafe(Flag f) const = 0;
+    virtual void set_flag(StoreFlag f) = 0;
+    virtual bool flag_enabled(StoreFlag f) = 0;
+    virtual void set_flag_unsafe(StoreFlag f) = 0;
+    virtual void unset_flag_unsafe(StoreFlag f) = 0;
+    [[nodiscard]] virtual bool flag_enabled_unsafe(StoreFlag f) const = 0;
   };
 
   template <class StorePointer>
@@ -762,10 +908,12 @@ namespace kv
   {
   public:
     ScopedStoreMapsLock() = delete;
-    ScopedStoreMapsLock(StorePointer _store) : store(_store)
+
+    ScopedStoreMapsLock(StorePointer _store) : store(std::move(_store))
     {
       store->lock_maps();
     }
+
     ~ScopedStoreMapsLock()
     {
       store->unlock_maps();
@@ -780,7 +928,7 @@ namespace kv
 FMT_BEGIN_NAMESPACE
 
 template <>
-struct formatter<kv::Configuration::Nodes>
+struct formatter<ccf::kv::Configuration::Nodes>
 {
   template <typename ParseContext>
   constexpr auto parse(ParseContext& ctx)
@@ -789,20 +937,20 @@ struct formatter<kv::Configuration::Nodes>
   }
 
   template <typename FormatContext>
-  auto format(const kv::Configuration::Nodes& nodes, FormatContext& ctx) const
-    -> decltype(ctx.out())
+  auto format(const ccf::kv::Configuration::Nodes& nodes, FormatContext& ctx)
+    const -> decltype(ctx.out())
   {
     std::set<ccf::NodeId> node_ids;
-    for (auto& [nid, _] : nodes)
+    for (const auto& [nid, _] : nodes)
     {
       node_ids.insert(nid);
     }
-    return format_to(ctx.out(), "{{{}}}", fmt::join(node_ids, " "));
+    return fmt::format_to(ctx.out(), "{{{}}}", fmt::join(node_ids, " "));
   }
 };
 
 template <>
-struct formatter<kv::MembershipState>
+struct formatter<ccf::kv::MembershipState>
 {
   template <typename ParseContext>
   constexpr auto parse(ParseContext& ctx)
@@ -811,7 +959,7 @@ struct formatter<kv::MembershipState>
   }
 
   template <typename FormatContext>
-  auto format(const kv::MembershipState& state, FormatContext& ctx) const
+  auto format(const ccf::kv::MembershipState& state, FormatContext& ctx) const
     -> decltype(ctx.out())
   {
     const auto s = nlohmann::json(state).get<std::string>();
@@ -820,7 +968,7 @@ struct formatter<kv::MembershipState>
 };
 
 template <>
-struct formatter<kv::LeadershipState>
+struct formatter<ccf::kv::LeadershipState>
 {
   template <typename ParseContext>
   constexpr auto parse(ParseContext& ctx)
@@ -829,7 +977,7 @@ struct formatter<kv::LeadershipState>
   }
 
   template <typename FormatContext>
-  auto format(const kv::LeadershipState& state, FormatContext& ctx) const
+  auto format(const ccf::kv::LeadershipState& state, FormatContext& ctx) const
     -> decltype(ctx.out())
   {
     const auto s = nlohmann::json(state).get<std::string>();

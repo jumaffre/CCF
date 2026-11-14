@@ -1,22 +1,7 @@
-import * as rs from "jsrsasign";
-import { Base64 } from "js-base64";
-
 import * as ccfapp from "@microsoft/ccf-app";
 import * as ccfcrypto from "@microsoft/ccf-app/crypto";
-
-interface CryptoResponse {
-  available: boolean;
-}
-
-export function crypto(
-  request: ccfapp.Request,
-): ccfapp.Response<CryptoResponse> {
-  // Most functionality of jsrsasign requires keys.
-  // Generating a key here is too slow, so we'll just check if the
-  // JS API got exported correctly.
-  let available = rs.KEYUTIL.generateKeypair ? true : false;
-  return { body: { available: available } };
-}
+import { toArrayBuffer } from "@microsoft/ccf-app/utils";
+import { base64ToUint8Array } from "./base64";
 
 interface GenerateAesKeyRequest {
   size: number;
@@ -96,9 +81,7 @@ interface RsaOaepAesKwpParams {
 }
 
 type WrapAlgoParams =
-  | RsaOaepParams
-  | RsaOaepAesKwpParams
-  | ccfcrypto.AesKwpParams;
+  RsaOaepParams | RsaOaepAesKwpParams | ccfcrypto.AesKwpParams;
 
 interface WrapKeyRequest {
   key: Base64; // typically an AES key
@@ -130,6 +113,38 @@ export function wrapKey(
     wrappedKey = ccfcrypto.wrapKey(key, wrappingKey, r.wrapAlgo);
   }
   return { body: wrappedKey };
+}
+
+interface UnwrapKeyRequest {
+  key: Base64; // typically an AES key
+  unwrappingKey: Base64; // base64 encoding of PEM-encoded RSA private key or AES key bytes
+  wrapAlgo: WrapAlgoParams; // Wrapping algorithm parameters
+}
+
+export function unwrapKey(
+  request: ccfapp.Request<UnwrapKeyRequest>,
+): ccfapp.Response<ArrayBuffer> {
+  const r = request.body.json();
+  const key = b64ToBuf(r.key);
+  const unwrappingKey = b64ToBuf(r.unwrappingKey);
+  let unwrappedKey: ArrayBuffer;
+  if (r.wrapAlgo.name == "RSA-OAEP") {
+    const label = r.wrapAlgo.label ? b64ToBuf(r.wrapAlgo.label) : undefined;
+    unwrappedKey = ccfcrypto.unwrapKey(key, unwrappingKey, {
+      name: r.wrapAlgo.name,
+      label: label,
+    });
+  } else if (r.wrapAlgo.name == "RSA-OAEP-AES-KWP") {
+    const label = r.wrapAlgo.label ? b64ToBuf(r.wrapAlgo.label) : undefined;
+    unwrappedKey = ccfcrypto.unwrapKey(key, unwrappingKey, {
+      name: r.wrapAlgo.name,
+      aesKeySize: r.wrapAlgo.aesKeySize,
+      label: label,
+    });
+  } else {
+    unwrappedKey = ccfcrypto.unwrapKey(key, unwrappingKey, r.wrapAlgo);
+  }
+  return { body: unwrappedKey };
 }
 
 interface SignRequest {
@@ -310,7 +325,7 @@ export function eddsaJwkToPem(
 }
 
 function b64ToBuf(b64: string): ArrayBuffer {
-  return Base64.toUint8Array(b64).buffer;
+  return toArrayBuffer(base64ToUint8Array(b64));
 }
 
 function hex(buf: ArrayBuffer) {

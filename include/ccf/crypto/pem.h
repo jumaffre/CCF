@@ -11,45 +11,19 @@
 #include <string_view>
 #include <vector>
 
-namespace crypto
+namespace ccf::crypto
 {
   // Convenience class ensuring null termination of PEM-encoded certificates
   class Pem
   {
   private:
     std::string s;
-
-    void check_pem_format()
-    {
-      if (s.find("-----BEGIN") == std::string::npos)
-      {
-        throw std::runtime_error(
-          fmt::format("PEM constructed with non-PEM data: {}", s));
-      }
-    }
+    void check_pem_format();
 
   public:
     Pem() = default;
-
-    Pem(const std::string& s_) : s(s_)
-    {
-      check_pem_format();
-    }
-
-    Pem(const uint8_t* data, size_t size)
-    {
-      if (size == 0)
-        throw std::logic_error("Got PEM of size 0.");
-
-      // If it's already null-terminated, don't suffix again
-      const auto null_terminated = *(data + size - 1) == 0;
-      if (null_terminated)
-        size -= 1;
-
-      s.assign(reinterpret_cast<const char*>(data), size);
-
-      check_pem_format();
-    }
+    Pem(std::string pem_string);
+    Pem(const uint8_t* data, size_t size);
 
     explicit Pem(std::span<const uint8_t> s) : Pem(s.data(), s.size()) {}
 
@@ -70,7 +44,7 @@ namespace crypto
       return s < rhs.s;
     }
 
-    const std::string& str() const
+    [[nodiscard]] const std::string& str() const
     {
       return s;
     }
@@ -80,22 +54,22 @@ namespace crypto
       return reinterpret_cast<uint8_t*>(s.data());
     }
 
-    const uint8_t* data() const
+    [[nodiscard]] const uint8_t* data() const
     {
       return reinterpret_cast<const uint8_t*>(s.data());
     }
 
-    size_t size() const
+    [[nodiscard]] size_t size() const
     {
       return s.size();
     }
 
-    bool empty() const
+    [[nodiscard]] bool empty() const
     {
       return s.empty();
     }
 
-    std::vector<uint8_t> raw() const
+    [[nodiscard]] std::vector<uint8_t> raw() const
     {
       return {data(), data() + size()};
     }
@@ -118,34 +92,20 @@ namespace crypto
     }
     else
     {
-      throw std::runtime_error(
-        fmt::format("Unable to parse pem from this JSON: {}", j.dump()));
+      throw std::runtime_error("Unable to parse PEM from this JSON");
     }
   }
 
-  inline std::string schema_name(const Pem*)
+  inline std::string schema_name([[maybe_unused]] const Pem* pem)
   {
     return "Pem";
   }
 
-  static std::vector<crypto::Pem> split_x509_cert_bundle(
-    const std::string_view& pem)
-  {
-    std::string separator("-----END CERTIFICATE-----");
-    std::vector<crypto::Pem> pems;
-    auto separator_end = 0;
-    auto next_separator_start = pem.find(separator);
-    while (next_separator_start != std::string_view::npos)
-    {
-      pems.emplace_back(std::string(
-        pem.substr(separator_end, next_separator_start + separator.size())));
-      separator_end = next_separator_start + separator.size();
-      next_separator_start = pem.find(separator, separator_end);
-    }
-    return pems;
-  }
+  std::vector<ccf::crypto::Pem> split_x509_cert_bundle(
+    const std::string_view& pem);
 
-  inline void fill_json_schema(nlohmann::json& schema, const Pem*)
+  inline void fill_json_schema(
+    nlohmann::json& schema, [[maybe_unused]] const Pem* pem)
   {
     schema["type"] = "string";
   }
@@ -154,9 +114,9 @@ namespace crypto
 namespace std
 {
   template <>
-  struct hash<crypto::Pem>
+  struct hash<ccf::crypto::Pem>
   {
-    size_t operator()(const crypto::Pem& pem) const
+    size_t operator()(const ccf::crypto::Pem& pem) const
     {
       return std::hash<std::string>()(pem.str());
     }

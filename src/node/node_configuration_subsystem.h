@@ -18,17 +18,18 @@ namespace ccf
   public:
     NodeConfigurationSubsystem(AbstractNodeState& node_state_) :
       node_state(node_state_),
-      node_config_state({node_state_.get_node_config(), {}, false})
+      node_config_state(
+        {node_state_.get_node_config(), node_state_.get_node_data(), {}, false})
     {}
 
-    virtual ~NodeConfigurationSubsystem() = default;
+    ~NodeConfigurationSubsystem() override = default;
 
     static char const* get_subsystem_name()
     {
       return "NodeConfiguration";
     }
 
-    virtual const NodeConfigurationState& get() override
+    const NodeConfigurationState& get() override
     {
       if (!node_config_state.initialized)
       {

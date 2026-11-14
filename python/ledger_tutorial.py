@@ -1,18 +1,11 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-import sys
-from loguru import logger as LOG
 import json
 import random
-import ccf.ledger
+import sys
 
-# Change default log format
-LOG.remove()
-LOG.add(
-    sys.stdout,
-    format="<green>[{time:HH:mm:ss.SSS}]</green> {message}",
-)
+import ccf.ledger
 
 if len(sys.argv) < 2:
     print("Error: Ledger directory should be specified as first argument")
@@ -38,12 +31,14 @@ for chunk in ledger:
         public_tables = transaction.get_public_domain().get_tables()
 
         if target_table in public_tables:
-            # Ledger verification is happening implicitly in ccf.ledger.Ledger()
             for key, value in public_tables[target_table].items():
+                if value is None:
+                    print(f"{key.decode()} : <removed>")
+                    continue
                 # Note: `key` and `value` are raw bytes here.
                 # This code needs to have knowledge of the serialisation format for each table.
                 # In this case, the target table 'public:ccf.gov.nodes.info' is raw bytes to JSON.
-                LOG.info(f"{key.decode()} : {json.loads(value)}")
+                print(f"{key.decode()} : {json.loads(value)}")
 # SNIPPET_END: iterate_over_ledger
 
 # Read state of ledger

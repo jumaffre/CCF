@@ -9,38 +9,24 @@
 #include <functional>
 #include <map>
 
-namespace kv
+namespace ccf::kv
 {
   // All collections of Map must be ordered so that we lock their contained
   // maps in a stable order. The order here is by map name
   using MapCollection = std::map<std::string, std::shared_ptr<AbstractMap>>;
 
-  struct AbstractChangeContainer
-  {
-    virtual ~AbstractChangeContainer() = default;
-    virtual void set_change_list(OrderedChanges&& change_list, Term term) = 0;
-  };
-
   // Atomically checks for conflicts then applies the writes in the given change
   // sets to their underlying Maps. Calls f() at most once, iff the writes are
-  // applied, to retrieve a unique Version for the write set and return the max
-  // version which can have a conflict with the transaction.
-  //
-  // The track_read_versions parameter tells the store if it needs to track the
-  // last read version for every key. This is required for backup execution as
-  // described at the top of tx.h
+  // applied, to retrieve a unique Version for the write set.
 
-  using VersionLastNewMap = Version;
-  using VersionResolver = std::function<std::tuple<Version, VersionLastNewMap>(
-    bool tx_contains_new_map)>;
+  using VersionResolver = std::function<std::optional<Version>()>;
 
   static inline std::optional<Version> apply_changes(
     OrderedChanges& changes,
     VersionResolver version_resolver_fn,
-    kv::ConsensusHookPtrs& hooks,
+    ccf::kv::ConsensusHookPtrs& hooks,
     const MapCollection& new_maps,
     const std::optional<Version>& new_maps_conflict_version,
-    bool track_read_versions,
     bool track_deletes_on_missing_keys,
     const std::optional<Version>& expected_rollback_count = std::nullopt)
   {
@@ -57,17 +43,10 @@ namespace kv
       views[map_name] = mc.map->create_committer(mc.changeset.get());
     }
 
-    for (auto it = changes.begin(); it != changes.end(); ++it)
+    for (auto& [map_name, mc] : changes)
     {
-      bool changeset_has_writes = it->second.changeset->has_writes();
-      if (changeset_has_writes)
-      {
-        has_writes = true;
-      }
-      if (changeset_has_writes || track_read_versions)
-      {
-        it->second.map->lock();
-      }
+      has_writes |= mc.changeset->has_writes();
+      mc.map->lock();
     }
 
     bool ok = true;
@@ -77,7 +56,7 @@ namespace kv
       // expected_rollback_count is only set on signature transactions
       // which always contain some writes, and on which all the maps
       // point to the same store.
-      auto store = changes.begin()->second.map->get_store();
+      auto* store = changes.begin()->second.map->get_store();
       if (store != nullptr)
       {
         // Note that this is done when holding the lock on at least some maps
@@ -93,9 +72,9 @@ namespace kv
 
     if (ok && has_writes)
     {
-      for (auto it = views.begin(); it != views.end(); ++it)
+      for (auto& [view_name, view_ptr] : views)
       {
-        if (!it->second->prepare(track_read_versions))
+        if (!view_ptr->prepare())
         {
           ok = false;
           break;
@@ -111,11 +90,11 @@ namespace kv
       // versions. This is fine - none can create maps (ie - change their
       // conflict set with this operation) while we hold the store lock. Assume
       // that the caller is currently holding store->lock()
-      auto store = map_ptr->get_store();
+      auto* store = map_ptr->get_store();
 
       // This is to avoid recursively locking version_lock by calling
       // current_version() in the commit_reserved case.
-      kv::Version current_v;
+      ccf::kv::Version current_v = 0;
       if (new_maps_conflict_version.has_value())
       {
         current_v = *new_maps_conflict_version;
@@ -135,11 +114,17 @@ namespace kv
     if (ok && has_writes)
     {
       // Get the version number to be used for this commit.
-      kv::Version version_last_new_map;
-      std::tie(version, version_last_new_map) =
-        version_resolver_fn(!new_maps.empty());
+      const auto resolved_version = version_resolver_fn();
+      if (resolved_version.has_value())
+      {
+        version = resolved_version.value();
+      }
+      else
+      {
+        ok = false;
+      }
 
-      if (!track_read_versions)
+      if (ok)
       {
         // Transfer ownership of these new maps to their target stores, iff we
         // have writes to them
@@ -152,35 +137,31 @@ namespace kv
           }
         }
 
-        for (auto it = views.begin(); it != views.end(); ++it)
+        for (auto& [view_name, view_ptr] : views)
         {
-          it->second->commit(
-            version, track_read_versions, track_deletes_on_missing_keys);
+          view_ptr->commit(version, track_deletes_on_missing_keys);
         }
 
         // Collect ConsensusHooks
-        for (auto it = views.begin(); it != views.end(); ++it)
+        for (auto& [view_name, view_ptr] : views)
         {
-          auto hook_ptr = it->second->post_commit();
+          auto hook_ptr = view_ptr->post_commit();
           if (hook_ptr != nullptr)
           {
             hooks.push_back(std::move(hook_ptr));
           }
         }
       }
-      else
-      {
-        // A linearizability violation was detected
-        ok = false;
-      }
     }
 
-    for (auto it = changes.begin(); it != changes.end(); ++it)
+    KV_TRACE(
+      if (!ok) { trace::local_result("conflict", 0); } else if (!has_writes) {
+        trace::local_result("success", 0);
+      });
+
+    for (auto& [map_name, mc] : changes)
     {
-      if (it->second.changeset->has_writes() || track_read_versions)
-      {
-        it->second.map->unlock();
-      }
+      mc.map->unlock();
     }
 
     if (!ok)

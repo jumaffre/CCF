@@ -4,10 +4,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 // C++ port of reference implementation
-namespace siphash
+// NOLINTBEGIN(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
+namespace ccf::siphash
 {
   using SipState = uint64_t[4];
   using SipKey = uint64_t[2];
@@ -61,7 +63,7 @@ namespace siphash
     }
   }
 
-  enum class OutputLength
+  enum class OutputLength : uint8_t
   {
     EightBytes = 8,
     SixteenBytes = 16,
@@ -95,7 +97,7 @@ namespace siphash
       s[1] ^= 0xee;
     }
 
-    uint64_t m;
+    uint64_t m = 0;
     for (; in != end; in += 8)
     {
       m = bytes_to_64_le(in);
@@ -112,21 +114,41 @@ namespace siphash
     switch (left)
     {
       case 7:
+      {
         b |= (uint64_t)in[6] << 48;
+      }
       case 6:
+      {
         b |= (uint64_t)in[5] << 40;
+      }
       case 5:
+      {
         b |= (uint64_t)in[4] << 32;
+      }
       case 4:
+      {
         b |= (uint64_t)in[3] << 24;
+      }
       case 3:
+      {
         b |= (uint64_t)in[2] << 16;
+      }
       case 2:
+      {
         b |= (uint64_t)in[1] << 8;
+      }
       case 1:
+      {
         b |= (uint64_t)in[0];
+      }
       case 0:
+      {
         break;
+      }
+      default:
+      {
+        throw std::logic_error("unreachable");
+      }
     }
 
     s[3] ^= b;
@@ -160,14 +182,12 @@ namespace siphash
 
     b = s[0] ^ s[1] ^ s[2] ^ s[3];
     u64_to_bytes_le(b, out + 8);
-
-    return;
   }
 
   template <size_t CompressionRounds, size_t FinalizationRounds>
   uint64_t siphash(const uint8_t* data, size_t size, const SipKey& key)
   {
-    uint64_t out;
+    uint64_t out = 0;
 
     siphash_raw<
       CompressionRounds,
@@ -185,3 +205,5 @@ namespace siphash
       in.data(), in.size(), key);
   }
 }
+
+// NOLINTEND(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)

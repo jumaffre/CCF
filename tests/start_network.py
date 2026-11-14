@@ -1,17 +1,35 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-import infra.e2e_args
-import infra.interfaces
-import infra.network
+import argparse
 import http
-import time
-import sys
 import json
 import os
 import shutil
+import sys
+import time
+
+import infra.e2e_args
+import infra.interfaces
+import infra.network
+import infra.platform_detection
 from loguru import logger as LOG
 
 DEFAULT_NODES = ["local://127.0.0.1:8000"]
+
+START_NETWORK_CLI_ARGUMENT_CONFIG_PATHS = {
+    "node": None,
+    "verbose": None,
+    "recover": None,
+    "ledger_dir": None,
+    "snapshots_dir": None,
+    "common_dir": None,
+    "auto_shutdown": None,
+    "auto_shutdown_delay_s": None,
+    "redirection_kind": None,
+    "primary_hostname": None,
+    "backup_hostname": None,
+    "use_defaults_from_host_config": None,
+}
 
 
 def run(args):
@@ -28,8 +46,36 @@ def run(args):
         host_descs = args.node or DEFAULT_NODES
         hosts = []
         for host_desc in host_descs:
-            interface = infra.interfaces.RPCInterface.from_args(args)
+            interface = infra.interfaces.RPCInterface()
+            interface.apply_args(args)
             interface.parse_from_str(host_desc)
+
+            if args.redirection_kind == "node-by-role":
+                LOG.warning("Redirection with node-by-role is enabled")
+                interface.redirections = infra.interfaces.RedirectionConfig(
+                    to_primary=infra.interfaces.NodeByRoleResolver(),
+                    to_backup=infra.interfaces.NodeByRoleResolver(
+                        target=infra.interfaces.TargetRole(
+                            infra.interfaces.NodeRole.backup
+                        )
+                    ),
+                )
+            elif args.redirection_kind == "static-address":
+                LOG.warning("Redirection with static-address is enabled")
+                interface.redirections = infra.interfaces.RedirectionConfig(
+                    to_primary=infra.interfaces.StaticAddressResolver(
+                        args.primary_hostname
+                    ),
+                    to_backup=infra.interfaces.StaticAddressResolver(
+                        args.backup_hostname
+                    ),
+                )
+
+            interface.enabled_operator_features = [
+                "SnapshotRead",
+                "LedgerChunkRead",
+            ]
+
             hosts.append(
                 infra.interfaces.HostSpec(
                     rpc_interfaces={infra.interfaces.PRIMARY_RPC_INTERFACE: interface}
@@ -40,12 +86,12 @@ def run(args):
         LOG.remove()
         LOG.add(
             sys.stdout,
-            format="<green>[{time:HH:mm:ss.SSS}]</green> {message}",
+            format="[{time:HH:mm:ss.SSS}] {message}",
         )
         LOG.disable("infra")
         LOG.disable("ccf")
 
-    if args.enclave_platform == "virtual":
+    if infra.platform_detection.is_virtual():
         LOG.warning("Virtual mode enabled")
     LOG.info(f"Starting {len(hosts)} CCF node{'s' if len(hosts) > 1 else ''}...")
 
@@ -111,10 +157,7 @@ def run(args):
             LOG.info("Started CCF network with the following nodes:")
             for node in nodes:
                 LOG.info(
-                    "  Node [{}] = https://{}".format(
-                        pad_node_id(node.local_node_id),
-                        node.get_public_rpc_address(),
-                    )
+                    f"  Node [{pad_node_id(node.local_node_id)}] = https://{node.get_public_rpc_address()}"
                 )
 
             LOG.info(
@@ -163,6 +206,9 @@ def run(args):
 
 
 if __name__ == "__main__":
+    defaults_parser = argparse.ArgumentParser(add_help=False)
+    defaults_parser.add_argument("--use-defaults-from-host-config", action="store_true")
+    defaults, _ = defaults_parser.parse_known_args()
 
     def add(parser):
         parser.add_argument(
@@ -209,10 +255,40 @@ if __name__ == "__main__":
             type=int,
             default=0,
         )
+        parser.add_argument(
+            "--redirection-kind",
+            choices=["node-by-role", "static-address"],
+            help="The redirection kind to use in lieu of forwarding. Either node-by-role or static-address",
+        )
+        parser.add_argument(
+            "--primary-hostname",
+            help="The primary hostname to set when --redirection-kind is set to static-address",
+        )
+        parser.add_argument(
+            "--backup-hostname",
+            help="The backup hostname to set when --redirection-kind is set to static-address",
+        )
+        parser.add_argument(
+            "--use-defaults-from-host-config",
+            help="Use defaults and descriptions from the cchost configuration schema",
+            action="store_true",
+        )
 
-    args = infra.e2e_args.cli_args(add)
+    args = infra.e2e_args.cli_args(
+        add,
+        use_host_config_defaults=defaults.use_defaults_from_host_config,
+        additional_cli_argument_config_paths=START_NETWORK_CLI_ARGUMENT_CONFIG_PATHS,
+    )
     if args.recover and not all([args.ledger_dir, args.common_dir]):
         print("Error: --recover requires --ledger-dir and --common-dir arguments.")
+        sys.exit(1)
+
+    if args.redirection_kind == "static-address" and not all(
+        [args.primary_hostname, args.backup_hostname]
+    ):
+        print(
+            "Error: --redirection-kind static-address requires --primary-hostname and --backup-hostname arguments."
+        )
         sys.exit(1)
 
     if args.common_dir is not None:

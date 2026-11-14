@@ -2,123 +2,160 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/cose_signatures_config.h"
 #include "ccf/crypto/curve.h"
+#include "ccf/crypto/mldsa_key_pair.h"
+#include "ccf/crypto/verifier.h"
 #include "crypto/certs.h"
-#include "crypto/openssl/key_pair.h"
+#include "crypto/openssl/ec_key_pair.h"
+#include "crypto/openssl/mldsa_support.h"
 
 #include <openssl/crypto.h>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace ccf
 {
-  enum class IdentityType
-  {
-    REPLICATED,
-    SPLIT
-  };
-
   struct NetworkIdentity
   {
-    crypto::Pem priv_key;
-    crypto::Pem cert;
-    std::optional<IdentityType> type;
+    ccf::crypto::Pem priv_key;
+    ccf::crypto::Pem cert;
+    std::optional<ccf::crypto::Pem> pq_priv_key = std::nullopt;
+    std::optional<ccf::crypto::Pem> pq_cert = std::nullopt;
 
-    bool operator==(const NetworkIdentity& other) const
-    {
-      return cert == other.cert && priv_key == other.priv_key &&
-        type == other.type;
-    }
+    bool operator==(const NetworkIdentity& other) const = default;
 
-    NetworkIdentity() : type(IdentityType::REPLICATED) {}
-    NetworkIdentity(IdentityType type) : type(type) {}
-
-    virtual crypto::Pem issue_certificate(
-      const std::string& valid_from, size_t validity_period_days)
-    {
-      return {};
-    }
-
-    virtual void set_certificate(const crypto::Pem& certificate) {}
-
-    virtual ~NetworkIdentity() {}
-  };
-
-  class ReplicatedNetworkIdentity : public NetworkIdentity
-  {
-  public:
-    static constexpr auto subject_name = "CN=CCF Network";
-
-    ReplicatedNetworkIdentity() : NetworkIdentity(IdentityType::REPLICATED) {}
-
-    ReplicatedNetworkIdentity(
-      crypto::CurveID curve_id,
+    NetworkIdentity(
+      const std::string& subject_name,
+      ccf::crypto::CurveID curve_id,
+      ccf::crypto::MLDSAParameterSet pq_parameter_set,
       const std::string& valid_from,
-      size_t validity_period_days) :
-      NetworkIdentity(IdentityType::REPLICATED)
+      size_t validity_period_days)
     {
       auto identity_key_pair =
-        std::make_shared<crypto::KeyPair_OpenSSL>(curve_id);
+        std::make_shared<ccf::crypto::ECKeyPair_OpenSSL>(curve_id);
       priv_key = identity_key_pair->private_key_pem();
 
-      cert = crypto::create_self_signed_cert(
+      cert = ccf::crypto::create_self_signed_cert(
         identity_key_pair,
         subject_name,
         {} /* SAN */,
         valid_from,
         validity_period_days);
+      create_pq_identity(
+        subject_name, pq_parameter_set, valid_from, validity_period_days);
     }
 
-    ReplicatedNetworkIdentity(const NetworkIdentity& other) :
-      NetworkIdentity(IdentityType::REPLICATED)
-    {
-      if (type != other.type)
-      {
-        throw std::runtime_error("invalid identity type conversion");
-      }
-      priv_key = other.priv_key;
-      cert = other.cert;
-    }
-
-    virtual crypto::Pem issue_certificate(
-      const std::string& valid_from, size_t validity_period_days) override
+    NetworkIdentity(
+      const std::vector<uint8_t>& subject_name_der,
+      ccf::crypto::CurveID curve_id,
+      ccf::crypto::MLDSAParameterSet pq_parameter_set,
+      const std::string& valid_from,
+      size_t validity_period_days)
     {
       auto identity_key_pair =
-        std::make_shared<crypto::KeyPair_OpenSSL>(priv_key);
+        std::make_shared<ccf::crypto::ECKeyPair_OpenSSL>(curve_id);
+      priv_key = identity_key_pair->private_key_pem();
 
-      return crypto::create_self_signed_cert(
+      cert = ccf::crypto::create_self_signed_cert(
         identity_key_pair,
-        subject_name,
+        subject_name_der,
+        {} /* SAN */,
+        valid_from,
+        validity_period_days);
+      create_pq_identity(
+        subject_name_der, pq_parameter_set, valid_from, validity_period_days);
+    }
+
+    NetworkIdentity(const NetworkIdentity& other) = default;
+
+    NetworkIdentity() = default;
+
+    virtual ~NetworkIdentity()
+    {
+      OPENSSL_cleanse(priv_key.data(), priv_key.size());
+      if (pq_priv_key.has_value())
+      {
+        OPENSSL_cleanse(pq_priv_key->data(), pq_priv_key->size());
+      }
+    }
+
+    ccf::crypto::Pem renew_certificate(
+      const std::string& valid_from, size_t validity_period_days)
+    {
+      return ccf::crypto::create_self_signed_cert(
+        get_key_pair(),
+        ccf::crypto::make_verifier(cert)->subject_der(),
         {} /* SAN */,
         valid_from,
         validity_period_days);
     }
 
-    virtual void set_certificate(const crypto::Pem& new_cert) override
+    /// Re-issues the ML-DSA certificate with the service certificate's
+    /// subject; nullopt without an ML-DSA key.
+    [[nodiscard]] std::optional<ccf::crypto::Pem> renew_pq_certificate(
+      const std::string& valid_from, size_t validity_period_days) const
+    {
+      const auto key_pair = get_pq_key_pair();
+      if (key_pair == nullptr)
+      {
+        return std::nullopt;
+      }
+      return ccf::crypto::create_self_signed_cert(
+        key_pair,
+        ccf::crypto::make_verifier(cert)->subject_der(),
+        {} /* SAN */,
+        valid_from,
+        validity_period_days);
+    }
+
+    void set_certificate(const ccf::crypto::Pem& new_cert)
     {
       cert = new_cert;
     }
 
-    ~ReplicatedNetworkIdentity() override
+    void set_pq_certificate(const std::optional<ccf::crypto::Pem>& new_pq_cert)
     {
-      OPENSSL_cleanse(priv_key.data(), priv_key.size());
+      pq_cert = new_pq_cert;
     }
-  };
 
-  class SplitNetworkIdentity : public NetworkIdentity
-  {
-  public:
-    SplitNetworkIdentity() : NetworkIdentity(IdentityType::SPLIT) {}
-
-    SplitNetworkIdentity(const NetworkIdentity& other) :
-      NetworkIdentity(IdentityType::SPLIT)
+    std::shared_ptr<ccf::crypto::ECKeyPair_OpenSSL> get_key_pair()
     {
-      if (type != other.type)
+      return std::make_shared<ccf::crypto::ECKeyPair_OpenSSL>(priv_key);
+    }
+
+    /// The ML-DSA service key, or nullptr for a classical-only service.
+    [[nodiscard]] ccf::crypto::MLDSAKeyPairPtr get_pq_key_pair() const
+    {
+      if (!pq_priv_key.has_value())
       {
-        throw std::runtime_error("invalid identity type conversion");
+        return nullptr;
       }
-      priv_key = {};
-      cert = other.cert;
+      return ccf::crypto::make_mldsa_key_pair(pq_priv_key.value());
+    }
+
+  private:
+    template <typename SubjectName>
+    void create_pq_identity(
+      const SubjectName& subject_name,
+      ccf::crypto::MLDSAParameterSet pq_parameter_set,
+      const std::string& valid_from,
+      size_t validity_period_days)
+    {
+      if (!ccf::crypto::mldsa_supported())
+      {
+        return;
+      }
+
+      auto pq_key_pair = ccf::crypto::make_mldsa_key_pair(pq_parameter_set);
+      pq_priv_key = pq_key_pair->private_key_pem();
+      pq_cert = ccf::crypto::create_self_signed_cert(
+        pq_key_pair,
+        subject_name,
+        {} /* SAN */,
+        valid_from,
+        validity_period_days);
     }
   };
 }

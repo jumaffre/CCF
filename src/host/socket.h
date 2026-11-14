@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ds/logger.h"
+#include "ds/internal_logger.h"
 
 #include <uv.h>
 
@@ -27,16 +27,19 @@ namespace asynchost
       name(name),
       conn_name(conn_name)
     {}
-    virtual ~SocketBehaviour() {}
+
+    virtual ~SocketBehaviour() = default;
 
     /// To be implemented by clients
-    virtual void on_read(size_t, uint8_t*&, sockaddr) {}
+    /// Return false to immediately disconnect socket.
+    virtual bool on_read(
+      size_t /*unused*/, uint8_t*& /*unused*/, sockaddr /*unused*/)
+    {
+      return true;
+    }
 
     /// To be implemented by servers with connections
-    virtual void on_accept(ConnType&) {}
-
-    /// To be implemented by all servers (after registration)
-    virtual void on_start(int64_t) {}
+    virtual void on_accept(ConnType& /*unused*/) {}
 
     /// Generic loggers for common reactions
     virtual void on_listening(
@@ -44,10 +47,12 @@ namespace asynchost
     {
       LOG_INFO_FMT("{} {} listening on {}:{}", conn_name, name, host, service);
     }
+
     virtual void on_connect()
     {
       LOG_INFO_FMT("{} {} connected", conn_name, name);
     }
+
     virtual void on_disconnect()
     {
       LOG_TRACE_FMT("{} {} disconnected", conn_name, name);
@@ -58,6 +63,7 @@ namespace asynchost
     {
       LOG_INFO_FMT("{} {} bind failed", conn_name, name);
     }
+
     virtual void on_connect_failed()
     {
       LOG_INFO_FMT("{} {} connect failed", conn_name, name);
@@ -66,24 +72,31 @@ namespace asynchost
     /// Failure loggers for when things go wrong, fataly
     virtual void on_resolve_failed()
     {
-      LOG_FATAL_FMT("{} {} resolve failed", conn_name, name);
+      const auto message = fmt::format("{} {} resolve failed", conn_name, name);
+      LOG_FATAL_FMT("{}", message);
+      ccf::logger::write_fatal_diagnostic(message);
+      abort();
     }
+
     virtual void on_listen_failed()
     {
-      LOG_FATAL_FMT("{} {} listen failed", conn_name, name);
+      const auto message = fmt::format("{} {} listen failed", conn_name, name);
+      LOG_FATAL_FMT("{}", message);
+      ccf::logger::write_fatal_diagnostic(message);
+      abort();
     }
   };
 
-  std::pair<std::string, std::string> addr_to_str(
+  inline std::pair<std::string, std::string> addr_to_str(
     const sockaddr* addr, int address_family = AF_INET)
   {
     constexpr auto buf_len = INET6_ADDRSTRLEN;
     char buf[buf_len] = {};
-    int rc;
+    int rc = 0;
 
     if (address_family == AF_INET6)
     {
-      const auto in6 = (const sockaddr_in6*)addr;
+      const auto* const in6 = reinterpret_cast<const sockaddr_in6*>(addr);
       if ((rc = uv_ip6_name(in6, buf, buf_len)) != 0)
       {
         LOG_FAIL_FMT("uv_ip6_name failed: {}", uv_strerror(rc));
@@ -94,7 +107,7 @@ namespace asynchost
     }
 
     assert(address_family == AF_INET);
-    const auto in4 = (const sockaddr_in*)addr;
+    const auto* const in4 = reinterpret_cast<const sockaddr_in*>(addr);
     if ((rc = uv_ip4_name(in4, buf, buf_len)) != 0)
     {
       LOG_FAIL_FMT("uv_ip4_name failed: {}", uv_strerror(rc));

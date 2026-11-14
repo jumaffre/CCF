@@ -1,25 +1,22 @@
 Running CCF Applications
 ========================
 
-This document explains how to spin up a test CCF network and submit simple commands to it using `curl`_. We use curl here because it is a standard tool and broadly available - you should be able to get the same results with any HTTP client, provided you can configure the appropriate caller and CA identities. Once you have built your own app, you should be able to test it in the same way - simply pass the path to your app binary to ``sandbox.sh`` as ``-p/--package``, and call the endpoints defined by your app.
+This document explains how to spin up a test CCF network and submit simple commands to it using ``curl``. We use curl here because it is a standard tool and broadly available - you should be able to get the same results with any HTTP client, provided you can configure the appropriate caller and CA identities. Once you have built your own app, you should be able to test it in the same way - simply pass the path to your app binary to ``sandbox.sh`` as ``-p/--package``, and call the endpoints defined by your app.
 
 Startup
 -------
 
-.. note:: Before starting a CCF sandbox environment, make sure that:
+.. note:: Before starting a CCF sandbox environment, make sure that CCF is installed (see :doc:`/build_apps/install_bin`).
 
-    - The CCF runtime environment has successfully been setup (see :doc:`/operations/run_setup`).
-    - CCF is installed (see :doc:`/build_apps/install_bin`)
-
-The quickest way to start a CCF sandbox is to use the ``sandbox.sh`` script available as part of the CCF install, specifying the :doc:`enclave image </build_apps/build_app>` to run.
-``sandbox.sh`` is a thin wrapper around ``start_network.py``. It ensures the necessary Python dependencies are available and sets some sensible default values.
+The quickest way to start a CCF sandbox is to use the ``sandbox.sh`` script available as part of the CCF install, specifying the :ref:`application <build_apps/example_cpp:Building>` to run.
+``sandbox.sh`` is a thin wrapper around ``start_network.py``. It ensures the necessary Python dependencies are available. Node configuration options use the defaults and descriptions from the :doc:`cchost configuration schema </operations/configuration>`, rather than defaults selected by the end-to-end test infrastructure. Explicit command-line options still override these defaults.
 ``sandbox.sh`` is a demonstration tool, and not intended for use in production deployments.
 There are a large number of additional configuration options, documented by passing the ``--help`` argument. You may wish to pass ``-v`` which will make the script significantly more verbose, printing the precise ``curl`` commands which were used to communicate with the test network.
 
 This script automates the steps described in :doc:`/operations/start_network`, in summary:
 
 - generating new identities (private keys and certs) for the initial members and users
-- starting the initial ``cchost`` node
+- starting the initial node
 - starting multiple additional nodes, instructed to ``join`` the initial node
 - verifying that each node has successfully joined the new service
 - proposing and passing governance votes using the generated member identities
@@ -30,22 +27,23 @@ For example, deploying the generic JS application:
 
 .. code-block:: bash
 
-    $ /opt/ccf_virtual/bin/sandbox.sh
+    $ /opt/ccf/bin/sandbox.sh
     Setting up Python environment...
     Python environment successfully setup
-    [16:14:05.294] Starting 1 CCF node...
-    [16:14:05.295] Virtual mode enabled
+    [16:14:05.294] Virtual mode enabled
+    [16:14:05.295] Starting 1 CCF node...
     [16:14:10.010] Started CCF network with the following nodes:
     [16:14:10.011]   Node [0] = https://127.0.0.1:8000
-    [16:14:10.011] You can now issue business transactions to the opt/ccf/lib/libjs_generic application.
-    [16:14:10.011] Loaded JS application: /opt/ccf_virtual/samples/logging/js
+    [16:14:10.011] You can now issue business transactions to the /opt/ccf/bin/js_generic application.
+    [16:14:10.011] Loaded JS application: /opt/ccf/samples/logging/js
     [16:14:10.011] Keys and certificates have been copied to the common folder: ./workspace/sandbox_common
     [16:14:10.011] See https://microsoft.github.io/CCF/main/use_apps/issue_commands.html for more information.
     [16:14:10.011] Press Ctrl+C to shutdown the network.
 
 .. note::
 
-    - ``sandbox.sh`` defaults to using CCF's `virtual` mode, which does not require or make use of SGX. To load debug or release enclaves and make use of SGX, ``--enclave-type`` must be set to the right value, for example: ``sandbox.sh --enclave-type release -p ./libjs.enclave.so.signed``
+    - CCF detects the platform at runtime: nodes started by ``sandbox.sh`` run on SEV-SNP when it is available on the machine, and otherwise fall back to the :doc:`Insecure Virtual </operations/platforms/virtual>` platform, which provides no security guarantees.
+      The ``Virtual mode enabled`` line above is only printed in the latter case.
     - The ``--verbose`` argument can be used to display all commands issued by operators and members to start the network.
 
 The command output shows the addresses of the CCF nodes where commands may be submitted (ie, via ``curl https://127.0.0.1:8000/...``).
@@ -60,7 +58,9 @@ Authentication
 
 When establishing a TLS connection with a CCF service both the service and client must prove their identity.
 
-The :term:`Service Identity` is created at startup. The initial node generates a fresh private key which exists solely within the service's enclaves. A certificate of the corresponding public key is emitted (``service_cert.pem``) and used by all subsequent connections to confirm they are communicating with the intended service.
+The :term:`Service Identity` is created at startup.
+The initial node generates a fresh private key which exists solely within the TEE-protected memory of the service's nodes.
+A certificate of the corresponding public key is emitted (``service_cert.pem``) and used by all subsequent connections to confirm they are communicating with the intended service.
 
 Each member and user is identified by the cert with which they were registered with the service, either at genesis or in a subsequent ``set_member`` or ``set_user`` governance proposal. Access to the corresponding private key allows a client to submit commands as this member or user. For this test network these are all freshly generated and stored in the same common workspace for easy access. In a real deployment only certificates would be shared; private keys would be created by each participant, and remain confidential in their possession.
 
@@ -91,7 +91,7 @@ This should look much like a standard HTTP server, with error codes for missing 
     $ curl https://127.0.0.1:8000/app/not/a/real/resource -X GET --cacert service_cert.pem --cert user0_cert.pem --key user0_privk.pem -i
     HTTP/1.1 404 Not Found
 
-    $ curl https://127.0.0.1:8000/gov/proposals -X POST --cacert service_cert.pem --cert user0_cert.pem --key user0_privk.pem -i
+    $ curl https://127.0.0.1:8000/gov/members/proposals:create?api-version=2024-07-01 -X POST --cacert service_cert.pem --cert user0_cert.pem --key user0_privk.pem -i
     HTTP/1.1 403 Forbidden
 
 Logging App Commands
@@ -129,7 +129,11 @@ We can log messages in the public table via the ``/app/log/public`` path:
     $ curl https://127.0.0.1:8000/app/log/public?id=42 -X GET --cacert service_cert.pem --cert user0_cert.pem --key user0_privk.pem
     {"msg":"Logged to public table"}
 
-Note that the paths to these handlers is arbitrary. The names of the endpoints do not affect whether the result works with public or private tables - that is determined entirely by the application code. The logging app contains very simple examples, and real business transactions are likely to read and write from multiple tables. The difference between public and private tables is that private tables are encrypted before being written to the ledger, so their contents are only visible within the service's enclaves, whereas public tables can be read and audited directly from the ledger. This can be crudely checked by grepping the produced ledger files:
+Note that the paths to these handlers is arbitrary.
+The names of the endpoints do not affect whether the result works with public or private tables - that is determined entirely by the application code.
+The logging app contains very simple examples, and real business transactions are likely to read and write from multiple tables.
+The difference between public and private tables is that private tables are encrypted before being written to the ledger, so their contents are only visible within the TEEs of the service's nodes, whereas public tables can be read and audited directly from the ledger.
+This can be crudely checked by grepping the produced ledger files:
 
 .. code-block:: bash
 
@@ -150,7 +154,7 @@ Additionally, if snapshots were generated by the defunct service, the recovery p
 
     $ cp -r ./workspace/sandbox_0/0.ledger .
     $ cp -r ./workspace/sandbox_0/snapshots . # Optional, only if snapshots are available
-    $ /opt/ccf_virtual/bin/sandbox.sh --recover --ledger-dir 0.ledger --common-dir ./workspace/sandbox_common/ [--snapshots-dir snapshots]
+    $ /opt/ccf/bin/sandbox.sh --recover --ledger-dir 0.ledger --common-dir ./workspace/sandbox_common/ [--snapshots-dir snapshots]
     Setting up Python environment...
     Python environment successfully setup
     [16:24:29.563] Starting 1 CCF node...
@@ -160,8 +164,8 @@ Additionally, if snapshots were generated by the defunct service, the recovery p
     [16:24:29.563] No available snapshot to recover from. Entire transaction history will be replayed.
     [16:24:32.885] Started CCF network with the following nodes:
     [16:24:32.885]   Node [0] = https://127.0.0.1:8000
-    [16:14:10.011] You can now issue business transactions to the opt/ccf/lib/libjs_generic application.
-    [16:14:10.011] Loaded JS application: /opt/ccf_virtual/samples/logging/js
+    [16:14:10.011] You can now issue business transactions to the /opt/ccf/bin/js_generic application.
+    [16:14:10.011] Loaded JS application: /opt/ccf/samples/logging/js
     [16:14:10.011] Keys and certificates have been copied to the common folder: ./workspace/sandbox_common
     [16:24:32.885] See https://microsoft.github.io/CCF/main/use_apps/issue_commands.html for more information.
     [16:24:32.885] Press Ctrl+C to shutdown the network.
@@ -175,38 +179,4 @@ Integration Tests
 
 The ``sandbox.sh`` script can be a helpful element of infrastructure to execute Integration Tests against a CCF test network running a particular application (see :ccf_repo:`test_install.sh </tests/test_install.sh>` script as example).
 
-``test_install.sh`` illustrates how to wait for the sandbox to be :ccf_repo:`ready </tests/test_install.sh#L48>` before issuing application transactions, how to shut it down cleanly, and how to trigger a recovery. Recovering a test network can be a useful way to inspect post-test application test.
-
-Performance Tests
------------------
-
-``sandbox.sh`` can be equally useful for performance testing, for example with a load testing tool such as `vegeta <https://github.com/tsenart/vegeta>`_:
-
-.. code-block:: bash
-
-    $ /opt/ccf_virtual/bin/sandbox.sh --package ./liblogging.virtual.so
-    ...
-    [16:14:10.011]   Node [0] = https://127.0.0.1:8000
-    ...
-    [16:14:10.011] Keys and certificates have been copied to the common folder: /data/src/CCF/build/workspace/sandbox_common
-    ...
-
-.. code-block:: bash
-
-    # Extracted from the output of sandbox.sh, above.
-    $ export SCDIR=/data/src/CCF/build/workspace/sandbox_common
-    $ export VEGETA=/opt/vegeta/vegeta
-    $ $VEGETA attack --targets sample_targets.json
-                     --format json --duration 10s \
-                     --cert $SCDIR/user0_cert.pem \
-                     --key $SCDIR/user0_privk.pem \
-                     --root-certs $SCDIR/service_cert.pem | /opt/vegeta/vegeta report
-
-Where ``sample_targets.json`` is a file containing some sample requests to be sent as load testing, for example:
-
-.. code-block:: json
-
-    {"method": "POST", "url": "https://127.0.0.1:8000/app/log/private", "header": {"Content-Type": ["application/json"]}, "body": "eyJpZCI6IDAsICJtc2ciOiAiUHJpdmF0ZSBtZXNzYWdlOiAwIn0="}
-    {"method": "GET", "url": "https://127.0.0.1:8000/app/log/private?id=0", "header": {"Content-Type": ["application/json"]}}
-
-.. _curl: https://curl.haxx.se/
+``test_install.sh`` illustrates how to wait for the sandbox to be :ccf_repo:`ready </tests/test_install.sh#L49>` before issuing application transactions, how to shut it down cleanly, and how to trigger a recovery. Recovering a test network can be a useful way to inspect post-test application test.

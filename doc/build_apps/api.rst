@@ -5,12 +5,11 @@ A CCF application is composed of the following:
 
 - The :ref:`Application Entry Point <build_apps/api:Application Entry Point>` which creates the application in CCF.
 - A collection of :cpp:class:`endpoints <ccf::endpoints::Endpoint>` handling HTTP requests and grouped in a single :cpp:class:`registry <ccf::endpoints::EndpointRegistry>`. An :cpp:class:`endpoint <ccf::endpoints::Endpoint>` reads and writes to the key-value store via the :ref:`Key-Value Store API <build_apps/kv/api:Key-Value Store API>`.
-- An optional set of :ref:`JavaScript FFI Plugins <build_apps/api:JavaScript FFI Plugins>` that can be registered to extend the built-in JavaScript API surface.
 
 Application Entry Point
 -----------------------
 
-.. doxygenfunction:: ccfapp::make_user_endpoints
+.. doxygenfunction:: ccf::make_user_endpoints
    :project: CCF
 
 
@@ -63,6 +62,9 @@ Policies
 .. doxygenvariable:: ccf::member_cert_auth_policy
    :project: CCF
 
+.. doxygenvariable:: ccf::any_cert_auth_policy
+   :project: CCF
+
 .. doxygenvariable:: ccf::member_cose_sign1_auth_policy
    :project: CCF
 
@@ -70,6 +72,9 @@ Policies
    :project: CCF
 
 .. doxygenvariable:: ccf::jwt_auth_policy
+   :project: CCF
+
+.. doxygenclass:: ccf::TypedUserCOSESign1AuthnPolicy
    :project: CCF
 
 Identities
@@ -80,6 +85,10 @@ Identities
    :members:
 
 .. doxygenstruct:: ccf::MemberCertAuthnIdentity
+   :project: CCF
+   :members:
+
+.. doxygenstruct:: ccf::AnyCertAuthnIdentity
    :project: CCF
    :members:
 
@@ -117,12 +126,21 @@ Supporting Types
 Historical Queries
 ------------------
 
-.. doxygenfunction:: ccf::historical::adapter_v3
+The historical cache shares fetched stores across request handles.
+Ledger replies are routed only to handles depending on that entry, including supporting signatures and older ledger secrets, rather than scanning unrelated retained requests.
+Processing still scales with actual consumers and their requested ranges.
+The routing index holds non-owning per-dependency metadata; it does not change request expiry, store retention, or the lifetime of returned historical states.
+This metadata and temporary reply snapshots add memory overhead beyond the cache's estimated ledger-entry size.
+
+.. doxygenfunction:: ccf::historical::read_only_adapter_v4
+   :project: CCF
+
+.. doxygenfunction:: ccf::historical::read_write_adapter_v4
    :project: CCF
 
 .. doxygenclass:: ccf::historical::AbstractStateCache
    :project: CCF
-   :members: set_default_expiry_duration, get_state_at, get_store_at, get_store_range, drop_cached_states
+   :members: set_default_expiry_duration, set_soft_cache_limit, get_state_at, get_store_at, get_store_range, drop_cached_states
 
 .. doxygenstruct:: ccf::historical::State
    :project: CCF
@@ -143,8 +161,57 @@ Indexing
    :project: CCF
    :members:
 
-JavaScript FFI Plugins
-----------------------
+HTTP Entity Tags Matching
+-------------------------
 
-.. doxygenfunction:: ccfapp::get_js_plugins
+.. doxygenclass:: ccf::http::Matcher
    :project: CCF
+   :members:
+
+HTTP Accept Header Matching
+---------------------------
+
+.. doxygenstruct:: ccf::http::AcceptHeaderField
+   :project: CCF
+   :members:
+
+.. doxygenfunction:: ccf::http::parse_accept_header
+   :project: CCF
+
+COSE
+----
+
+.. doxygenstruct:: ccf::cose::edit::pos::InArray
+   :project: CCF
+
+.. doxygenstruct:: ccf::cose::edit::pos::AtKey
+   :project: CCF
+   :members:
+
+.. doxygentypedef:: ccf::cose::edit::pos::Type
+   :project: CCF
+
+.. doxygenfunction:: ccf::cose::edit::set_unprotected_header
+   :project: CCF
+
+.. doxygenfunction:: ccf::cose::edit::detach_payload
+   :project: CCF
+
+Network Identity
+----------------
+
+.. doxygentypedef:: ccf::RawCoseEndorsement
+   :project: CCF
+
+.. doxygentypedef:: ccf::CoseEndorsementsChain
+   :project: CCF
+
+.. doxygenenum:: ccf::FetchStatus
+   :project: CCF
+
+.. doxygentypedef:: ccf::TrustedKeys
+   :project: CCF
+
+.. doxygenclass:: ccf::NetworkIdentitySubsystemInterface
+   :project: CCF
+   :members:

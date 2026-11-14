@@ -1,0 +1,53 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+#pragma once
+
+#include "ccf/crypto/pem.h"
+#include "ccf/tx.h"
+#include "forwarder_types.h"
+
+#include <chrono>
+#include <limits>
+#include <stdint.h>
+#include <vector>
+
+namespace ccf::kv
+{
+  class CommittableTx;
+  class Consensus;
+  class TxHistory;
+}
+
+namespace ccf
+{
+  class RpcContextImpl;
+
+  namespace tasks
+  {
+    class JobBoard;
+  }
+
+  class RpcHandler
+  {
+  public:
+    virtual ~RpcHandler() = default;
+
+    // Used by enclave to initialise and tick frontends
+    virtual void set_cmd_forwarder(
+      std::shared_ptr<AbstractForwarder> cmd_forwarder_) = 0;
+
+    virtual void tick(std::chrono::milliseconds /*elapsed*/) {}
+
+    virtual void start_periodic_tick(
+      ccf::tasks::JobBoard& /*job_board*/, std::chrono::milliseconds /*period*/)
+    {}
+
+    virtual void open() = 0;
+    virtual bool is_open() = 0;
+    virtual void set_consensus_and_history(
+      ccf::kv::Consensus* consensus, ccf::kv::TxHistory* history) = 0;
+
+    // Used by rpcendpoint to process incoming client RPCs
+    virtual void process(std::shared_ptr<RpcContextImpl> ctx) = 0;
+  };
+}

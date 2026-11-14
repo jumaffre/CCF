@@ -3,9 +3,15 @@
 
 #include "ccf/ds/nonstd.h"
 
+#include "ds/nonstd.h"
+
 #include <algorithm>
 #include <doctest/doctest.h>
+#include <stdlib.h>
 #include <string>
+
+#define FMT_HEADER_ONLY
+#include <fmt/format.h>
 
 TEST_CASE("split" * doctest::test_suite("nonstd"))
 {
@@ -15,7 +21,7 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
 
     {
       INFO("Split by spaces");
-      auto v = nonstd::split(s, " ");
+      auto v = ccf::nonstd::split(s, " ");
       REQUIRE(v.size() == 7);
       REQUIRE(v[0] == "Good");
       REQUIRE(v[1] == "afternoon,");
@@ -28,7 +34,7 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
 
     {
       INFO("Split by commas");
-      auto v = nonstd::split(s, ",");
+      auto v = ccf::nonstd::split(s, ",");
       REQUIRE(v.size() == 3);
       REQUIRE(v[0] == "Good afternoon");
       REQUIRE(v[1] == " good evening");
@@ -37,7 +43,7 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
 
     {
       INFO("Split by comma-with-space");
-      auto v = nonstd::split(s, ", ");
+      auto v = ccf::nonstd::split(s, ", ");
       REQUIRE(v.size() == 3);
       REQUIRE(v[0] == "Good afternoon");
       REQUIRE(v[1] == "good evening");
@@ -46,27 +52,27 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
       {
         INFO("split(max_splits=3)");
         {
-          auto v = nonstd::split(s, " ", 3);
+          auto parts = ccf::nonstd::split(s, " ", 3);
           // NB: max_splits=3 => 4 returned segments
-          REQUIRE(v.size() == 4);
-          REQUIRE(v[0] == "Good");
-          REQUIRE(v[1] == "afternoon,");
-          REQUIRE(v[2] == "good");
-          REQUIRE(v[3] == "evening, and good night!");
+          REQUIRE(parts.size() == 4);
+          REQUIRE(parts[0] == "Good");
+          REQUIRE(parts[1] == "afternoon,");
+          REQUIRE(parts[2] == "good");
+          REQUIRE(parts[3] == "evening, and good night!");
         }
 
         {
-          auto v = nonstd::split(s, "afternoon", 3);
+          auto parts = ccf::nonstd::split(s, "afternoon", 3);
           // NB: max_splits=3, but only 1 split possible => 2 returned segments
-          REQUIRE(v.size() == 2);
-          REQUIRE(v[0] == "Good ");
-          REQUIRE(v[1] == ", good evening, and good night!");
+          REQUIRE(parts.size() == 2);
+          REQUIRE(parts[0] == "Good ");
+          REQUIRE(parts[1] == ", good evening, and good night!");
         }
       }
 
       {
         INFO("split_1");
-        auto t = nonstd::split_1(s, ", ");
+        auto t = ccf::nonstd::split_1(s, ", ");
         REQUIRE(std::get<0>(t) == "Good afternoon");
         REQUIRE(std::get<1>(t) == "good evening, and good night!");
       }
@@ -74,7 +80,7 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
 
     {
       INFO("Split by commas");
-      auto v = nonstd::split(s, ",");
+      auto v = ccf::nonstd::split(s, ",");
       REQUIRE(v.size() == 3);
       REQUIRE(v[0] == "Good afternoon");
       REQUIRE(v[1] == " good evening");
@@ -83,7 +89,7 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
 
     {
       INFO("Split by 'oo'");
-      auto v = nonstd::split(s, "oo");
+      auto v = ccf::nonstd::split(s, "oo");
       REQUIRE(v.size() == 5);
       REQUIRE(v[0] == "G");
       REQUIRE(v[1] == "d aftern");
@@ -98,7 +104,7 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
 
     {
       const auto s = "  bob ";
-      auto v = nonstd::split(s, " ");
+      auto v = ccf::nonstd::split(s, " ");
       REQUIRE(v.size() == 4);
       REQUIRE(v[0].empty());
       REQUIRE(v[1].empty());
@@ -109,13 +115,13 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
     {
       const auto s = "bobbob";
       {
-        auto v = nonstd::split(s, " ");
+        auto v = ccf::nonstd::split(s, " ");
         REQUIRE(v.size() == 1);
         REQUIRE(v[0] == "bobbob");
       }
 
       {
-        auto v = nonstd::split(s, "bob");
+        auto v = ccf::nonstd::split(s, "bob");
         REQUIRE(v.size() == 3);
         REQUIRE(v[0].empty());
         REQUIRE(v[1].empty());
@@ -123,7 +129,7 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
       }
 
       {
-        auto t = nonstd::split_1(s, "bob");
+        auto t = ccf::nonstd::split_1(s, "bob");
         REQUIRE(std::get<0>(t).empty());
         REQUIRE(std::get<1>(t) == "bob");
       }
@@ -132,19 +138,19 @@ TEST_CASE("split" * doctest::test_suite("nonstd"))
     {
       const auto s = "";
       {
-        auto v = nonstd::split(s, " ");
+        auto v = ccf::nonstd::split(s, " ");
         REQUIRE(v.size() == 1);
         REQUIRE(v[0].empty());
       }
 
       {
-        auto v = nonstd::split(s, "bob");
+        auto v = ccf::nonstd::split(s, "bob");
         REQUIRE(v.size() == 1);
         REQUIRE(v[0].empty());
       }
 
       {
-        auto t = nonstd::split_1(s, " ");
+        auto t = ccf::nonstd::split_1(s, " ");
         REQUIRE(std::get<0>(t).empty());
         REQUIRE(std::get<1>(t).empty());
       }
@@ -161,7 +167,7 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
 
     {
       INFO("rsplit by spaces");
-      auto v = nonstd::rsplit(s, " ");
+      auto v = ccf::nonstd::rsplit(s, " ");
       REQUIRE(v.size() == 7);
       REQUIRE(v[0] == "night!");
       REQUIRE(v[1] == "good");
@@ -175,7 +181,7 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
     {
       INFO("rsplit(max_splits=3)");
       {
-        auto v = nonstd::rsplit(s, " ", 3);
+        auto v = ccf::nonstd::rsplit(s, " ", 3);
         // NB: max_splits=3 => 4 returned segments
         REQUIRE(v.size() == 4);
         REQUIRE(v[0] == "night!");
@@ -185,7 +191,7 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
       }
 
       {
-        auto v = nonstd::rsplit(s, "afternoon", 3);
+        auto v = ccf::nonstd::rsplit(s, "afternoon", 3);
         // NB: max_splits=3, but only 1 split possible => 2 returned segments
         REQUIRE(v.size() == 2);
         REQUIRE(v[0] == ", good evening, and good night!");
@@ -195,7 +201,7 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
 
     {
       INFO("rsplit_1");
-      auto t = nonstd::rsplit_1(s, ", ");
+      auto t = ccf::nonstd::rsplit_1(s, ", ");
       REQUIRE(std::get<0>(t) == "Good afternoon, good evening");
       REQUIRE(std::get<1>(t) == "and good night!");
     }
@@ -206,7 +212,7 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
 
     {
       const auto s = "  bob ";
-      auto v = nonstd::rsplit(s, " ");
+      auto v = ccf::nonstd::rsplit(s, " ");
       REQUIRE(v.size() == 4);
       REQUIRE(v[0].empty());
       REQUIRE(v[1] == "bob");
@@ -217,13 +223,13 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
     {
       const auto s = "bobbob";
       {
-        auto v = nonstd::rsplit(s, " ");
+        auto v = ccf::nonstd::rsplit(s, " ");
         REQUIRE(v.size() == 1);
         REQUIRE(v[0] == "bobbob");
       }
 
       {
-        auto v = nonstd::rsplit(s, "bob");
+        auto v = ccf::nonstd::rsplit(s, "bob");
         REQUIRE(v.size() == 3);
         REQUIRE(v[0].empty());
         REQUIRE(v[1].empty());
@@ -231,7 +237,7 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
       }
 
       {
-        auto t = nonstd::rsplit_1(s, "bob");
+        auto t = ccf::nonstd::rsplit_1(s, "bob");
         REQUIRE(std::get<0>(t) == "bob");
         REQUIRE(std::get<1>(t).empty());
       }
@@ -240,22 +246,38 @@ TEST_CASE("rsplit" * doctest::test_suite("nonstd"))
     {
       const auto s = "";
       {
-        auto v = nonstd::rsplit(s, " ");
+        auto v = ccf::nonstd::rsplit(s, " ");
         REQUIRE(v.size() == 1);
         REQUIRE(v[0].empty());
       }
 
       {
-        auto v = nonstd::rsplit(s, "bob");
+        auto v = ccf::nonstd::rsplit(s, "bob");
         REQUIRE(v.size() == 1);
         REQUIRE(v[0].empty());
       }
 
       {
-        auto t = nonstd::rsplit_1(s, " ");
+        auto t = ccf::nonstd::rsplit_1(s, " ");
         REQUIRE(std::get<0>(t).empty());
         REQUIRE(std::get<1>(t).empty());
       }
     }
   }
+}
+
+TEST_CASE("trim" * doctest::test_suite("nonstd"))
+{
+  REQUIRE(ccf::nonstd::trim("  hello world  ") == "hello world");
+  REQUIRE(
+    ccf::nonstd::trim(" \r\n\t\nhello world\n\n\r\t\t\n\t \n\t") ==
+    "hello world");
+  REQUIRE(ccf::nonstd::trim("..hello..") == "..hello..");
+  REQUIRE(ccf::nonstd::trim("..hello..", ".") == "hello");
+
+  REQUIRE(ccf::nonstd::trim("hello") == "hello");
+  REQUIRE(ccf::nonstd::trim(" h") == "h");
+  REQUIRE(ccf::nonstd::trim("h ") == "h");
+  REQUIRE(ccf::nonstd::trim(" ") == "");
+  REQUIRE(ccf::nonstd::trim("") == "");
 }

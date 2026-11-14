@@ -2,19 +2,56 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ccf_assert.h"
 #include "consensus/ledger_enclave_types.h"
+#include "ds/ccf_assert.h"
 #include "ds/serialized.h"
 #include "kv/kv_types.h"
 #include "kv/serialised_entry_format.h"
+
+#include <fmt/format.h>
 
 namespace consensus
 {
   class LedgerEnclave
   {
-  public:
-    static constexpr size_t FRAME_SIZE = sizeof(uint32_t);
+  private:
+    static size_t get_entry_size(const uint8_t* data, size_t size)
+    {
+      if (size < ccf::kv::serialised_entry_header_size)
+      {
+        throw std::logic_error(fmt::format(
+          "Cannot read transaction header: buffer contains {} bytes, but the "
+          "fixed ledger entry header requires {} bytes",
+          size,
+          ccf::kv::serialised_entry_header_size));
+      }
 
+      const auto header =
+        serialized::peek<ccf::kv::SerialisedEntryHeader>(data, size);
+      const size_t body_size = header.size;
+      const auto available_body_size =
+        size - ccf::kv::serialised_entry_header_size;
+
+      // The size in the entry header is not trusted: check it against the
+      // buffer we were given before allocating. This is distinct from the
+      // configured max_transaction_size, which applies only when serialising
+      // new transactions, so that entries written under a larger or unset
+      // limit can always be read back.
+      if (body_size > available_body_size)
+      {
+        throw std::logic_error(fmt::format(
+          "Cannot read transaction with serialised body size {} bytes from "
+          "buffer containing {} bytes after the fixed {}-byte ledger entry "
+          "header",
+          body_size,
+          available_body_size,
+          ccf::kv::serialised_entry_header_size));
+      }
+
+      return ccf::kv::serialised_entry_header_size + body_size;
+    }
+
+  public:
     /**
      * Retrieve a single entry, advancing offset to the next entry.
      *
@@ -25,20 +62,29 @@ namespace consensus
      */
     static std::vector<uint8_t> get_entry(const uint8_t*& data, size_t& size)
     {
-      auto header = serialized::peek<kv::SerialisedEntryHeader>(data, size);
-      size_t entry_size = kv::serialised_entry_header_size + header.size;
+      const auto entry_size = get_entry_size(data, size);
       std::vector<uint8_t> entry(data, data + entry_size);
       serialized::skip(data, size, entry_size);
       return entry;
     }
 
   private:
-    ringbuffer::WriterPtr to_host;
+    std::shared_ptr<AbstractLedgerWriter> ledger;
 
   public:
-    LedgerEnclave(ringbuffer::AbstractWriterFactory& writer_factory_) :
-      to_host(writer_factory_.create_writer_to_outside())
-    {}
+    LedgerEnclave(std::shared_ptr<AbstractLedgerWriter> ledger_) :
+      ledger(std::move(ledger_))
+    {
+      if (ledger == nullptr)
+      {
+        throw std::logic_error("A ledger writer must be provided");
+      }
+    }
+
+    [[nodiscard]] bool is_backlogged() const
+    {
+      return ledger->is_backlogged();
+    }
 
     /**
      * Put a single entry to be written to the ledger, when primary.
@@ -51,8 +97,8 @@ namespace consensus
     void put_entry(
       const std::vector<uint8_t>& entry,
       bool globally_committable,
-      kv::Term term,
-      kv::Version index)
+      ccf::kv::Term term,
+      ccf::kv::Version index)
     {
       put_entry(entry.data(), entry.size(), globally_committable, term, index);
     }
@@ -72,12 +118,14 @@ namespace consensus
       const uint8_t* data,
       size_t size,
       bool globally_committable,
-      kv::Term term,
-      kv::Version index)
+      [[maybe_unused]] ccf::kv::Term term,
+      [[maybe_unused]] ccf::kv::Version index)
     {
-      serializer::ByteRange byte_range = {data, size};
-      RINGBUFFER_WRITE_MESSAGE(
-        consensus::ledger_append, to_host, globally_committable, byte_range);
+      std::vector<uint8_t> entry(data, data + size);
+      if (!ledger->append(std::move(entry), globally_committable))
+      {
+        throw std::logic_error("Ledger rejected append");
+      }
     }
 
     /**
@@ -90,8 +138,7 @@ namespace consensus
      */
     static void skip_entry(const uint8_t*& data, size_t& size)
     {
-      auto header = serialized::read<kv::SerialisedEntryHeader>(data, size);
-      serialized::skip(data, size, header.size);
+      serialized::skip(data, size, get_entry_size(data, size));
     }
 
     /**
@@ -101,8 +148,10 @@ namespace consensus
      */
     void truncate(Index idx)
     {
-      RINGBUFFER_WRITE_MESSAGE(
-        consensus::ledger_truncate, to_host, idx, false /* no recovery */);
+      if (!ledger->truncate(idx, false /* no recovery */))
+      {
+        throw std::logic_error("Ledger rejected truncation");
+      }
     }
 
     /**
@@ -112,7 +161,10 @@ namespace consensus
      */
     void commit(Index idx)
     {
-      RINGBUFFER_WRITE_MESSAGE(consensus::ledger_commit, to_host, idx);
+      if (!ledger->commit(idx))
+      {
+        throw std::logic_error("Ledger rejected commit");
+      }
     }
 
     /**
@@ -123,8 +175,10 @@ namespace consensus
      */
     void init(Index idx = 0, Index recovery_start_idx = 0)
     {
-      RINGBUFFER_WRITE_MESSAGE(
-        consensus::ledger_init, to_host, idx, recovery_start_idx);
+      if (!ledger->init(idx, recovery_start_idx))
+      {
+        throw std::logic_error("Ledger rejected initialisation");
+      }
     }
   };
 }

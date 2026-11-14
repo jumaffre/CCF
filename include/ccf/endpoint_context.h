@@ -2,7 +2,10 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/claims_digest.h"
+#include "ccf/crypto/sha256_hash.h"
 #include "ccf/endpoints/authentication/authentication_types.h"
+#include "ccf/tx_status.h"
 
 #include <functional>
 #include <memory>
@@ -48,34 +51,50 @@ namespace ccf::endpoints
       return *ident;
     }
   };
+
   using CommandEndpointFunction =
     std::function<void(CommandEndpointContext& args)>;
 
   struct EndpointContext : public CommandEndpointContext
   {
-    EndpointContext(const std::shared_ptr<ccf::RpcContext>& r, kv::Tx& t) :
+    EndpointContext(const std::shared_ptr<ccf::RpcContext>& r, ccf::kv::Tx& t) :
       CommandEndpointContext(r),
       tx(t)
     {}
 
-    kv::Tx& tx;
+    ccf::kv::Tx& tx;
   };
+
   using EndpointFunction = std::function<void(EndpointContext& args)>;
 
   using LocallyCommittedEndpointFunction =
     std::function<void(CommandEndpointContext& ctx, const ccf::TxID& txid)>;
 
+  struct CommittedTxInfo
+  {
+    std::shared_ptr<ccf::RpcContext> rpc_ctx;
+    ccf::TxID tx_id;
+    ccf::FinalTxStatus status;
+    ccf::crypto::Sha256Hash write_set_digest;
+    std::string commit_evidence;
+    ccf::ClaimsDigest claims_digest;
+  };
+
+  using ConsensusCommittedEndpointFunction =
+    std::function<void(CommittedTxInfo& info)>;
+
   // Read-only endpoints can only get values from the kv, they cannot write
   struct ReadOnlyEndpointContext : public CommandEndpointContext
   {
     ReadOnlyEndpointContext(
-      const std::shared_ptr<ccf::RpcContext>& r, kv::ReadOnlyTx& t) :
+      const std::shared_ptr<ccf::RpcContext>& r, ccf::kv::ReadOnlyTx& t) :
       CommandEndpointContext(r),
       tx(t)
     {}
 
-    kv::ReadOnlyTx& tx;
+    ccf::kv::ReadOnlyTx& tx;
   };
+
   using ReadOnlyEndpointFunction =
     std::function<void(ReadOnlyEndpointContext& args)>;
 }

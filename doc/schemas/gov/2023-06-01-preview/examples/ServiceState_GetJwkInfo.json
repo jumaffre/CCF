@@ -1,0 +1,18 @@
+{
+  "title": "ServiceState_GetJwkInfo",
+  "operationId": "ServiceState_GetJwkInfo",
+  "parameters": {
+    "api-version": "2023-06-01-preview"
+  },
+  "responses": {
+    "200": {
+      "body": {
+        "issuers": {},
+        "caCertBundles": {
+          "MyIdProviderCa": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n"
+        },
+        "keys": {}
+      }
+    }
+  }
+}

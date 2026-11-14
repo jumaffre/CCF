@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
-#include "ccf/ds/logger.h"
 #include "crypto/openssl/hash.h"
+#include "ds/internal_logger.h"
 #include "kv/compacted_version_conflict.h"
 #include "kv/kv_serialiser.h"
+#include "kv/null_encryptor.h"
 #include "kv/store.h"
-#include "kv/test/null_encryptor.h"
 #include "kv/test/stub_consensus.h"
 
 #include <atomic>
@@ -17,12 +17,12 @@
 #include <thread>
 #include <vector>
 
-class SlowStubConsensus : public kv::test::StubConsensus
+class SlowStubConsensus : public ccf::kv::test::StubConsensus
 {
 public:
-  using kv::test::StubConsensus::StubConsensus;
+  using ccf::kv::test::StubConsensus::StubConsensus;
 
-  bool replicate(const kv::BatchVector& entries, ccf::View view) override
+  bool replicate(const ccf::kv::BatchVector& entries, ccf::View view) override
   {
     if (rand() % 2 == 0)
     {
@@ -30,19 +30,19 @@ public:
       std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     }
 
-    return kv::test::StubConsensus::replicate(entries, view);
+    return ccf::kv::test::StubConsensus::replicate(entries, view);
   }
 };
 
 DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 {
-  logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
   // Multiple threads write random entries into random tables, and attempt to
   // commit them. A single thread continually compacts the kv to the latest
   // entry. The goal is for these commits and compactions to avoid deadlock
 
-  using MapType = kv::Map<size_t, size_t>;
+  using MapType = ccf::kv::Map<size_t, size_t>;
   constexpr size_t max_k = 32;
 
   constexpr size_t thread_count = 16;
@@ -54,9 +54,10 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
   struct ThreadArgs
   {
     std::vector<MapType> maps;
-    kv::Store* kv_store;
+    ccf::kv::Store* kv_store;
     std::atomic<size_t>* counter;
   };
+
   ThreadArgs args[thread_count] = {};
 
   const auto seed = time(NULL);
@@ -80,7 +81,6 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
   }
 
   auto thread_fn = [](void* a) {
-    crypto::openssl_sha256_init();
     auto args = static_cast<ThreadArgs*>(a);
 
     for (size_t i = 0u; i < tx_count; ++i)
@@ -124,12 +124,12 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 
           // Try to commit
           const auto result = tx.commit();
-          if (result == kv::CommitResult::SUCCESS)
+          if (result == ccf::kv::CommitResult::SUCCESS)
           {
             break;
           }
         }
-        catch (const kv::CompactedVersionConflict& e)
+        catch (const ccf::kv::CompactedVersionConflict& e)
         {
           // Retry on conflict
           continue;
@@ -139,12 +139,12 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 
     // Notify that this thread has finished
     --*args->counter;
-    crypto::openssl_sha256_shutdown();
   };
 
   // Start a thread which continually compacts at the latest version, until all
   // tx_threads have finished
   std::thread compact_thread;
+
   enum CompacterState
   {
     NotStarted,
@@ -154,7 +154,7 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 
   struct CompactArgs
   {
-    kv::Store* kv_store;
+    ccf::kv::Store* kv_store;
     std::atomic<size_t>* tx_counter;
     std::atomic<CompacterState>* compact_state;
   };
@@ -162,10 +162,10 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
   static constexpr auto iterations = 20;
   for (auto i = 0; i < iterations; ++i)
   {
-    kv::Store kv_store;
+    ccf::kv::Store kv_store;
     auto consensus = std::make_shared<SlowStubConsensus>();
     kv_store.set_consensus(consensus);
-    auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+    auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
     kv_store.set_encryptor(encryptor);
 
     // Keep atomic count of running threads
@@ -199,12 +199,12 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
     const auto initial_version = kv_store.compacted_version();
 
     // Start tx threads
-    for (size_t i = 0u; i < thread_count; ++i)
+    for (size_t t = 0u; t < thread_count; ++t)
     {
-      args[i].kv_store = &kv_store;
-      args[i].counter = &active_tx_threads;
+      args[t].kv_store = &kv_store;
+      args[t].counter = &active_tx_threads;
 
-      tx_threads[i] = std::thread(thread_fn, &args[i]);
+      tx_threads[t] = std::thread(thread_fn, &args[t]);
     }
 
     // Wait for the compact thread to start
@@ -237,9 +237,9 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
     DOCTEST_REQUIRE(consensus->number_of_replicas() == expected);
 
     // Wait for tx threads to complete
-    for (size_t i = 0u; i < thread_count; ++i)
+    for (size_t t = 0u; t < thread_count; ++t)
     {
-      tx_threads[i].join();
+      tx_threads[t].join();
     }
 
     // Wait for compact thread to complete
@@ -252,23 +252,25 @@ DOCTEST_TEST_CASE("Concurrent kv access" * doctest::test_suite("concurrency"))
 DOCTEST_TEST_CASE(
   "get_version_of_previous_write ordering" * doctest::test_suite("concurrency"))
 {
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
+
   // Many threads attempt to produce a chain of transactions pointing at the
   // previous write to a single key, at that key.
-  kv::Store kv_store;
-  auto encryptor = std::make_shared<kv::NullTxEncryptor>();
+  ccf::kv::Store kv_store;
+  auto encryptor = std::make_shared<ccf::kv::NullTxEncryptor>();
   kv_store.set_encryptor(encryptor);
   constexpr auto store_commit_term = 2;
   kv_store.initialise_term(store_commit_term);
 
-  using MapType = kv::Map<size_t, nlohmann::json>;
+  using MapType = ccf::kv::Map<size_t, nlohmann::json>;
   MapType map("public:foo");
 
   constexpr size_t k = 42;
 
   std::atomic<size_t> conflict_count = 0;
+  std::atomic<bool> stop = false;
 
   auto point_at_previous_write = [&]() {
-    crypto::openssl_sha256_init();
     auto sleep_time = std::chrono::microseconds(5);
     while (true)
     {
@@ -293,13 +295,13 @@ DOCTEST_TEST_CASE(
       h->put(k, j);
 
       const auto result = tx.commit();
-      if (result == kv::CommitResult::SUCCESS)
+      if (result == ccf::kv::CommitResult::SUCCESS)
       {
         // Succeeded
         break;
       }
 
-      DOCTEST_REQUIRE(result == kv::CommitResult::FAIL_CONFLICT);
+      DOCTEST_REQUIRE(result == ccf::kv::CommitResult::FAIL_CONFLICT);
       ++conflict_count;
 
       // Sleep before retrying
@@ -310,29 +312,61 @@ DOCTEST_TEST_CASE(
       sleep_time =
         std::chrono::microseconds((size_t)(sleep_time.count() * factor));
     }
-    crypto::openssl_sha256_shutdown();
   };
 
-  std::vector<std::thread> threads;
   constexpr auto num_threads = 64;
-  constexpr auto writes_per_thread = 10;
+  std::vector<std::thread> threads;
+  std::atomic<size_t> ready_count = 0;
+  std::atomic<bool> start = false;
+
   for (size_t i = 0; i < num_threads; ++i)
   {
     threads.emplace_back([&]() {
-      for (size_t n = 0; n < writes_per_thread; ++n)
+      ++ready_count;
+      while (!start.load())
+      {
+        std::this_thread::yield();
+      }
+
+      while (!stop.load())
       {
         point_at_previous_write();
       }
     });
   }
 
+  // Wait until all worker threads are ready, so contention begins together
+  while (ready_count.load() < num_threads)
+  {
+    std::this_thread::yield();
+  }
+  start.store(true);
+
+  // Wait until at least one conflict has been observed, or a deadline is
+  // reached, then signal all workers to stop
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::seconds(5);
+  bool conflict_seen_before_deadline = false;
+  while (Clock::now() < deadline)
+  {
+    if (conflict_count.load() > 0)
+    {
+      conflict_seen_before_deadline = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  stop.store(true);
+
   for (auto& thread : threads)
   {
     thread.join();
   }
 
-  DOCTEST_CHECK(conflict_count > 0);
-  constexpr auto last_write_version = num_threads * writes_per_thread;
+  LOG_INFO_FMT("Found {} conflicts", conflict_count.load());
+  DOCTEST_REQUIRE(conflict_seen_before_deadline);
+  const auto last_write_version = kv_store.current_version();
 
   {
     DOCTEST_INFO("Read final write from current state");

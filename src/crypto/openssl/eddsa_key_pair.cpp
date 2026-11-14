@@ -3,9 +3,9 @@
 
 #include "crypto/openssl/eddsa_key_pair.h"
 
-#include "openssl_wrappers.h"
+#include "ccf/crypto/openssl/openssl_wrappers.h"
 
-namespace crypto
+namespace ccf::crypto
 {
   EdDSAKeyPair_OpenSSL::EdDSAKeyPair_OpenSSL(CurveID curve_id)
   {
@@ -19,11 +19,8 @@ namespace crypto
   EdDSAKeyPair_OpenSSL::EdDSAKeyPair_OpenSSL(const Pem& pem)
   {
     OpenSSL::Unique_BIO mem(pem);
-    key = PEM_read_bio_PrivateKey(mem, NULL, NULL, NULL);
-    if (!key)
-    {
-      throw std::runtime_error("could not parse PEM");
-    }
+    key = PEM_read_bio_PrivateKey(mem, nullptr, nullptr, nullptr);
+    OpenSSL::CHECKNULL(key);
   }
 
   EdDSAKeyPair_OpenSSL::EdDSAKeyPair_OpenSSL(const JsonWebKeyEdDSAPrivate& jwk)
@@ -34,28 +31,38 @@ namespace crypto
         "Cannot construct EdDSA key pair from non-OKP JWK");
     }
 
-    if (jwk.crv != JsonWebKeyEdDSACurve::ED25519)
+    int curve = 0;
+    if (jwk.crv == JsonWebKeyEdDSACurve::ED25519)
+    {
+      curve = EVP_PKEY_ED25519;
+    }
+    else if (jwk.crv == JsonWebKeyEdDSACurve::X25519)
+    {
+      curve = EVP_PKEY_X25519;
+    }
+    else
     {
       throw std::logic_error(
-        "Cannot construct EdDSA key pair from non-Ed25519 JWK");
+        "Cannot construct EdDSA key pair from JWK that is neither Ed25519 nor "
+        "X25519");
     }
 
     auto d_raw = raw_from_b64url(jwk.d);
     OpenSSL::CHECKNULL(
       key = EVP_PKEY_new_raw_private_key(
-        EVP_PKEY_ED25519, nullptr, d_raw.data(), d_raw.size()));
+        curve, nullptr, d_raw.data(), d_raw.size()));
   }
 
   Pem EdDSAKeyPair_OpenSSL::private_key_pem() const
   {
     OpenSSL::Unique_BIO buf;
 
-    OpenSSL::CHECK1(
-      PEM_write_bio_PrivateKey(buf, key, NULL, NULL, 0, NULL, NULL));
+    OpenSSL::CHECK1(PEM_write_bio_PrivateKey(
+      buf, key, nullptr, nullptr, 0, nullptr, nullptr));
 
-    BUF_MEM* bptr;
+    BUF_MEM* bptr = nullptr;
     BIO_get_mem_ptr(buf, &bptr);
-    return Pem((uint8_t*)bptr->data, bptr->length);
+    return {reinterpret_cast<uint8_t*>(bptr->data), bptr->length};
   }
 
   Pem EdDSAKeyPair_OpenSSL::public_key_pem() const
@@ -69,7 +76,7 @@ namespace crypto
     EVP_PKEY_CTX* pkctx = nullptr;
     OpenSSL::Unique_EVP_MD_CTX ctx;
 
-    OpenSSL::CHECK1(EVP_DigestSignInit(ctx, &pkctx, NULL, NULL, key));
+    OpenSSL::CHECK1(EVP_DigestSignInit(ctx, &pkctx, nullptr, nullptr, key));
 
     std::vector<uint8_t> sigret(EVP_PKEY_size(key));
     size_t siglen = sigret.size();
@@ -99,12 +106,14 @@ namespace crypto
   JsonWebKeyEdDSAPrivate EdDSAKeyPair_OpenSSL::private_key_jwk_eddsa(
     const std::optional<std::string>& kid) const
   {
-    JsonWebKeyEdDSAPrivate jwk = {
-      EdDSAPublicKey_OpenSSL::public_key_jwk_eddsa(kid)};
+    JsonWebKeyEdDSAPrivate jwk;
+    static_cast<JsonWebKeyEdDSAPublic&>(jwk) =
+      EdDSAPublicKey_OpenSSL::public_key_jwk_eddsa(kid);
 
     std::vector<uint8_t> raw_priv(EVP_PKEY_size(key));
     size_t raw_priv_len = raw_priv.size();
-    EVP_PKEY_get_raw_private_key(key, raw_priv.data(), &raw_priv_len);
+    OpenSSL::CHECK1(
+      EVP_PKEY_get_raw_private_key(key, raw_priv.data(), &raw_priv_len));
     raw_priv.resize(raw_priv_len);
     jwk.d = b64url_from_raw(raw_priv, false /* with_padding */);
     return jwk;

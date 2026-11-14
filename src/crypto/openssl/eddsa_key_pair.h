@@ -3,10 +3,10 @@
 #pragma once
 
 #include "ccf/crypto/eddsa_key_pair.h"
+#include "ccf/crypto/openssl/openssl_wrappers.h"
 #include "crypto/openssl/eddsa_public_key.h"
-#include "openssl_wrappers.h"
 
-namespace crypto
+namespace ccf::crypto
 {
   class EdDSAKeyPair_OpenSSL : public EdDSAPublicKey_OpenSSL,
                                public EdDSAKeyPair
@@ -16,11 +16,12 @@ namespace crypto
     EdDSAKeyPair_OpenSSL(const Pem& pem);
     EdDSAKeyPair_OpenSSL(const JsonWebKeyEdDSAPrivate& jwk);
 
-    Pem private_key_pem() const override;
+    [[nodiscard]] Pem private_key_pem() const override;
 
-    Pem public_key_pem() const override;
+    [[nodiscard]] Pem public_key_pem() const override;
 
-    std::vector<uint8_t> sign(std::span<const uint8_t> d) const override;
+    [[nodiscard]] std::vector<uint8_t> sign(
+      std::span<const uint8_t> d) const override;
 
     bool verify(
       const uint8_t* contents,
@@ -28,9 +29,9 @@ namespace crypto
       const uint8_t* signature,
       size_t signature_size) override;
 
-    virtual CurveID get_curve_id() const override;
+    [[nodiscard]] CurveID get_curve_id() const override;
 
-    virtual JsonWebKeyEdDSAPrivate private_key_jwk_eddsa(
+    [[nodiscard]] JsonWebKeyEdDSAPrivate private_key_jwk_eddsa(
       const std::optional<std::string>& kid = std::nullopt) const override;
   };
 }

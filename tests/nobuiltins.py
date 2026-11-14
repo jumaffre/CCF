@@ -1,10 +1,12 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-from ccf.tx_id import TxID
-from http import HTTPStatus
-import openapi_spec_validator
-from datetime import datetime, timezone
 import time
+from datetime import UTC, datetime
+from http import HTTPStatus
+
+import infra.platform_detection
+import openapi_spec_validator
+from ccf.tx_id import TxID
 
 
 def test_nobuiltins_endpoints(network, args):
@@ -20,14 +22,14 @@ def test_nobuiltins_endpoints(network, args):
         body_j = r.body.json()
         assert body_j["committed_view"] >= tx_id.view
         assert body_j["committed_seqno"] >= tx_id.seqno
-        if args.enclave_platform == "sgx":
-            expected_format = "OE_SGX_v1"
-        elif args.enclave_platform == "virtual":
+        if infra.platform_detection.is_virtual():
             expected_format = "Insecure_Virtual"
-        elif args.enclave_platform == "snp":
+        elif infra.platform_detection.is_snp():
             expected_format = "AMD_SEV_SNP_v1"
         else:
-            raise ValueError(f"Unhandled enclave platform = {args.enclave_platform}")
+            raise ValueError(
+                f"Unhandled enclave platform = {infra.platform_detection.get_platform()}"
+            )
         assert body_j["quote_format"] == expected_format, body_j["quote_format"]
         assert body_j["node_id"] == primary.node_id
 
@@ -44,7 +46,7 @@ def test_nobuiltins_endpoints(network, args):
             if i != 0:
                 time.sleep(1.5)
             r = c.get("/app/current_time")
-            local_time = datetime.now(timezone.utc)
+            local_time = datetime.now(UTC)
             assert r.status_code == HTTPStatus.OK
             body_j = r.body.json()
             service_time = datetime.fromisoformat(body_j["timestamp"])

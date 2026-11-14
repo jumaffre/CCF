@@ -1,0 +1,34 @@
+{
+  "title": "ServiceState_GetJoinPolicies",
+  "operationId": "ServiceState_GetJoinPolicies",
+  "parameters": {
+    "api-version": "2024-07-01"
+  },
+  "responses": {
+    "200": {
+      "body": {
+        "sgx": {
+          "measurements": []
+        },
+        "virtual": {
+          "measurements": [],
+          "hostData": []
+        },
+        "snp": {
+          "measurements": [],
+          "hostData": {},
+          "uvmEndorsements": {},
+          "tcbVersions": {
+            "00a00f11": {
+              "hexstring": "d315000000000004",
+              "boot_loader": 4,
+              "tee": 0,
+              "snp": 21,
+              "microcode": 211
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,245 +1,156 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-set(ALLOWED_TARGETS "sgx;snp;virtual")
-
-if(NOT DEFINED COMPILE_TARGET)
-  set(COMPILE_TARGET
-      "sgx"
-      CACHE STRING
-            "Target compilation platforms, Choose from: ${ALLOWED_TARGETS}"
-  )
-endif()
-
-if(NOT COMPILE_TARGET IN_LIST ALLOWED_TARGETS)
-  message(
-    FATAL_ERROR
-      "${REQUESTED_TARGET} is not a valid target. Choose from: ${ALLOWED_TARGETS}"
-  )
-endif()
-message(STATUS "Compile target platform: ${COMPILE_TARGET}")
-
-include(${CCF_DIR}/cmake/open_enclave.cmake)
-
-list(APPEND COMPILE_LIBCXX -stdlib=libc++)
-list(APPEND LINK_LIBCXX -lc++ -lc++abi -stdlib=libc++)
-
-# Sign a built enclave library with oesign
-function(sign_app_library name app_oe_conf_path enclave_sign_key_path)
-  cmake_parse_arguments(PARSE_ARGV 1 PARSED_ARGS "" "" "INSTALL_LIBS")
-
-  if(TARGET ${name})
-    # Produce a debuggable variant. This doesn't need to be signed, but oesign
-    # also stamps the other config (heap size etc) which _are_ needed
-    set(DEBUG_CONF_NAME ${CMAKE_CURRENT_BINARY_DIR}/${name}.debuggable.conf)
-
-    add_custom_command(
-      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so.debuggable
-      # Copy conf file locally
-      COMMAND cp ${app_oe_conf_path} ${DEBUG_CONF_NAME}
-      # Remove any existing Debug= lines
-      COMMAND sed -i "/^Debug=\.*/d" ${DEBUG_CONF_NAME}
-      # Add Debug=1 line
-      COMMAND echo "Debug=1" >> ${DEBUG_CONF_NAME}
-      COMMAND
-        openenclave::oesign sign -e ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so -c
-        ${DEBUG_CONF_NAME} -k ${enclave_sign_key_path} -o
-        ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so.debuggable
-      DEPENDS ${name} ${app_oe_conf_path} ${enclave_sign_key_path}
-    )
-
-    add_custom_target(
-      ${name}_debuggable ALL
-      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so.debuggable
-    )
-
-    # Produce a releaseable signed variant. This is NOT debuggable - oegdb
-    # cannot be attached
-    set(SIGNED_CONF_NAME ${CMAKE_CURRENT_BINARY_DIR}/${name}.signed.conf)
-    add_custom_command(
-      OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so.signed
-      # Copy conf file locally
-      COMMAND cp ${app_oe_conf_path} ${SIGNED_CONF_NAME}
-      # Remove any existing Debug= lines
-      COMMAND sed -i "/^Debug=\.*/d" ${SIGNED_CONF_NAME}
-      # Add Debug=0 line
-      COMMAND echo "Debug=0" >> ${SIGNED_CONF_NAME}
-      COMMAND
-        openenclave::oesign sign -e ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so -c
-        ${SIGNED_CONF_NAME} -k ${enclave_sign_key_path}
-      DEPENDS ${name} ${app_oe_conf_path} ${enclave_sign_key_path}
-    )
-
-    add_custom_target(
-      ${name}_signed ALL
-      DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so.signed
-    )
-
-    if(${PARSED_ARGS_INSTALL_LIBS})
-      install(FILES ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so.debuggable
-              DESTINATION lib
-      )
-      install(FILES ${CMAKE_CURRENT_BINARY_DIR}/lib${name}.so.signed
-              DESTINATION lib
-      )
-    endif()
-  endif()
-endfunction()
-
 # Enclave library wrapper
 function(add_ccf_app name)
-
   cmake_parse_arguments(
-    PARSE_ARGV
-    1
+    PARSE_ARGV 1
     PARSED_ARGS
     ""
     ""
-    "SRCS;INCLUDE_DIRS;SYSTEM_INCLUDE_DIRS;LINK_LIBS_ENCLAVE;LINK_LIBS_VIRTUAL;LINK_LIBS_SNP;DEPS;INSTALL_LIBS"
+    "SRCS;INCLUDE_DIRS;SYSTEM_INCLUDE_DIRS;LINK_LIBS;DEPS;INSTALL_LIBS"
   )
-  add_custom_target(${name} ALL)
 
-  if(COMPILE_TARGET STREQUAL "sgx")
-    set(enc_name ${name}.enclave)
+  # Build app executable
+  add_executable(${name} ${PARSED_ARGS_SRCS})
 
-    add_library(${enc_name} SHARED ${PARSED_ARGS_SRCS})
+  target_include_directories(${name} PRIVATE ${PARSED_ARGS_INCLUDE_DIRS})
+  target_include_directories(
+    ${name}
+    SYSTEM
+    PRIVATE ${PARSED_ARGS_SYSTEM_INCLUDE_DIRS}
+  )
+  add_warning_checks(${name})
 
-    target_compile_definitions(${enc_name} PUBLIC PLATFORM_SGX)
+  target_link_libraries(
+    ${name}
+    PRIVATE ${PARSED_ARGS_LINK_LIBS} ccf_launcher ccf
+  )
 
-    target_include_directories(${enc_name} PRIVATE ${PARSED_ARGS_INCLUDE_DIRS})
-    target_include_directories(
-      ${enc_name} SYSTEM PRIVATE ${PARSED_ARGS_SYSTEM_INCLUDE_DIRS}
-    )
-    add_warning_checks(${enc_name})
-    target_link_libraries(
-      ${enc_name} PRIVATE ${PARSED_ARGS_LINK_LIBS_ENCLAVE}
-                          ${OE_TARGET_ENCLAVE_CORE_LIBS} ccf.enclave
-    )
+  if(NOT (SAN OR TSAN))
+    target_link_options(${name} PRIVATE LINKER:--no-undefined)
+  endif()
 
-    set_property(TARGET ${enc_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
+  set_property(TARGET ${name} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-    add_lvi_mitigations(${enc_name})
+  add_san(${name})
+  add_hardening(${name})
+  add_tidy(${name})
+  enable_coverage(${name})
 
-    add_dependencies(${name} ${enc_name})
-    if(PARSED_ARGS_DEPS)
-      add_dependencies(${enc_name} ${PARSED_ARGS_DEPS})
-    endif()
+  if(USE_SNMALLOC)
+    target_link_libraries(${name} INTERFACE snmallocshim-static)
+  endif()
 
-  elseif(COMPILE_TARGET STREQUAL "snp")
-    # Build an SNP enclave, loaded as a shared library without OE
-    set(snp_name ${name}.snp)
+  add_dependencies(${name} ${name})
+  if(PARSED_ARGS_DEPS)
+    add_dependencies(${name} ${PARSED_ARGS_DEPS})
+  endif()
 
-    add_library(${snp_name} SHARED ${PARSED_ARGS_SRCS})
-
-    target_compile_definitions(${snp_name} PUBLIC PLATFORM_SNP)
-
-    target_include_directories(${snp_name} PRIVATE ${PARSED_ARGS_INCLUDE_DIRS})
-    target_include_directories(
-      ${snp_name} SYSTEM PRIVATE ${PARSED_ARGS_SYSTEM_INCLUDE_DIRS}
-    )
-    add_warning_checks(${snp_name})
-
-    target_link_libraries(
-      ${snp_name} PRIVATE ${PARSED_ARGS_LINK_LIBS_SNP} ccf.snp
-    )
-
-    if(NOT (SAN OR TSAN))
-      target_link_options(${snp_name} PRIVATE LINKER:--no-undefined)
-    endif()
-
-    target_link_options(
-      ${snp_name} PRIVATE
-      LINKER:--undefined=enclave_create_node,--undefined=enclave_run
-    )
-
-    set_property(TARGET ${snp_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
-
-    add_san(${snp_name})
-
-    add_dependencies(${name} ${snp_name})
-    if(PARSED_ARGS_DEPS)
-      add_dependencies(${snp_name} ${PARSED_ARGS_DEPS})
-    endif()
-
-    if(${PARSED_ARGS_INSTALL_LIBS})
-      install(TARGETS ${snp_name} DESTINATION lib)
-    endif()
-
-  elseif(COMPILE_TARGET STREQUAL "virtual")
-    # Build a virtual enclave, loaded as a shared library without OE
-    set(virt_name ${name}.virtual)
-
-    add_library(${virt_name} SHARED ${PARSED_ARGS_SRCS})
-
-    target_compile_definitions(${virt_name} PUBLIC PLATFORM_VIRTUAL)
-
-    target_include_directories(${virt_name} PRIVATE ${PARSED_ARGS_INCLUDE_DIRS})
-    target_include_directories(
-      ${virt_name} SYSTEM PRIVATE ${PARSED_ARGS_SYSTEM_INCLUDE_DIRS}
-    )
-    add_warning_checks(${virt_name})
-
-    target_link_libraries(
-      ${virt_name} PRIVATE ${PARSED_ARGS_LINK_LIBS_VIRTUAL} ccf.virtual
-    )
-
-    if(NOT (SAN OR TSAN))
-      target_link_options(${virt_name} PRIVATE LINKER:--no-undefined)
-    endif()
-
-    target_link_options(
-      ${virt_name} PRIVATE
-      LINKER:--undefined=enclave_create_node,--undefined=enclave_run
-    )
-
-    set_property(TARGET ${virt_name} PROPERTY POSITION_INDEPENDENT_CODE ON)
-
-    add_san(${virt_name})
-
-    add_dependencies(${name} ${virt_name})
-    if(PARSED_ARGS_DEPS)
-      add_dependencies(${virt_name} ${PARSED_ARGS_DEPS})
-    endif()
-
-    if(${PARSED_ARGS_INSTALL_LIBS})
-      install(TARGETS ${virt_name} DESTINATION lib)
-    endif()
+  if(${PARSED_ARGS_INSTALL_LIBS})
+    install(TARGETS ${name} DESTINATION bin)
   endif()
 endfunction()
 
-# Convenience wrapper to build C-libraries that can be linked in enclave, ie. in
-# a CCF application.
-if(COMPILE_TARGET STREQUAL "sgx")
-  function(add_enclave_library_c name)
-    cmake_parse_arguments(PARSE_ARGV 1 PARSED_ARGS "" "" "")
-    set(files ${PARSED_ARGS_UNPARSED_ARGUMENTS})
-    add_library(${name} STATIC ${files})
-    target_compile_options(${name} PRIVATE -nostdinc)
-    target_link_libraries(${name} PRIVATE ${OE_TARGET_LIBC})
-    set_property(TARGET ${name} PROPERTY POSITION_INDEPENDENT_CODE ON)
-  endfunction()
+function(add_ccf_rust_app name)
+  cmake_parse_arguments(
+    PARSE_ARGV 1
+    PARSED_ARGS
+    ""
+    "MANIFEST_PATH;PACKAGE;LIB_NAME"
+    ""
+  )
 
-  # Convenience wrapper to build C++-libraries that can be linked in enclave,
-  # ie. in a CCF application.
-  function(add_enclave_library name)
-    cmake_parse_arguments(PARSE_ARGV 1 PARSED_ARGS "" "" "")
-    set(files ${PARSED_ARGS_UNPARSED_ARGUMENTS})
-    add_library(${name} ${files})
-    target_compile_options(${name} PUBLIC -nostdinc -nostdinc++)
-    target_compile_definitions(
-      ${name} PUBLIC INSIDE_ENCLAVE _LIBCPP_HAS_THREAD_API_PTHREAD
+  if(NOT PARSED_ARGS_MANIFEST_PATH)
+    message(FATAL_ERROR "add_ccf_rust_app requires MANIFEST_PATH")
+  endif()
+  if(NOT PARSED_ARGS_PACKAGE)
+    set(PARSED_ARGS_PACKAGE ${name})
+  endif()
+  if(NOT PARSED_ARGS_LIB_NAME)
+    set(PARSED_ARGS_LIB_NAME ${PARSED_ARGS_PACKAGE})
+  endif()
+
+  find_program(CARGO NAMES cargo REQUIRED)
+  find_program(RUSTC NAMES rustc REQUIRED)
+
+  if(CMAKE_CONFIGURATION_TYPES)
+    message(
+      FATAL_ERROR
+      "Multi-config generators are not supported for Rust CCF applications"
     )
-    target_link_libraries(${name} PUBLIC ${OE_TARGET_ENCLAVE_AND_STD} -lgcc)
-    set_property(TARGET ${name} PROPERTY POSITION_INDEPENDENT_CODE ON)
-  endfunction()
-endif()
+  endif()
 
-function(add_host_library name)
-  cmake_parse_arguments(PARSE_ARGV 1 PARSED_ARGS "" "" "")
-  set(files ${PARSED_ARGS_UNPARSED_ARGUMENTS})
-  add_library(${name} ${files})
-  target_compile_options(${name} PUBLIC ${COMPILE_LIBCXX})
-  target_link_libraries(${name} PUBLIC ${LINK_LIBCXX} -lgcc)
-  link_openenclave_host(${name})
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(CARGO_PROFILE_FLAG "")
+    set(CARGO_PROFILE_DIR debug)
+  else()
+    set(CARGO_PROFILE_FLAG --release)
+    set(CARGO_PROFILE_DIR release)
+  endif()
+
+  string(REPLACE "-" "_" RUST_LIB_NAME ${PARSED_ARGS_LIB_NAME})
+  get_filename_component(MANIFEST_PATH ${PARSED_ARGS_MANIFEST_PATH} ABSOLUTE)
+  get_filename_component(MANIFEST_DIR ${MANIFEST_PATH} DIRECTORY)
+  set(CARGO_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/cargo/${name})
+  set(
+    RUST_APP_LIB
+    ${CARGO_TARGET_DIR}/${CARGO_PROFILE_DIR}/lib${RUST_LIB_NAME}.a
+  )
+
+  set(
+    RUSTFLAGS
+    "$ENV{RUSTFLAGS} --remap-path-prefix=${MANIFEST_DIR}=APP --remap-path-prefix=${CCF_DIR}=CCF --remap-path-prefix=$ENV{HOME}/.cargo=CARGO"
+  )
+  add_custom_target(
+    cargo-build_${name}
+    BYPRODUCTS ${RUST_APP_LIB}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CARGO_TARGET_DIR}
+    COMMAND
+      ${CMAKE_COMMAND} -E env --unset=CARGO_BUILD_TARGET
+      "RUSTFLAGS=${RUSTFLAGS}" "CARGO_NET_RETRY=10" "CARGO_HTTP_TIMEOUT=60"
+      "CC=${CMAKE_C_COMPILER}" "CXX=${CMAKE_CXX_COMPILER}" "AR=${CMAKE_AR}"
+      "CARGO_BUILD_RUSTC=${RUSTC}" ${CARGO} build --lib --package
+      ${PARSED_ARGS_PACKAGE} --manifest-path ${MANIFEST_PATH} --target-dir
+      ${CARGO_TARGET_DIR} ${CARGO_PROFILE_FLAG} --locked
+    WORKING_DIRECTORY ${MANIFEST_DIR}
+    COMMENT "Building Rust CCF application ${name}"
+    USES_TERMINAL
+    VERBATIM
+  )
+
+  if(EXISTS "${CCF_DIR}/samples/apps/main.cpp")
+    set(RUST_APP_MAIN_SOURCE "${CCF_DIR}/samples/apps/main.cpp")
+  else()
+    set(RUST_APP_MAIN_SOURCE "${CCF_DIR}/share/ccf/rust/app_main.cpp")
+  endif()
+
+  add_ccf_app(
+    ${name}
+    SRCS ${RUST_APP_MAIN_SOURCE}
+    LINK_LIBS ccf_rust_app_bridge ${RUST_APP_LIB}
+    DEPS cargo-build_${name}
+  )
+endfunction()
+
+function(add_ccf_static_library name)
+  cmake_parse_arguments(PARSE_ARGV 1 PARSED_ARGS "" "" "SRCS;LINK_LIBS")
+
+  add_library(${name} STATIC ${PARSED_ARGS_SRCS})
+
+  target_link_libraries(${name} PUBLIC ${PARSED_ARGS_LINK_LIBS})
+
   set_property(TARGET ${name} PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+  add_san(${name})
+  add_hardening(${name})
+  add_tidy(${name})
+  add_warning_checks(${name})
+  enable_coverage(${name})
+
+  install(TARGETS ${name} EXPORT ccf DESTINATION lib)
+
+  if(USE_SNMALLOC)
+    target_link_libraries(${name} INTERFACE snmallocshim-static)
+  endif()
 endfunction()

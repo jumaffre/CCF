@@ -5,7 +5,7 @@
 #include "ccf/ds/nonstd.h"
 #include "ccf/kv/serialisers/serialised_entry.h"
 
-namespace kv::serialisers
+namespace ccf::kv::serialisers
 {
   // Converts values to their raw, in-memory representation. To add support for
   // custom types, add a specialization of BlitSerialiser for them.
@@ -14,11 +14,12 @@ namespace kv::serialisers
   {
     static SerialisedEntry to_serialised(const T& t)
     {
+      // NOLINTBEGIN(bugprone-branch-clone)
       if constexpr (std::is_same_v<T, std::vector<uint8_t>>)
       {
         return SerialisedEntry(t.begin(), t.end());
       }
-      else if constexpr (nonstd::is_std_array<T>::value)
+      else if constexpr (ccf::nonstd::is_std_array<T>::value)
       {
         return SerialisedEntry(t.begin(), t.end());
       }
@@ -35,17 +36,19 @@ namespace kv::serialisers
       else
       {
         static_assert(
-          nonstd::dependent_false<T>::value, "Can't serialise this type");
+          ccf::nonstd::dependent_false<T>::value, "Can't serialise this type");
       }
+      // NOLINTEND(bugprone-branch-clone)
     }
 
     static T from_serialised(const SerialisedEntry& rep)
     {
+      // NOLINTBEGIN(bugprone-branch-clone)
       if constexpr (std::is_same_v<T, std::vector<uint8_t>>)
       {
         return T(rep.begin(), rep.end());
       }
-      else if constexpr (nonstd::is_std_array<T>::value)
+      else if constexpr (ccf::nonstd::is_std_array<T>::value)
       {
         T t;
         if (rep.size() != t.size())
@@ -77,8 +80,10 @@ namespace kv::serialisers
       else
       {
         static_assert(
-          nonstd::dependent_false<T>::value, "Can't deserialise this type");
+          ccf::nonstd::dependent_false<T>::value,
+          "Can't deserialise this type");
       }
+      // NOLINTEND(bugprone-branch-clone)
     }
   };
 }

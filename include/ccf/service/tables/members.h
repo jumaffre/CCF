@@ -13,7 +13,7 @@
 
 namespace ccf
 {
-  enum class MemberStatus
+  enum class MemberStatus : uint8_t
   {
     ACCEPTED = 0,
     ACTIVE = 1,
@@ -21,41 +21,57 @@ namespace ccf
   DECLARE_JSON_ENUM(
     MemberStatus,
     {{MemberStatus::ACCEPTED, "Accepted"}, {MemberStatus::ACTIVE, "Active"}});
-}
 
-namespace ccf
-{
-  // Current limitations of secret sharing library (sss).
-  static constexpr size_t max_active_recovery_members = 255;
+  enum class MemberRecoveryRole : uint8_t
+  {
+    NonParticipant = 0,
+    Participant,
+
+    /** If set then the member is to receive a key allowing it
+       to single-handedly recover the network without requiring
+       any other recovery member to submit their shares. */
+    Owner
+  };
+  DECLARE_JSON_ENUM(
+    MemberRecoveryRole,
+    {{MemberRecoveryRole::NonParticipant, "NonParticipant"},
+     {MemberRecoveryRole::Participant, "Participant"},
+     {MemberRecoveryRole::Owner, "Owner"}});
 
   struct NewMember
   {
-    crypto::Pem cert;
+    ccf::crypto::Pem cert;
 
     // If encryption public key is set, the member is a recovery member
-    std::optional<crypto::Pem> encryption_pub_key = std::nullopt;
-    nlohmann::json member_data = nullptr;
+    std::optional<ccf::crypto::Pem> encryption_pub_key = std::nullopt;
+    nlohmann::json member_data;
 
-    NewMember() {}
+    std::optional<MemberRecoveryRole> recovery_role = std::nullopt;
+
+    NewMember() = default;
 
     NewMember(
-      const crypto::Pem& cert_,
-      const std::optional<crypto::Pem>& encryption_pub_key_ = std::nullopt,
-      const nlohmann::json& member_data_ = nullptr) :
-      cert(cert_),
+      ccf::crypto::Pem cert_,
+      const std::optional<ccf::crypto::Pem>& encryption_pub_key_ = std::nullopt,
+      nlohmann::json member_data_ = {},
+      const std::optional<MemberRecoveryRole>& recovery_role_ = std::nullopt) :
+      cert(std::move(cert_)),
       encryption_pub_key(encryption_pub_key_),
-      member_data(member_data_)
+      member_data(std::move(member_data_)),
+      recovery_role(recovery_role_)
     {}
 
     bool operator==(const NewMember& rhs) const
     {
       return cert == rhs.cert && encryption_pub_key == rhs.encryption_pub_key &&
-        member_data == rhs.member_data;
+        member_data == rhs.member_data && recovery_role == rhs.recovery_role;
     }
   };
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(NewMember)
-  DECLARE_JSON_REQUIRED_FIELDS(NewMember, cert)
-  DECLARE_JSON_OPTIONAL_FIELDS(NewMember, encryption_pub_key, member_data)
+
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(NewMember);
+  DECLARE_JSON_REQUIRED_FIELDS(NewMember, cert);
+  DECLARE_JSON_OPTIONAL_FIELDS(
+    NewMember, encryption_pub_key, member_data, recovery_role);
 
   struct MemberDetails
   {
@@ -65,20 +81,25 @@ namespace ccf
         members for example. */
     nlohmann::json member_data = nullptr;
 
+    /// Optional recovery role of the member
+    std::optional<MemberRecoveryRole> recovery_role = std::nullopt;
+
     bool operator==(const MemberDetails& rhs) const
     {
-      return status == rhs.status && member_data == rhs.member_data;
+      return status == rhs.status && member_data == rhs.member_data &&
+        recovery_role == rhs.recovery_role;
     }
   };
-  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(MemberDetails)
-  DECLARE_JSON_REQUIRED_FIELDS(MemberDetails, status)
-  DECLARE_JSON_OPTIONAL_FIELDS(MemberDetails, member_data)
+
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(MemberDetails);
+  DECLARE_JSON_REQUIRED_FIELDS(MemberDetails, status);
+  DECLARE_JSON_OPTIONAL_FIELDS(MemberDetails, member_data, recovery_role);
 
   using MemberInfo = ServiceMap<MemberId, MemberDetails>;
 
-  using MemberCerts = kv::RawCopySerialisedMap<MemberId, crypto::Pem>;
+  using MemberCerts = ccf::kv::RawCopySerialisedMap<MemberId, ccf::crypto::Pem>;
   using MemberPublicEncryptionKeys =
-    kv::RawCopySerialisedMap<MemberId, crypto::Pem>;
+    ccf::kv::RawCopySerialisedMap<MemberId, ccf::crypto::Pem>;
 
   namespace Tables
   {
@@ -96,13 +117,15 @@ namespace ccf
     /// Next state digest the member is expected to sign.
     std::string state_digest;
 
-    StateDigest() {}
+    StateDigest() = default;
 
-    StateDigest(const crypto::Sha256Hash& root) : state_digest(root.hex_str())
+    StateDigest(const ccf::crypto::Sha256Hash& root) :
+      state_digest(root.hex_str())
     {}
   };
-  DECLARE_JSON_TYPE(StateDigest)
-  DECLARE_JSON_REQUIRED_FIELDS(StateDigest, state_digest)
+
+  DECLARE_JSON_TYPE(StateDigest);
+  DECLARE_JSON_REQUIRED_FIELDS(StateDigest, state_digest);
 
   struct MemberAck : public StateDigest
   {
@@ -112,30 +135,33 @@ namespace ccf
     /// COSE Sign1 containing the last state digest
     std::optional<std::vector<uint8_t>> cose_sign1_req = std::nullopt;
 
-    MemberAck() {}
+    MemberAck() = default;
 
-    MemberAck(const crypto::Sha256Hash& root) : StateDigest(root) {}
+    MemberAck(const ccf::crypto::Sha256Hash& root) : StateDigest(root) {}
 
-    MemberAck(const crypto::Sha256Hash& root, const SignedReq& signed_req_) :
+    MemberAck(
+      const ccf::crypto::Sha256Hash& root, const SignedReq& signed_req_) :
       StateDigest(root),
       signed_req(signed_req_)
     {}
 
     MemberAck(
-      const crypto::Sha256Hash& root,
+      const ccf::crypto::Sha256Hash& root,
       const std::vector<uint8_t>& cose_sign1_req_) :
       StateDigest(root),
       cose_sign1_req(cose_sign1_req_)
     {}
   };
-  DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(MemberAck, StateDigest)
+
+  DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(MemberAck, StateDigest);
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-parameter"
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
-  DECLARE_JSON_REQUIRED_FIELDS(MemberAck)
+  DECLARE_JSON_REQUIRED_FIELDS(MemberAck);
 #pragma clang diagnostic pop
-  DECLARE_JSON_OPTIONAL_FIELDS(MemberAck, signed_req, cose_sign1_req)
+  DECLARE_JSON_OPTIONAL_FIELDS(MemberAck, signed_req, cose_sign1_req);
   using MemberAcks = ServiceMap<MemberId, MemberAck>;
+
   namespace Tables
   {
     static constexpr auto MEMBER_ACKS = "public:ccf.gov.members.acks";

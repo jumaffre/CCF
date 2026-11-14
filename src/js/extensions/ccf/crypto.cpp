@@ -1,0 +1,1365 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+
+#include "ccf/js/extensions/ccf/crypto.h"
+
+#include "ccf/crypto/ec_key_pair.h"
+#include "ccf/crypto/ecdsa.h"
+#include "ccf/crypto/eddsa_key_pair.h"
+#include "ccf/crypto/entropy.h"
+#include "ccf/crypto/hmac.h"
+#include "ccf/crypto/key_wrap.h"
+#include "ccf/crypto/openssl/openssl_wrappers.h"
+#include "ccf/crypto/rsa_key_pair.h"
+#include "ccf/crypto/sha256.h"
+#include "ccf/crypto/verifier.h"
+#include "ccf/ds/json.h"
+#include "ccf/js/core/context.h"
+#include "ds/internal_logger.h"
+#include "js/checks.h"
+#include "js/extensions/ccf/scoped_cleanse.h"
+
+#include <climits>
+
+namespace ccf::js::extensions
+{
+  namespace
+  {
+    JSValue js_generate_aes_key(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 1)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1", argc);
+      }
+
+      int32_t key_size = 0;
+      if (JS_ToInt32(ctx, &key_size, argv[0]) < 0)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      // Supported key sizes for AES.
+      // NOLINTBEGIN(readability-magic-numbers)
+      // NOLINTBEGIN(cppcoreguidelines-avoid-magic-numbers)
+      if (key_size != 128 && key_size != 192 && key_size != 256)
+      // NOLINTEND(cppcoreguidelines-avoid-magic-numbers)
+      // NOLINTEND(readability-magic-numbers)
+      {
+        return JS_ThrowRangeError(
+          ctx, "invalid key size (not one of 128, 192, 256)");
+      }
+
+      try
+      {
+        std::vector<uint8_t> key =
+          ccf::crypto::get_entropy()->random(key_size / CHAR_BIT);
+        return JS_NewArrayBufferCopy(ctx, key.data(), key.size());
+      }
+      catch (const std::exception& exc)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to generate AES key: %s", exc.what());
+      }
+    }
+
+    JSValue js_generate_rsa_key_pair(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 1 && argc != 2)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1 or 2", argc);
+      }
+
+      uint32_t key_size = 0;
+      uint32_t key_exponent = 0;
+      if (JS_ToUint32(ctx, &key_size, argv[0]) < 0)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      if (argc == 2 && JS_ToUint32(ctx, &key_exponent, argv[1]) < 0)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      std::shared_ptr<ccf::crypto::RSAKeyPair> k;
+      try
+      {
+        if (argc == 1)
+        {
+          k = ccf::crypto::make_rsa_key_pair(key_size);
+        }
+        else
+        {
+          k = ccf::crypto::make_rsa_key_pair(key_size, key_exponent);
+        }
+      }
+      catch (const std::exception& exc)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to generate RSA key pair: %s", exc.what());
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      try
+      {
+        ccf::crypto::Pem prv = k->private_key_pem();
+        ccf::js::ScopedCleanse<ccf::crypto::Pem> prv_guard(prv);
+        ccf::crypto::Pem pub = k->public_key_pem();
+
+        auto r = jsctx.new_obj();
+        JS_CHECK_EXC(r);
+        auto private_key = jsctx.new_string(prv.str());
+        JS_CHECK_EXC(private_key);
+        JS_CHECK_SET(r.set("privateKey", std::move(private_key)));
+        auto public_key = jsctx.new_string(pub.str());
+        JS_CHECK_EXC(public_key);
+        JS_CHECK_SET(r.set("publicKey", std::move(public_key)));
+
+        return r.take();
+      }
+      catch (const std::exception& exc)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to serialise RSA key pair: %s", exc.what());
+      }
+    }
+
+    JSValue js_generate_ecdsa_key_pair(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 1)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1", argc);
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+      auto curve = jsctx.to_str(argv[0]);
+      if (!curve)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      ccf::crypto::CurveID cid = {};
+      if (curve == "secp256r1")
+      {
+        cid = ccf::crypto::CurveID::SECP256R1;
+      }
+      else if (curve == "secp384r1")
+      {
+        cid = ccf::crypto::CurveID::SECP384R1;
+      }
+      else if (curve == "secp521r1")
+      {
+        cid = ccf::crypto::CurveID::SECP521R1;
+      }
+      else
+      {
+        return JS_ThrowRangeError(
+          ctx,
+          "Unsupported curve id, supported: secp256r1, secp384r1, secp521r1");
+      }
+
+      try
+      {
+        auto k = ccf::crypto::make_ec_key_pair(cid);
+
+        ccf::crypto::Pem prv = k->private_key_pem();
+        ccf::js::ScopedCleanse<ccf::crypto::Pem> prv_guard(prv);
+        ccf::crypto::Pem pub = k->public_key_pem();
+
+        auto r = jsctx.new_obj();
+        JS_CHECK_EXC(r);
+        auto private_key = jsctx.new_string(prv.str());
+        JS_CHECK_EXC(private_key);
+        JS_CHECK_SET(r.set("privateKey", std::move(private_key)));
+        auto public_key = jsctx.new_string(pub.str());
+        JS_CHECK_EXC(public_key);
+        JS_CHECK_SET(r.set("publicKey", std::move(public_key)));
+
+        return r.take();
+      }
+      catch (const std::exception& exc)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to generate ECDSA key pair: %s", exc.what());
+      }
+    }
+
+    JSValue js_generate_eddsa_key_pair(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 1)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1", argc);
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+      auto curve = jsctx.to_str(argv[0]);
+      if (!curve)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      ccf::crypto::CurveID cid = {};
+      if (curve == "curve25519")
+      {
+        cid = ccf::crypto::CurveID::CURVE25519;
+      }
+      else if (curve == "x25519")
+      {
+        cid = ccf::crypto::CurveID::X25519;
+      }
+      else
+      {
+        return JS_ThrowRangeError(
+          ctx, "Unsupported curve id, supported: curve25519, x25519");
+      }
+
+      try
+      {
+        auto k = ccf::crypto::make_eddsa_key_pair(cid);
+
+        ccf::crypto::Pem prv = k->private_key_pem();
+        ccf::js::ScopedCleanse<ccf::crypto::Pem> prv_guard(prv);
+        ccf::crypto::Pem pub = k->public_key_pem();
+
+        auto r = jsctx.new_obj();
+        JS_CHECK_EXC(r);
+        auto private_key = jsctx.new_string(prv.str());
+        JS_CHECK_EXC(private_key);
+        JS_CHECK_SET(r.set("privateKey", std::move(private_key)));
+        auto public_key = jsctx.new_string(pub.str());
+        JS_CHECK_EXC(public_key);
+        JS_CHECK_SET(r.set("publicKey", std::move(public_key)));
+
+        return r.take();
+      }
+      catch (const std::exception& exc)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to generate EdDSA key pair: %s", exc.what());
+      }
+    }
+
+    JSValue js_digest(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 2)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 2", argc);
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+      auto digest_algo_name_str = jsctx.to_str(argv[0]);
+      if (!digest_algo_name_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      if (*digest_algo_name_str != "SHA-256")
+      {
+        return JS_ThrowRangeError(
+          ctx, "unsupported digest algorithm, supported: SHA-256");
+      }
+
+      size_t data_size = 0;
+      uint8_t* data = JS_GetArrayBuffer(ctx, &data_size, argv[1]);
+      if (data == nullptr)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        auto h = ccf::crypto::sha256(data, data_size);
+        return JS_NewArrayBufferCopy(ctx, h.data(), h.size());
+      }
+      catch (const std::exception& exc)
+      {
+        return JS_ThrowInternalError(ctx, "Failed to digest: %s", exc.what());
+      }
+    }
+
+    JSValue js_is_valid_x509_cert_bundle(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 1)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1", argc);
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      auto pem = jsctx.to_str(argv[0]);
+      if (!pem)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        ccf::crypto::OpenSSL::Unique_BIO bio(
+          pem.value().data(), pem.value().size());
+        ccf::crypto::OpenSSL::Unique_X509 cert(bio, true);
+        if (cert == nullptr)
+        {
+          const auto error = ccf::crypto::OpenSSL::first_error();
+          LOG_DEBUG_FMT("isValidX509Bundle: {}", error);
+          return ccf::js::core::constants::False;
+        }
+      }
+      catch (const std::runtime_error& e)
+      {
+        LOG_DEBUG_FMT("isValidX509Bundle: {}", e.what());
+        return ccf::js::core::constants::False;
+      }
+      catch (const std::logic_error& e)
+      {
+        return JS_ThrowInternalError(
+          ctx, "isValidX509Bundle failed: %s", e.what());
+      }
+
+      return ccf::js::core::constants::True;
+    }
+
+    JSValue js_is_valid_x509_cert_chain(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      // first arg: chain (concatenated PEM certs, first cert = target)
+      // second arg: trusted (concatenated PEM certs)
+      if (argc != 2)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 2", argc);
+      }
+
+      auto chain_js = argv[0];
+      auto trusted_js = argv[1];
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      auto chain_str = jsctx.to_str(chain_js);
+      if (!chain_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      auto trusted_str = jsctx.to_str(trusted_js);
+      if (!trusted_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        auto chain_vec = ccf::crypto::split_x509_cert_bundle(*chain_str);
+        auto trusted_vec = ccf::crypto::split_x509_cert_bundle(*trusted_str);
+        if (chain_vec.empty() || trusted_vec.empty())
+        {
+          throw std::runtime_error(
+            "chain/trusted arguments must contain at least one certificate");
+        }
+
+        auto& target_pem = chain_vec[0];
+        std::vector<const ccf::crypto::Pem*> chain_ptr;
+        for (auto it = chain_vec.begin() + 1; it != chain_vec.end(); it++)
+        {
+          chain_ptr.push_back(&*it);
+        }
+        std::vector<const ccf::crypto::Pem*> trusted_ptr;
+        trusted_ptr.reserve(trusted_vec.size());
+        for (auto& pem : trusted_vec)
+        {
+          trusted_ptr.push_back(&pem);
+        }
+
+        auto verifier = ccf::crypto::make_unique_verifier(target_pem);
+        if (!verifier->verify_certificate(trusted_ptr, chain_ptr))
+        {
+          throw std::runtime_error("certificate chain is invalid");
+        }
+      }
+      catch (const std::runtime_error& e)
+      {
+        LOG_DEBUG_FMT("isValidX509Chain: {}", e.what());
+        return ccf::js::core::constants::False;
+      }
+      catch (const std::logic_error& e)
+      {
+        return JS_ThrowInternalError(
+          ctx, "isValidX509Chain failed: %s", e.what());
+      }
+
+      return ccf::js::core::constants::True;
+    }
+
+    JSValue js_is_valid_x509_root_ca_cert(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      // Returns true iff the argument is a single, self-signed CA certificate.
+      // Unlike isValidX509CertChain, this rejects intermediate CAs: a cert must
+      // be self-signed (EXFLAG_SS) as well as passing X509_check_ca.
+      if (argc != 1)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1", argc);
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      auto pem_str = jsctx.to_str(argv[0]);
+      if (!pem_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        auto certs = ccf::crypto::split_x509_cert_bundle(*pem_str);
+        if (certs.size() != 1)
+        {
+          throw std::runtime_error(
+            "expected exactly one certificate, got " +
+            std::to_string(certs.size()));
+        }
+
+        auto verifier = ccf::crypto::make_unique_verifier(certs[0]);
+
+        // Reject intermediate CAs: the cert must be self-signed.
+        if (!verifier->is_self_signed())
+        {
+          return ccf::js::core::constants::False;
+        }
+
+        // Confirm it is a CA by verifying it against itself; verify_certificate
+        // runs X509_check_ca on each trusted cert and rejects non-CA certs.
+        const ccf::crypto::Pem* pem_ptr = certs.data();
+        std::vector<const ccf::crypto::Pem*> trusted = {pem_ptr};
+        std::vector<const ccf::crypto::Pem*> chain = {};
+        if (!verifier->verify_certificate(trusted, chain))
+        {
+          return ccf::js::core::constants::False;
+        }
+      }
+      catch (const std::runtime_error& e)
+      {
+        LOG_DEBUG_FMT("isValidX509RootCACert: {}", e.what());
+        return ccf::js::core::constants::False;
+      }
+      catch (const std::logic_error& e)
+      {
+        return JS_ThrowInternalError(
+          ctx, "isValidX509RootCACert failed: %s", e.what());
+      }
+
+      return ccf::js::core::constants::True;
+    }
+
+    template <typename T>
+    JSValue js_pem_to_jwk(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 1 && argc != 2)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1 or 2", argc);
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      auto pem_str = jsctx.to_str(argv[0]);
+      if (!pem_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      ccf::js::ScopedCleanse<std::string> pem_str_guard(*pem_str);
+
+      std::optional<std::string> kid = std::nullopt;
+      if (argc == 2)
+      {
+        auto kid_str = jsctx.to_str(argv[1]);
+        if (!kid_str)
+        {
+          return ccf::js::core::constants::Exception;
+        }
+        kid = kid_str;
+      }
+
+      T jwk;
+      ccf::js::ScopedCleanse jwk_guard(jwk);
+      try
+      {
+        ccf::crypto::Pem pem(*pem_str);
+        ccf::js::ScopedCleanse pem_guard(pem);
+
+        if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyECPublic>)
+        {
+          auto pubk = ccf::crypto::make_ec_public_key(pem);
+          jwk = pubk->public_key_jwk(kid);
+        }
+        else if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyECPrivate>)
+        {
+          auto kp = ccf::crypto::make_ec_key_pair(pem);
+          jwk = kp->private_key_jwk(kid);
+        }
+        else if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyRSAPublic>)
+        {
+          auto pubk = ccf::crypto::make_rsa_public_key(pem);
+          jwk = pubk->public_key_jwk(kid);
+        }
+        else if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyRSAPrivate>)
+        {
+          auto kp = ccf::crypto::make_rsa_key_pair(pem);
+          jwk = kp->private_key_jwk(kid);
+        }
+        else if constexpr (std::
+                             is_same_v<T, ccf::crypto::JsonWebKeyEdDSAPublic>)
+        {
+          auto pubk = ccf::crypto::make_eddsa_public_key(pem);
+          jwk = pubk->public_key_jwk_eddsa(kid);
+        }
+        else if constexpr (std::
+                             is_same_v<T, ccf::crypto::JsonWebKeyEdDSAPrivate>)
+        {
+          auto kp = ccf::crypto::make_eddsa_key_pair(pem);
+          jwk = kp->private_key_jwk_eddsa(kid);
+        }
+        else
+        {
+          static_assert(ccf::nonstd::dependent_false_v<T>, "Unknown type");
+        }
+      }
+      catch (const std::exception& ex)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to convert pem to jwk: %s", ex.what());
+      }
+
+      try
+      {
+        nlohmann::json jwk_json;
+        ccf::js::ScopedCleanse jwk_json_guard(jwk_json);
+        ccf::crypto::to_json(jwk_json, jwk);
+        auto jwk_str = jwk_json.dump();
+        ccf::js::ScopedCleanse<std::string> jwk_str_guard(jwk_str);
+        return JS_ParseJSON(ctx, jwk_str.c_str(), jwk_str.size(), "<jwk>");
+      }
+      catch (const std::exception& ex)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to serialise jwk: %s", ex.what());
+      }
+    }
+
+    template <typename T>
+    JSValue js_jwk_to_pem(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 1)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 1", argc);
+      }
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      auto jwk_str = jsctx.to_str(jsctx.json_stringify(jsctx.wrap(argv[0])));
+      if (!jwk_str.has_value())
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      ccf::js::ScopedCleanse<std::string> jwk_str_guard(*jwk_str);
+
+      ccf::crypto::Pem pem;
+      ccf::js::ScopedCleanse<ccf::crypto::Pem> pem_guard(pem);
+
+      try
+      {
+        auto jwk_json = ccf::parse_json_safe(*jwk_str);
+        ccf::js::ScopedCleanse jwk_json_guard(jwk_json);
+        T jwk;
+        ccf::js::ScopedCleanse jwk_guard(jwk);
+        jwk_json.get_to(jwk);
+
+        if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyECPublic>)
+        {
+          auto pubk = ccf::crypto::make_ec_public_key(jwk);
+          pem = pubk->public_key_pem();
+        }
+        else if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyECPrivate>)
+        {
+          auto kp = ccf::crypto::make_ec_key_pair(jwk);
+          pem = kp->private_key_pem();
+        }
+        else if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyRSAPublic>)
+        {
+          auto pubk = ccf::crypto::make_rsa_public_key(jwk);
+          pem = pubk->public_key_pem();
+        }
+        else if constexpr (std::is_same_v<T, ccf::crypto::JsonWebKeyRSAPrivate>)
+        {
+          auto kp = ccf::crypto::make_rsa_key_pair(jwk);
+          pem = kp->private_key_pem();
+        }
+        else if constexpr (std::
+                             is_same_v<T, ccf::crypto::JsonWebKeyEdDSAPublic>)
+        {
+          auto pubk = ccf::crypto::make_eddsa_public_key(jwk);
+          pem = pubk->public_key_pem();
+        }
+        else if constexpr (std::
+                             is_same_v<T, ccf::crypto::JsonWebKeyEdDSAPrivate>)
+        {
+          auto kp = ccf::crypto::make_eddsa_key_pair(jwk);
+          pem = kp->private_key_pem();
+        }
+        else
+        {
+          static_assert(ccf::nonstd::dependent_false_v<T>, "Unknown type");
+        }
+      }
+      catch (const std::exception& ex)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to convert jwk to pem %s", ex.what());
+      }
+
+      return JS_NewString(ctx, pem.str().c_str());
+    }
+
+    // Reads the optional RSA-OAEP "label" parameter. An absent, null or
+    // empty label means "no label", matching the behaviour of the previous
+    // JS_GetArrayBuffer-based code, which silently ignored a null pointer.
+    // Returns false, leaving the pending QuickJS TypeError in place, only
+    // when the label is present but is not an ArrayBuffer.
+    bool try_get_optional_label(
+      js::core::Context& jsctx,
+      const js::core::JSWrappedValue& label_val,
+      std::optional<std::vector<uint8_t>>& label_opt)
+    {
+      if (label_val.is_undefined() || JS_IsNull(label_val.val) != 0)
+      {
+        return true;
+      }
+
+      auto label_buf = jsctx.copy_array_buffer(label_val.val);
+      if (!label_buf.has_value())
+      {
+        return false;
+      }
+
+      if (!label_buf->empty())
+      {
+        label_opt = std::move(label_buf);
+      }
+
+      return true;
+    }
+
+    JSValue js_wrap_key(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 3)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 3", argc);
+      }
+
+      // API loosely modeled after
+      // https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/wrapKey.
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      // Copy the ArrayBuffer arguments before any call that can re-enter
+      // JavaScript. Since QuickJS 2026-06-04, ArrayBuffer.prototype.transfer
+      // and .resize() let script free or reallocate the backing store, so
+      // holding raw pointers from JS_GetArrayBuffer across property getters,
+      // toString hooks, JS_Call etc. is a use-after-free hazard.
+      auto key_opt = jsctx.copy_array_buffer(argv[0]);
+      if (!key_opt.has_value())
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      // key is the plaintext being wrapped. Guard it before copying the
+      // wrapping key: that copy allocates and can fail, and the early return
+      // below must not drop the plaintext without scrubbing it.
+      auto& key = *key_opt;
+      ccf::js::ScopedCleanse key_cleanse(key);
+
+      auto wrapping_key_opt = jsctx.copy_array_buffer(argv[1]);
+      if (!wrapping_key_opt.has_value())
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      // wrapping_key is a symmetric secret for AES-KWP.
+      auto& wrapping_key = *wrapping_key_opt;
+      ccf::js::ScopedCleanse wrapping_key_cleanse(wrapping_key);
+
+      auto parameters = argv[2];
+      auto wrap_algo_name_val = jsctx.get_property(parameters, "name");
+      JS_CHECK_EXC(wrap_algo_name_val);
+
+      auto wrap_algo_name_str = jsctx.to_str(wrap_algo_name_val);
+      if (!wrap_algo_name_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        auto algo_name = *wrap_algo_name_str;
+        if (algo_name == "RSA-OAEP")
+        {
+          // key can in principle be arbitrary data (see note on maximum size
+          // in rsa_key_pair.h). wrapping_key is a public RSA key.
+
+          auto label_val = jsctx.get_property(parameters, "label");
+          JS_CHECK_EXC(label_val);
+
+          auto label_opt = std::optional<std::vector<uint8_t>>{};
+          if (!try_get_optional_label(jsctx, label_val, label_opt))
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto wrapped_key = ccf::crypto::ckm_rsa_pkcs_oaep_wrap(
+            ccf::crypto::Pem(wrapping_key.data(), wrapping_key.size()),
+            key,
+            label_opt);
+
+          return JS_NewArrayBufferCopy(
+            ctx, wrapped_key.data(), wrapped_key.size());
+        }
+
+        if (algo_name == "AES-KWP")
+        {
+          std::vector<uint8_t> wrapped_key =
+            ccf::crypto::ckm_aes_key_wrap_pad(wrapping_key, key);
+
+          return JS_NewArrayBufferCopy(
+            ctx, wrapped_key.data(), wrapped_key.size());
+        }
+
+        if (algo_name == "RSA-OAEP-AES-KWP")
+        {
+          auto aes_key_size_value =
+            jsctx.get_property(parameters, "aesKeySize");
+          JS_CHECK_EXC(aes_key_size_value);
+
+          int32_t aes_key_size = 0;
+          if (JS_ToInt32(ctx, &aes_key_size, aes_key_size_value.val) < 0)
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto label_val = jsctx.get_property(parameters, "label");
+          JS_CHECK_EXC(label_val);
+
+          auto label_opt = std::optional<std::vector<uint8_t>>{};
+          if (!try_get_optional_label(jsctx, label_val, label_opt))
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto wrapped_key = ccf::crypto::ckm_rsa_aes_key_wrap(
+            aes_key_size,
+            ccf::crypto::Pem(wrapping_key.data(), wrapping_key.size()),
+            key,
+            label_opt);
+
+          return JS_NewArrayBufferCopy(
+            ctx, wrapped_key.data(), wrapped_key.size());
+        }
+
+        return JS_ThrowRangeError(
+          ctx,
+          "unsupported key wrapping algorithm, supported: RSA-OAEP, AES-KWP, "
+          "RSA-OAEP-AES-KWP");
+      }
+      catch (std::exception& ex)
+      {
+        return JS_ThrowInternalError(ctx, "Failed to wrap key: %s", ex.what());
+      }
+      catch (...)
+      {
+        return JS_ThrowRangeError(ctx, "caught unknown exception");
+      }
+    }
+
+    JSValue js_unwrap_key(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      if (argc != 3)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 3", argc);
+      }
+
+      // API loosely modeled after
+      // https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/unwrapKey.
+
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      // Copy ArrayBuffer arguments before any potentially re-entrant call
+      // (see js_wrap_key for the rationale).
+      auto key_opt = jsctx.copy_array_buffer(argv[0]);
+      if (!key_opt.has_value())
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      // key is the wrapped (encrypted) blob here, so it is not secret and
+      // needs no cleansing.
+      auto& key = *key_opt;
+
+      auto unwrapping_key_opt = jsctx.copy_array_buffer(argv[1]);
+      if (!unwrapping_key_opt.has_value())
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      // unwrapping_key is secret key material; cleanse on all exit paths.
+      // The guard is kept adjacent to the copy so that no fallible statement
+      // can sit between creating the secret and protecting it.
+      auto& unwrapping_key = *unwrapping_key_opt;
+      ccf::js::ScopedCleanse unwrapping_key_cleanse(unwrapping_key);
+
+      auto parameters = argv[2];
+      auto wrap_algo_name_val = jsctx.get_property(parameters, "name");
+      JS_CHECK_EXC(wrap_algo_name_val);
+
+      auto wrap_algo_name_str = jsctx.to_str(wrap_algo_name_val);
+      if (!wrap_algo_name_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        auto algo_name = *wrap_algo_name_str;
+        if (algo_name == "RSA-OAEP")
+        {
+          // key can in principle be arbitrary data (see note on maximum size
+          // in rsa_key_pair.h). unwrapping_key is a private RSA key.
+
+          auto label_val = jsctx.get_property(parameters, "label");
+          JS_CHECK_EXC(label_val);
+
+          auto label_opt = std::optional<std::vector<uint8_t>>{};
+          if (!try_get_optional_label(jsctx, label_val, label_opt))
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto pemPrivateUnwrappingKey =
+            ccf::crypto::Pem(unwrapping_key.data(), unwrapping_key.size());
+          ccf::js::ScopedCleanse pem_cleanse(pemPrivateUnwrappingKey);
+
+          auto unwrapped_key = ccf::crypto::ckm_rsa_pkcs_oaep_unwrap(
+            pemPrivateUnwrappingKey, key, label_opt);
+          // The unwrapped key is plaintext secret material. This guard runs
+          // after JS_NewArrayBufferCopy has taken its own copy.
+          ccf::js::ScopedCleanse unwrapped_cleanse(unwrapped_key);
+
+          return JS_NewArrayBufferCopy(
+            ctx, unwrapped_key.data(), unwrapped_key.size());
+        }
+
+        if (algo_name == "AES-KWP")
+        {
+          std::vector<uint8_t> unwrapped_key =
+            ccf::crypto::ckm_aes_key_unwrap_pad(unwrapping_key, key);
+          // The unwrapped key is plaintext secret material. This guard runs
+          // after JS_NewArrayBufferCopy has taken its own copy.
+          ccf::js::ScopedCleanse unwrapped_cleanse(unwrapped_key);
+
+          return JS_NewArrayBufferCopy(
+            ctx, unwrapped_key.data(), unwrapped_key.size());
+        }
+
+        if (algo_name == "RSA-OAEP-AES-KWP")
+        {
+          auto aes_key_size_value =
+            jsctx.get_property(parameters, "aesKeySize");
+          JS_CHECK_EXC(aes_key_size_value);
+
+          int32_t aes_key_size = 0;
+          if (JS_ToInt32(ctx, &aes_key_size, aes_key_size_value.val) < 0)
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto label_val = jsctx.get_property(parameters, "label");
+          JS_CHECK_EXC(label_val);
+
+          auto label_opt = std::optional<std::vector<uint8_t>>{};
+          if (!try_get_optional_label(jsctx, label_val, label_opt))
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto privPemUnwrappingKey =
+            ccf::crypto::Pem(unwrapping_key.data(), unwrapping_key.size());
+          ccf::js::ScopedCleanse pem_cleanse(privPemUnwrappingKey);
+
+          auto unwrapped_key = ccf::crypto::ckm_rsa_aes_key_unwrap(
+            privPemUnwrappingKey, key, label_opt);
+          // The unwrapped key is plaintext secret material. This guard runs
+          // after JS_NewArrayBufferCopy has taken its own copy.
+          ccf::js::ScopedCleanse unwrapped_cleanse(unwrapped_key);
+
+          return JS_NewArrayBufferCopy(
+            ctx, unwrapped_key.data(), unwrapped_key.size());
+        }
+
+        return JS_ThrowRangeError(
+          ctx,
+          "unsupported key unwrapping algorithm, supported: RSA-OAEP, "
+          "AES-KWP, "
+          "RSA-OAEP-AES-KWP");
+      }
+      catch (std::exception& ex)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to unwrap key: %s", ex.what());
+      }
+      catch (...)
+      {
+        return JS_ThrowRangeError(ctx, "caught unknown exception");
+      }
+    }
+
+    JSValue js_sign(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      if (argc != 3)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 3", argc);
+      }
+
+      auto algorithm = argv[0];
+
+      auto algo_name_val = jsctx.get_property(algorithm, "name");
+      JS_CHECK_EXC(algo_name_val);
+
+      auto algo_hash_val = jsctx.get_property(algorithm, "hash");
+      JS_CHECK_EXC(algo_hash_val);
+
+      auto algo_name_str = jsctx.to_str(algo_name_val);
+      if (!algo_name_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      auto key_str = jsctx.to_str(argv[1]);
+      if (!key_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      ccf::js::ScopedCleanse<std::string> key_str_guard(*key_str);
+      auto& key = *key_str;
+
+      size_t data_size = 0;
+      uint8_t* data = JS_GetArrayBuffer(ctx, &data_size, argv[2]);
+      if (data == nullptr)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      std::vector<uint8_t> contents(data, data + data_size);
+
+      // Handle algorithms that don't use algo_hash here
+      if (*algo_name_str == "EdDSA")
+      {
+        try
+        {
+          ccf::crypto::Pem key_pem(key);
+          ccf::js::ScopedCleanse<ccf::crypto::Pem> key_pem_guard(key_pem);
+          auto key_pair = ccf::crypto::make_eddsa_key_pair(key_pem);
+          auto sig = key_pair->sign(contents);
+          return JS_NewArrayBufferCopy(ctx, sig.data(), sig.size());
+        }
+        catch (const std::exception& ex)
+        {
+          return JS_ThrowInternalError(
+            ctx, "Failed to sign with EdDSA pair: %s", ex.what());
+        }
+      }
+
+      auto algo_hash_str = jsctx.to_str(algo_hash_val);
+      if (!algo_hash_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        auto algo_name = *algo_name_str;
+        auto algo_hash = *algo_hash_str;
+
+        ccf::crypto::MDType mdtype = ccf::crypto::MDType::NONE;
+
+        if (algo_hash == "SHA-256")
+        {
+          mdtype = ccf::crypto::MDType::SHA256;
+        }
+
+        if (algo_hash == "SHA-384")
+        {
+          mdtype = ccf::crypto::MDType::SHA384;
+        }
+
+        if (algo_hash == "SHA-512")
+        {
+          mdtype = ccf::crypto::MDType::SHA512;
+        }
+
+        if (mdtype == ccf::crypto::MDType::NONE)
+        {
+          return JS_ThrowRangeError(
+            ctx,
+            "Unsupported hash algorithm, supported: SHA-256, SHA-384, SHA-512");
+        }
+
+        if (algo_name == "ECDSA")
+        {
+          ccf::crypto::Pem key_pem(key);
+          ccf::js::ScopedCleanse key_pem_guard(key_pem);
+          auto key_pair = ccf::crypto::make_ec_key_pair(key_pem);
+          auto sig_der = key_pair->sign(contents, mdtype);
+          auto sig = ccf::crypto::ecdsa_sig_der_to_p1363(
+            sig_der, key_pair->get_curve_id());
+          return JS_NewArrayBufferCopy(ctx, sig.data(), sig.size());
+        }
+
+        if (algo_name == "RSA-PSS")
+        {
+          ccf::crypto::Pem key_pem(key);
+          ccf::js::ScopedCleanse key_pem_guard(key_pem);
+          auto key_pair = ccf::crypto::make_rsa_key_pair(key_pem);
+
+          auto salt_length_val = jsctx.get_property(algorithm, "saltLength");
+          JS_CHECK_EXC(salt_length_val);
+
+          int64_t salt_length{};
+          if (JS_ToInt64(ctx, &salt_length, salt_length_val.val) < 0)
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto sig =
+            key_pair->sign(contents, mdtype, static_cast<size_t>(salt_length));
+
+          return JS_NewArrayBufferCopy(ctx, sig.data(), sig.size());
+        }
+
+        if (algo_name == "HMAC")
+        {
+          std::vector<uint8_t> vkey(key.begin(), key.end());
+          ccf::js::ScopedCleanse<std::vector<uint8_t>> vkey_guard(vkey);
+          const auto sig = ccf::crypto::hmac(mdtype, vkey, contents);
+          return JS_NewArrayBufferCopy(ctx, sig.data(), sig.size());
+        }
+
+        return JS_ThrowRangeError(
+          ctx,
+          "Unsupported signing algorithm, supported: RSA-PSS, ECDSA, EdDSA, "
+          "HMAC");
+      }
+      catch (const std::exception& ex)
+      {
+        return JS_ThrowInternalError(ctx, "Failed to sign: %s", ex.what());
+      }
+    }
+
+    bool verify_eddsa_signature(
+      uint8_t* contents,
+      size_t contents_size,
+      uint8_t* signature,
+      size_t signature_size,
+      const std::string& pub_key)
+    {
+      auto public_key = ccf::crypto::make_eddsa_public_key(pub_key);
+      return public_key->verify(
+        contents, contents_size, signature, signature_size);
+    }
+
+    JSValue js_verify_signature(
+      JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+    {
+      js::core::Context& jsctx =
+        *reinterpret_cast<js::core::Context*>(JS_GetContextOpaque(ctx));
+
+      if (argc != 4)
+      {
+        return JS_ThrowTypeError(
+          ctx, "Passed %d arguments, but expected 4", argc);
+      }
+
+      // API loosely modeled after
+      // https://developer.mozilla.org/en-US/docs/Web/API/SubtleCrypto/verify.
+
+      // Copy ArrayBuffer arguments before any potentially re-entrant call
+      // (property getters on `algorithm`, toString on `key`, etc.), since
+      // script can transfer or resize the backing ArrayBuffer and invalidate
+      // raw pointers taken from JS_GetArrayBuffer.
+      auto signature_opt = jsctx.copy_array_buffer(argv[2]);
+      if (!signature_opt.has_value())
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      auto data_opt = jsctx.copy_array_buffer(argv[3]);
+      if (!data_opt.has_value())
+      {
+        return ccf::js::core::constants::Exception;
+      }
+      auto& signature = *signature_opt;
+      auto& data = *data_opt;
+
+      auto algorithm = argv[0];
+
+      auto algo_name_val = jsctx.get_property(algorithm, "name");
+      JS_CHECK_EXC(algo_name_val);
+
+      auto algo_hash_val = jsctx.get_property(algorithm, "hash");
+      JS_CHECK_EXC(algo_hash_val);
+
+      auto algo_name_str = jsctx.to_str(algo_name_val);
+      if (!algo_name_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      auto key_str = jsctx.to_str(argv[1]);
+      if (!key_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      // Handle algorithms that don't use algo_hash here
+      if (*algo_name_str == "EdDSA")
+      {
+        try
+        {
+          return JS_NewBool(
+            ctx,
+            static_cast<int>(verify_eddsa_signature(
+              data.data(),
+              data.size(),
+              signature.data(),
+              signature.size(),
+              *key_str)));
+        }
+        catch (const std::exception& ex)
+        {
+          return JS_ThrowRangeError(
+            ctx, "Failed to verify EdDSA signature: %s", ex.what());
+        }
+      }
+
+      auto algo_hash_str = jsctx.to_str(algo_hash_val);
+      if (!algo_hash_str)
+      {
+        return ccf::js::core::constants::Exception;
+      }
+
+      try
+      {
+        auto algo_name = *algo_name_str;
+        auto algo_hash = *algo_hash_str;
+        auto key = *key_str;
+
+        ccf::crypto::MDType mdtype = {};
+        if (algo_hash == "SHA-256")
+        {
+          mdtype = ccf::crypto::MDType::SHA256;
+        }
+        else
+        {
+          return JS_ThrowRangeError(
+            ctx, "Unsupported hash algorithm, supported: SHA-256");
+        }
+
+        if (algo_name != "RSA-PSS" && algo_name != "ECDSA")
+        {
+          return JS_ThrowRangeError(
+            ctx,
+            "Unsupported signing algorithm, supported: RSA-PSS, ECDSA, "
+            "EdDSA");
+        }
+
+        std::vector<uint8_t> sig = signature;
+        if (algo_name == "ECDSA")
+        {
+          sig = ccf::crypto::ecdsa_sig_p1363_to_der(
+            {signature.data(), signature.size()});
+        }
+
+        auto is_cert = key.starts_with("-----BEGIN CERTIFICATE");
+
+        bool valid = false;
+
+        if (is_cert)
+        {
+          auto verifier = ccf::crypto::make_unique_verifier(key);
+          valid = verifier->verify(
+            data.data(), data.size(), sig.data(), sig.size(), mdtype);
+        }
+        else if (algo_name == "ECDSA")
+        {
+          auto public_key = ccf::crypto::make_ec_public_key(key);
+          valid = public_key->verify(
+            data.data(), data.size(), sig.data(), sig.size(), mdtype);
+        }
+        else
+        {
+          auto salt_length_val = jsctx.get_property(algorithm, "saltLength");
+          JS_CHECK_EXC(salt_length_val);
+
+          int64_t salt_length{};
+          if (JS_ToInt64(ctx, &salt_length, salt_length_val.val) < 0)
+          {
+            return ccf::js::core::constants::Exception;
+          }
+
+          auto public_key = ccf::crypto::make_rsa_public_key(key);
+          // Only supporting PSS (with salt), PKCS1v15 has been deprecated.
+          valid = public_key->verify(
+            data.data(),
+            data.size(),
+            sig.data(),
+            sig.size(),
+            mdtype,
+            ccf::crypto::RSAPadding::PKCS_PSS,
+            static_cast<size_t>(salt_length));
+        }
+        return JS_NewBool(ctx, static_cast<int>(valid));
+      }
+      catch (const std::exception& ex)
+      {
+        return JS_ThrowInternalError(
+          ctx, "Failed to verify signature: %s", ex.what());
+      }
+    }
+  }
+
+  void CryptoExtension::install(js::core::Context& ctx)
+  {
+    auto crypto = ctx.new_obj();
+
+    JS_CHECK_OR_THROW(
+      crypto.set("sign", ctx.new_c_function(js_sign, "sign", 3)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "verifySignature",
+      ctx.new_c_function(js_verify_signature, "verifySignature", 4)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "pubPemToJwk",
+      ctx.new_c_function(
+        js_pem_to_jwk<ccf::crypto::JsonWebKeyECPublic>, "pubPemToJwk", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "pemToJwk",
+      ctx.new_c_function(
+        js_pem_to_jwk<ccf::crypto::JsonWebKeyECPrivate>, "pemToJwk", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "pubRsaPemToJwk",
+      ctx.new_c_function(
+        js_pem_to_jwk<ccf::crypto::JsonWebKeyRSAPublic>, "pubRsaPemToJwk", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "rsaPemToJwk",
+      ctx.new_c_function(
+        js_pem_to_jwk<ccf::crypto::JsonWebKeyRSAPrivate>, "rsaPemToJwk", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "pubEddsaPemToJwk",
+      ctx.new_c_function(
+        js_pem_to_jwk<ccf::crypto::JsonWebKeyEdDSAPublic>,
+        "pubEddsaPemToJwk",
+        1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "eddsaPemToJwk",
+      ctx.new_c_function(
+        js_pem_to_jwk<ccf::crypto::JsonWebKeyEdDSAPrivate>,
+        "eddsaPemToJwk",
+        1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "pubJwkToPem",
+      ctx.new_c_function(
+        js_jwk_to_pem<ccf::crypto::JsonWebKeyECPublic>, "pubJwkToPem", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "jwkToPem",
+      ctx.new_c_function(
+        js_jwk_to_pem<ccf::crypto::JsonWebKeyECPrivate>, "jwkToPem", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "pubRsaJwkToPem",
+      ctx.new_c_function(
+        js_jwk_to_pem<ccf::crypto::JsonWebKeyRSAPublic>, "pubRsaJwkToPem", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "rsaJwkToPem",
+      ctx.new_c_function(
+        js_jwk_to_pem<ccf::crypto::JsonWebKeyRSAPrivate>, "rsaJwkToPem", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "pubEddsaJwkToPem",
+      ctx.new_c_function(
+        js_jwk_to_pem<ccf::crypto::JsonWebKeyEdDSAPublic>,
+        "pubEddsaJwkToPem",
+        1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "eddsaJwkToPem",
+      ctx.new_c_function(
+        js_jwk_to_pem<ccf::crypto::JsonWebKeyEdDSAPrivate>,
+        "eddsaJwkToPem",
+        1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "generateAesKey",
+      ctx.new_c_function(js_generate_aes_key, "generateAesKey", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "generateRsaKeyPair",
+      ctx.new_c_function(js_generate_rsa_key_pair, "generateRsaKeyPair", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "generateEcdsaKeyPair",
+      ctx.new_c_function(
+        js_generate_ecdsa_key_pair, "generateEcdsaKeyPair", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "generateEddsaKeyPair",
+      ctx.new_c_function(
+        js_generate_eddsa_key_pair, "generateEddsaKeyPair", 1)));
+    JS_CHECK_OR_THROW(
+      crypto.set("wrapKey", ctx.new_c_function(js_wrap_key, "wrapKey", 3)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "unwrapKey", ctx.new_c_function(js_unwrap_key, "unwrapKey", 3)));
+    JS_CHECK_OR_THROW(
+      crypto.set("digest", ctx.new_c_function(js_digest, "digest", 2)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "isValidX509CertBundle",
+      ctx.new_c_function(
+        js_is_valid_x509_cert_bundle, "isValidX509CertBundle", 1)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "isValidX509CertChain",
+      ctx.new_c_function(
+        js_is_valid_x509_cert_chain, "isValidX509CertChain", 2)));
+    JS_CHECK_OR_THROW(crypto.set(
+      "isValidX509RootCACert",
+      ctx.new_c_function(
+        js_is_valid_x509_root_ca_cert, "isValidX509RootCACert", 1)));
+
+    auto ccf = ctx.get_or_create_global_property("ccf", ctx.new_obj());
+    JS_CHECK_OR_THROW(ccf.set("crypto", std::move(crypto)));
+  }
+}

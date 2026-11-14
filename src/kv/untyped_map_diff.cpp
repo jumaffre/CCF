@@ -3,36 +3,80 @@
 
 #include "ccf/kv/untyped_map_diff.h"
 
+#include "ds/internal_logger.h"
 #include "kv/untyped_change_set.h"
 
-namespace kv::untyped
+namespace ccf::kv::untyped
 {
-  void MapDiff::foreach_(const MapDiff::ElementVisitorWithEarlyOut& f)
-  {
-    for (auto write = writes.begin(); write != writes.end(); ++write)
-    {
-      bool should_continue = f(write->first, write->second);
+  // A change set created for a diff (see Map::create_change_set) holds the
+  // state as of its start version, and its writes contain exactly the keys
+  // deleted by the commit at that version, all mapped to nullopt. Puts are the
+  // entries of the state whose version is the start version.
 
-      if (!should_continue)
+  namespace
+  {
+    // Returns the value written at the change set's start version if key was
+    // put by that commit, else nullptr. The pointer is owned by change_set.
+    const MapDiff::ValueType* written_value(
+      const ChangeSet& change_set, const MapDiff::KeyType& key)
+    {
+      const auto* const search = change_set.state.getp(key);
+      if (search == nullptr || search->version != change_set.start_version)
       {
-        break;
+        return nullptr;
       }
+
+      return &search->value;
     }
   }
 
-  MapDiff::MapDiff(kv::untyped::ChangeSet& cs, const std::string& map_name) :
-    writes(cs.writes),
-    map_name(map_name)
-  {}
+  void MapDiff::foreach_(const MapDiff::ElementVisitorWithEarlyOut& f)
+  {
+    for (const auto& [key, deleted] : change_set.writes)
+    {
+      if (!f(key, deleted))
+      {
+        return;
+      }
+    }
+
+    const auto version = change_set.start_version;
+    change_set.state.foreach(
+      [&f, version](const KeyType& k, const VersionV& v) {
+        if (v.version != version)
+        {
+          return true;
+        }
+
+        const std::optional<ValueType> value = v.value;
+        return f(k, value);
+      });
+  }
+
+  MapDiff::MapDiff(ccf::kv::untyped::ChangeSet& cs, std::string map_name) :
+    change_set(cs),
+    map_name(std::move(map_name))
+  {
+    KV_TRACE(trace::transaction(
+      cs.trace_metadata.id, "unsupported", {{"operation", "map diff"}}));
+  }
 
   std::optional<std::optional<MapDiff::ValueType>> MapDiff::get(
     const MapDiff::KeyType& key)
   {
-    auto val_opt = writes.find(key);
-    if (val_opt != writes.end())
+    using MaybeValue = std::optional<ValueType>;
+
+    if (change_set.writes.contains(key))
+    {
+      LOG_TRACE_FMT("KV[{}]::get({}) - deleted", map_name, key);
+      return std::optional<MaybeValue>(std::in_place, std::nullopt);
+    }
+
+    const auto* value_p = written_value(change_set, key);
+    if (value_p != nullptr)
     {
       LOG_TRACE_FMT("KV[{}]::get({}) - found", map_name, key);
-      return val_opt->second;
+      return std::optional<MaybeValue>(std::in_place, *value_p);
     }
 
     LOG_TRACE_FMT("KV[{}]::get({}) - not found", map_name, key);
@@ -42,14 +86,7 @@ namespace kv::untyped
 
   bool MapDiff::has(const MapDiff::KeyType& key)
   {
-    auto val_opt = writes.find(key);
-
-    bool found = false;
-
-    if (val_opt != writes.end())
-    {
-      found = val_opt->second.has_value();
-    }
+    const bool found = written_value(change_set, key) != nullptr;
 
     LOG_TRACE_FMT(
       "KV[{}]::has({}) - {}found", map_name, key, found ? "" : "not ");
@@ -58,14 +95,7 @@ namespace kv::untyped
 
   bool MapDiff::is_deleted(const MapDiff::KeyType& key)
   {
-    auto val_opt = writes.find(key);
-
-    bool deleted = false;
-
-    if (val_opt != writes.end())
-    {
-      deleted = !val_opt->second.has_value();
-    }
+    const bool deleted = change_set.writes.contains(key);
 
     LOG_TRACE_FMT(
       "KV[{}]::deleted({}) - {}deleted", map_name, key, deleted ? "" : "not ");
@@ -79,12 +109,15 @@ namespace kv::untyped
 
   size_t MapDiff::size()
   {
-    size_t size_ = 0;
+    // Counted directly rather than via foreach, which would copy every value
+    size_t size_ = change_set.writes.size();
 
-    foreach([&size_](const auto&, const auto&) {
-      ++size_;
-      return true;
-    });
+    const auto version = change_set.start_version;
+    change_set.state.foreach(
+      [&size_, version](const KeyType&, const VersionV& v) {
+        size_ += (v.version == version) ? 1 : 0;
+        return true;
+      });
 
     return size_;
   }
@@ -102,8 +135,8 @@ namespace kv::untyped
     // - The constructed range is loop over at the end to call lambda on.
     // Optimisation is possible to only loop over the state/writes once, in
     // order, and call the user lambda on each element in the range directly.
-    // This should include adding an iterator to underlying ordered state
-    // (i.e. rb::Map) to find the start/end of the range using
+    // This should include adding an iterator to the underlying ordered state
+    // to find the start/end of the range using
     // std::lower_bound()/std::upper_bound() and loop over it, interleaves
     // with the local writes.
 
@@ -114,14 +147,11 @@ namespace kv::untyped
       return;
     }
 
-    // Since entries are ordered in the RB Map, it is OK to early out once we
-    // have passed the end of the range. Otherwise (CHAMP), all entries should
-    // be considered.
-#ifndef KV_STATE_RB
+    // CHAMP maps are unordered, so we cannot early-out when we encounter a
+    // key past the end of the range - there may still be in-range keys later
+    // in the iteration. If the underlying state used an ordered collection,
+    // this could be set to false to stop iteration once `to` is exceeded.
     bool continue_past_range_to = true;
-#else
-    bool continue_past_range_to = false;
-#endif
 
     std::map<KeyType, std::optional<ValueType>> res;
     auto g = [&res, &from, &to, continue_past_range_to](
@@ -131,7 +161,8 @@ namespace kv::untyped
         // Start of range is not yet found.
         return true;
       }
-      else if (to.has_value() && (k == to.value() || to.value() < k))
+
+      if (to.has_value() && (k == to.value() || to.value() < k))
       {
         // End of range. Note: `to` is excluded.
         return continue_past_range_to;

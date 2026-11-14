@@ -1,29 +1,23 @@
+#!/usr/bin/env python3
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
 import argparse
-import re
 import sys
 import subprocess
+from pathlib import Path
 
-MICROSOFT_ARTIFACT_REGISTRY_NAME = "mcr.microsoft.com"
-MICROSOFT_ARTIFACT_REGISTRY_PREFIX = "product"
-CCF_APP_IMAGE_PREFIX = "ccf/app"
-CCF_MCR_IMAGES = {
-    "App Development": f"{CCF_APP_IMAGE_PREFIX}/dev",
-    "C++ Runtime": f"{CCF_APP_IMAGE_PREFIX}/run",
-    "TypeScript/JavaScript Runtime": f"{CCF_APP_IMAGE_PREFIX}/run-js",
-}
+import release_notes as fragments
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parses a CHANGELOG file and checks it meets some formatting expectations. "
-        "Will also extract release notes for targeted versions."
+        description="Validate the historical CHANGELOG or extract release notes for targeted versions. "
+        "Use --from-changes to generate notes directly from tagged change descriptions."
     )
     parser.add_argument(
         "--target-version",
-        help="Add a version string which must be present in the CHANGELOG",
+        help="Release version without 'ccf-'; must be in CHANGELOG unless --from-changes is used",
         action="append",
         default=[],
     )
@@ -36,46 +30,67 @@ def main():
         "--changelog", help="Path to CHANGELOG file to parse", default="CHANGELOG.md"
     )
     parser.add_argument(
+        "--from-changes",
+        help="Generate notes from descriptions added since the previous release tag.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--previous-tag",
+        help="Explicit range start for --from-changes (default: nearest ancestor ccf-* tag).",
+    )
+    parser.add_argument(
+        "--pr",
+        action="append",
+        default=[],
+        metavar="FILENAME=NUMBER",
+        help="Override a change description's PR lookup.",
+    )
+    parser.add_argument(
         "-f",
         "--fix",
         help="Fix any automatically correctable errors",
         action="store_true",
     )
     parser.add_argument(
-        "--append-mcr-images",
-        help="If true, automatically append MCR images URLs to release notes",
-        action="store_true",
-        default=False,
+        "--describe-path-changes",
+        help="If true, add a note whenever the given path has changes between releases.",
+        action="append",
+        default=[],
     )
     args = parser.parse_args()
+    root = Path.cwd()
+
+    if args.pr and not args.from_changes:
+        parser.error("--pr requires --from-changes.")
+    if args.previous_tag and not args.from_changes:
+        parser.error("--previous-tag requires --from-changes.")
+    if args.from_changes and args.fix:
+        parser.error("--from-changes cannot be combined with --fix.")
 
     if args.target_git_version:
-        git_version = subprocess.run(
-            ["git", "describe", "--tags"], capture_output=True, universal_newlines=True
-        ).stdout.strip()
-        git_version = git_version.replace("ccf-", "")
+        git_version = fragments.git(
+            root, "describe", "--tags", "--exact-match", "--match", "ccf-*"
+        )
+        git_version = git_version.removeprefix("ccf-")
         args.target_version.append(git_version)
 
-    version_header = re.compile(r"## \[(.+)\]")
-    link_definition = re.compile(r"\[(.+)\]:")
+    if args.from_changes:
+        if len(args.target_version) != 1:
+            parser.error("--from-changes requires exactly one target version.")
+        version = args.target_version[0]
+        tag = f"ccf-{version}"
+        previous = args.previous_tag or fragments.previous_tag(root, tag)
+        notes = fragments.from_descriptions(root, version, args.pr, previous)
+        if args.describe_path_changes:
+            for path in args.describe_path_changes:
+                notes += fragments.describe_path_changes(root, tag, previous, path)
+        print(notes)
+        return
 
-    release_notes = {}
-    links_found = []
+    fragments.check_descriptions(root)
 
-    # Parse file, bucketing lines into each version's release notes
-    current_release_notes = None
     with open(args.changelog) as f:
-        while line := f.readline():
-            if match := version_header.match(line):
-                log_version = match.group(1)
-                current_release_notes = []
-                release_notes[log_version] = current_release_notes
-            elif match := link_definition.match(line):
-                link_version = match.group(1)
-                links_found.append(link_version)
-            else:
-                if current_release_notes != None:
-                    current_release_notes.append(line.strip())
+        release_notes, links_found = fragments.parse_changelog(f.read())
 
     documented_versions = set(release_notes.keys())
 
@@ -115,19 +130,45 @@ def main():
                         print("\n" + "-" * 80 + "\n")
                     print(f"# {version}")
                 print("\n".join(release_notes[version]).strip())
-            if args.append_mcr_images:
-                print("\n**MCR Docker Images:** ", end="")
-                print(
-                    ", ".join(
+
+                for path in args.describe_path_changes:
+                    git_version = f"ccf-{version}"
+                    prev_version = subprocess.run(
+                        ["git", "describe", "--tags", f"{git_version}^", "--abbrev=0"],
+                        capture_output=True,
+                        universal_newlines=True,
+                    ).stdout.strip()
+                    diff = subprocess.run(
                         [
-                            f"[{desc}](https://{MICROSOFT_ARTIFACT_REGISTRY_NAME}/{MICROSOFT_ARTIFACT_REGISTRY_PREFIX}/{name}/tags)"
-                            for desc, name in CCF_MCR_IMAGES.items()
-                        ]
+                            "git",
+                            "diff",
+                            "--exit-code",
+                            prev_version,
+                            git_version,
+                            "--",
+                            path,
+                        ],
+                        capture_output=True,
+                        universal_newlines=True,
                     )
-                )
+                    if diff.returncode == 1:
+                        # Insert a hyperlink to a GitHub compare page.
+                        # This shows all changes between tags, not localised to the path, but seems to be the best we can do automatically.
+                        print(
+                            f"\n- **Note**: This release include changes to `{path}`, which may be viewed [here](https://github.com/Microsoft/CCF/compare/{prev_version}...{git_version}#files_bucket)"
+                        )
+
         else:
             print("CHANGELOG is valid!")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        detail = (
+            error.stderr.strip()
+            if isinstance(error, subprocess.CalledProcessError)
+            else str(error)
+        )
+        sys.exit(f"Error: {detail or str(error)}")

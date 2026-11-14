@@ -4,7 +4,7 @@
       "post": {
         "js_module": "limits.js",
         "js_function": "recursive",
-        "forwarding_required": "never",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {}
@@ -14,7 +14,7 @@
       "post": {
         "js_module": "limits.js",
         "js_function": "alloc",
-        "forwarding_required": "never",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {}
@@ -24,7 +24,97 @@
       "post": {
         "js_module": "limits.js",
         "js_function": "sleep",
-        "forwarding_required": "never",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/nested_eval": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "nestedEval",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/nested_function": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "nestedFunction",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/response_body_getter": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "responseBodyGetter",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/response_headers_getter": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "responseHeadersGetter",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/response_header_value_getter": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "responseHeaderValueGetter",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/response_headers_proxy": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "responseHeadersProxy",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/response_status_code_getter": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "responseStatusCodeGetter",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/response_getter_throws": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "responseGetterThrows",
+        "redirection_strategy": "none",
+        "authn_policies": ["user_cert"],
+        "mode": "readonly",
+        "openapi": {}
+      }
+    },
+    "/handler_throws": {
+      "post": {
+        "js_module": "limits.js",
+        "js_function": "handlerThrows",
+        "redirection_strategy": "none",
         "authn_policies": ["user_cert"],
         "mode": "readonly",
         "openapi": {}

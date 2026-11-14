@@ -1,0 +1,367 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+
+#include "tasks/worker.h"
+
+#include <cstdlib>
+#include <cxxabi.h>
+#include <dlfcn.h>
+#include <limits>
+#include <memory>
+#include <new>
+#include <sstream>
+#include <type_traits>
+#include <utility>
+
+#ifdef CCF_STACKTRACE_USE_STD
+#  include <stacktrace>
+#else
+#  include <backtrace.h>
+#  include <execinfo.h>
+#endif
+
+namespace ccf::tasks
+{
+  // Maximum number of frames to capture at the throw-point
+  static constexpr int throw_trace_max_frames = 128;
+
+  struct ThrowTrace
+  {
+#ifdef CCF_STACKTRACE_USE_STD
+    std::stacktrace frames;
+#else
+    void* frames[throw_trace_max_frames] = {};
+    size_t num_frames = 0;
+#endif
+  };
+
+  namespace
+  {
+    // Initialise the guard before touching the trace's non-trivial TLS object.
+    // An allocator may throw while current() is capturing the original throw.
+    thread_local bool suppress_throw_capture = false;
+    thread_local ThrowTrace current_throw_trace = {};
+
+    struct SuppressThrowCapture
+    {
+      bool previous = std::exchange(suppress_throw_capture, true);
+
+      ~SuppressThrowCapture()
+      {
+        suppress_throw_capture = previous;
+      }
+    };
+
+#ifdef CCF_STACKTRACE_USE_STD
+    static_assert(
+      noexcept(std::stacktrace::current(0, throw_trace_max_frames)));
+    static_assert(std::is_nothrow_move_assignable_v<ThrowTrace>);
+
+    std::string format_stacktrace(const std::stacktrace& frames)
+    {
+      std::ostringstream oss;
+      size_t i = 0;
+      for (const auto& entry : frames)
+      {
+        oss << "  #" << i++ << ": ";
+        try
+        {
+          const auto description = entry.description();
+          const auto filename = entry.source_file();
+          const auto line = entry.source_line();
+          if (!description.empty() || !filename.empty())
+          {
+            oss << (description.empty() ? "<unknown>" : description);
+            if (!filename.empty())
+            {
+              oss << " at " << filename << ":" << line;
+            }
+            oss << "\n";
+            continue;
+          }
+        }
+        catch (const std::bad_alloc&)
+        {
+          // Symbolization is best-effort; retain the captured native handle.
+        }
+        oss << "<unavailable> (native handle: " << std::hex
+            << entry.native_handle() << std::dec << ")\n";
+      }
+      return oss.str();
+    }
+#else
+    struct FreeDeleter
+    {
+      void operator()(char* p) const
+      {
+        // NOLINTNEXTLINE(cppcoreguidelines-no-malloc,cppcoreguidelines-owning-memory)
+        free(p);
+      }
+    };
+
+    // Silently ignore libbacktrace errors. For individual frame resolution
+    // failures we fall back to printing the raw PC address; for
+    // backtrace_create_state failures the returned state will be nullptr and
+    // we fall back to glibc backtrace().
+    void error_callback(void* /*data*/, const char* /*msg*/, int /*errnum*/) {}
+
+    // Lazily initialise and return the process-wide backtrace_state.
+    // backtrace_create_state allocates resources that cannot be freed, so
+    // we call it at most once and cache the result.
+    backtrace_state* get_backtrace_state()
+    {
+      static backtrace_state* state = backtrace_create_state(
+        nullptr, // let libbacktrace find the executable
+        1, // threaded = true
+        error_callback,
+        nullptr);
+      return state;
+    }
+
+    bool is_sentinel_pc(uintptr_t pc)
+    {
+      return pc == 0 || pc == std::numeric_limits<uintptr_t>::max();
+    }
+
+    // Demangle a C++ mangled symbol name. Returns the original string
+    // unchanged if demangling fails.
+    std::string demangle(const char* name)
+    {
+      if (name == nullptr)
+      {
+        return "<unknown>";
+      }
+
+      int status = 0;
+      std::unique_ptr<char, FreeDeleter> demangled(
+        abi::__cxa_demangle(name, nullptr, nullptr, &status));
+      if (status == 0 && demangled != nullptr)
+      {
+        return demangled.get();
+      }
+      return name;
+    }
+
+    // Data passed through libbacktrace callbacks to build up each frame's
+    // description.
+    struct PcinfoResult
+    {
+      bool resolved = false;
+      std::string function;
+      std::string filename;
+      int lineno = 0;
+    };
+
+    // Called by backtrace_pcinfo for each source location (may be called
+    // multiple times per PC when inlined calls are present).
+    int pcinfo_callback(
+      void* data,
+      uintptr_t /*pc*/,
+      const char* filename,
+      int lineno,
+      const char* function)
+    {
+      auto* result = static_cast<PcinfoResult*>(data);
+      if (function != nullptr || filename != nullptr || lineno != 0)
+      {
+        result->resolved = true;
+        result->function = demangle(function);
+        result->filename = (filename != nullptr) ? filename : "";
+        result->lineno = lineno;
+      }
+      return 0; // continue
+    }
+
+    // Called by backtrace_syminfo when DWARF info is unavailable but the
+    // dynamic symbol table has an entry.
+    void syminfo_callback(
+      void* data,
+      uintptr_t /*pc*/,
+      const char* symname,
+      uintptr_t /*symval*/,
+      uintptr_t /*symsize*/)
+    {
+      auto* result = static_cast<PcinfoResult*>(data);
+      if (symname != nullptr)
+      {
+        result->resolved = true;
+        result->function = demangle(symname);
+      }
+    }
+
+    // Format a stack trace using libbacktrace for DWARF-aware symbol,
+    // file and line resolution. This works in all build configurations
+    // without requiring -rdynamic.
+    std::string format_stacktrace(void** frames, int num_frames)
+    {
+      std::ostringstream oss;
+      auto* state = get_backtrace_state();
+
+      for (int i = 0; i < num_frames; ++i)
+      {
+        auto pc = reinterpret_cast<uintptr_t>(frames[i]);
+        if (is_sentinel_pc(pc))
+        {
+          continue;
+        }
+
+        PcinfoResult result;
+
+        if (state != nullptr)
+        {
+          // Try DWARF-based resolution first (gives file + line + function)
+          backtrace_pcinfo(state, pc, pcinfo_callback, error_callback, &result);
+
+          // If DWARF info wasn't available, try the symbol table
+          if (!result.resolved)
+          {
+            backtrace_syminfo(
+              state, pc, syminfo_callback, error_callback, &result);
+          }
+        }
+
+        oss << "  #" << i << ": ";
+        if (result.resolved)
+        {
+          oss << result.function;
+          if (!result.filename.empty())
+          {
+            oss << " at " << result.filename << ":" << result.lineno;
+          }
+        }
+        else
+        {
+          oss << "0x" << std::hex << pc << std::dec;
+        }
+        oss << "\n";
+      }
+      return oss.str();
+    }
+#endif
+  }
+
+  void dump_stacktrace(const std::string& msg)
+  {
+    // Consume before logging, so a symbolization/logging failure cannot leave
+    // a stale trace or replace it with an exception from the diagnostics.
+    const SuppressThrowCapture guard;
+    auto throw_trace = std::exchange(current_throw_trace, {});
+    LOG_FATAL_FMT("{}", msg);
+
+#ifdef CCF_STACKTRACE_USE_STD
+    if (!throw_trace.frames.empty())
+    {
+      LOG_FATAL_FMT("Stack trace:\n{}", format_stacktrace(throw_trace.frames));
+    }
+#else
+    if (throw_trace.num_frames > 0)
+    {
+      LOG_FATAL_FMT(
+        "Stack trace:\n{}",
+        format_stacktrace(throw_trace.frames, throw_trace.num_frames));
+    }
+#endif
+    else
+    {
+      LOG_FATAL_FMT("No throw-point stack trace available");
+    }
+  }
+}
+
+// Interpose __cxa_throw to capture a backtrace at each throw-point.
+// This is called by the C++ runtime whenever `throw` is executed.
+extern "C"
+{
+  using CxaThrowFn = void (*)(void*, std::type_info*, void (*)(void*));
+
+  void __cxa_throw(
+    void* thrown_exception, std::type_info* tinfo, void (*dest)(void*))
+  {
+    // Resolve before capturing: a reentrant throw must be able to forward
+    // without entering a partially initialised function-local static.
+    static auto real_cxa_throw =
+      reinterpret_cast<CxaThrowFn>(dlsym(RTLD_NEXT, "__cxa_throw"));
+    if (real_cxa_throw == nullptr)
+    {
+      ccf::logger::write_fatal_diagnostic(
+        "Failed to resolve the C++ exception runtime handler");
+      std::abort();
+    }
+
+    if (!ccf::tasks::suppress_throw_capture)
+    {
+      const ccf::tasks::SuppressThrowCapture guard;
+      auto& trace = ccf::tasks::current_throw_trace;
+#ifdef CCF_STACKTRACE_USE_STD
+      // current() is noexcept and returns an empty trace on allocation failure.
+      // Its allocator can still throw internally; the guard lets that exception
+      // reach the library's handler without overwriting this throw's trace.
+      trace.frames =
+        std::stacktrace::current(0, ccf::tasks::throw_trace_max_frames);
+#else
+      // Capture the backtrace at the throw site using libbacktrace's own
+      // unwinder. glibc backtrace() can lose frames whose return address
+      // falls exactly at the end of a .eh_frame FDE range; libbacktrace's
+      // DWARF unwinder handles this correctly.
+      trace.num_frames = 0;
+      auto* bt_state = ccf::tasks::get_backtrace_state();
+      // Initialise to -1 so that bt_ret < 0 means "backtrace_simple() was not
+      // called" (bt_state was nullptr). backtrace_simple() itself only returns
+      // 0 (all frames visited) or a positive value (callback stopped early).
+      int bt_ret = -1;
+      if (bt_state != nullptr)
+      {
+        bt_ret = backtrace_simple(
+          bt_state,
+          0, // skip = 0, capture from here
+          [](void* data, uintptr_t pc) -> int {
+            auto* trace = static_cast<ccf::tasks::ThrowTrace*>(data);
+            if (ccf::tasks::is_sentinel_pc(pc))
+            {
+              return 1;
+            }
+
+            if (trace->num_frames == ccf::tasks::throw_trace_max_frames)
+            {
+              return 1;
+            }
+
+            // NOLINTNEXTLINE(performance-no-int-to-ptr)
+            trace->frames[trace->num_frames++] = reinterpret_cast<void*>(pc);
+            return 0;
+          },
+          ccf::tasks::error_callback,
+          &trace);
+      }
+
+      if (trace.num_frames == 0 || bt_ret < 0)
+      {
+        // libbacktrace was unavailable (bt_ret < 0) or captured no frames;
+        // fall back to the glibc backtrace() so the throw-point trace is not
+        // lost.
+        auto num_frames =
+          backtrace(trace.frames, ccf::tasks::throw_trace_max_frames);
+        if (num_frames > 0)
+        {
+          trace.num_frames = static_cast<size_t>(num_frames);
+          while (trace.num_frames > 0)
+          {
+            const auto pc =
+              reinterpret_cast<uintptr_t>(trace.frames[trace.num_frames - 1]);
+            if (!ccf::tasks::is_sentinel_pc(pc))
+            {
+              break;
+            }
+
+            --trace.num_frames;
+          }
+        }
+      }
+#endif
+    }
+
+    // Forward to the real __cxa_throw
+    real_cxa_throw(thrown_exception, tinfo, dest);
+    std::unreachable();
+  }
+}

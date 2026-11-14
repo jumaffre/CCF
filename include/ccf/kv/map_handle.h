@@ -4,27 +4,27 @@
 
 #include "ccf/kv/untyped_map_handle.h"
 
-namespace kv
+namespace ccf::kv
 {
-  /** Grants read access to a @c kv::Map, as part of a @c kv::Tx.
+  /** Grants read access to a @c ccf::kv::Map, as part of a @c ccf::kv::Tx.
    */
   template <typename K, typename V, typename KSerialiser, typename VSerialiser>
   class ReadableMapHandle
   {
   protected:
-    kv::untyped::MapHandle& read_handle;
+    ccf::kv::untyped::MapHandle& read_handle;
 
   public:
     using KeyType = K;
     using ValueType = V;
 
-    ReadableMapHandle(kv::untyped::MapHandle& uh) : read_handle(uh) {}
+    ReadableMapHandle(ccf::kv::untyped::MapHandle& uh) : read_handle(uh) {}
 
     /** Get name of this map.
      *
      * @return String containing name used to construct this map handle
      */
-    std::string get_name_of_map() const
+    [[nodiscard]] std::string get_name_of_map() const
     {
       return read_handle.get_name_of_map();
     }
@@ -143,11 +143,11 @@ namespace kv
      * (true) or stop (false)
      */
     template <class F>
-    void foreach(F&& f)
+    void foreach(F&& f) // NOLINT(cppcoreguidelines-missing-std-forward)
     {
       auto g = [&](
-                 const kv::serialisers::SerialisedEntry& k_rep,
-                 const kv::serialisers::SerialisedEntry& v_rep) {
+                 const ccf::kv::serialisers::SerialisedEntry& k_rep,
+                 const ccf::kv::serialisers::SerialisedEntry& v_rep) {
         return f(
           KSerialiser::from_serialised(k_rep),
           VSerialiser::from_serialised(v_rep));
@@ -166,11 +166,11 @@ namespace kv
      * (true) or stop (false)
      */
     template <class F>
-    void foreach_key(F&& f)
+    void foreach_key(F&& f) // NOLINT(cppcoreguidelines-missing-std-forward)
     {
       auto g = [&](
-                 const kv::serialisers::SerialisedEntry& k_rep,
-                 const kv::serialisers::SerialisedEntry&) {
+                 const ccf::kv::serialisers::SerialisedEntry& k_rep,
+                 const ccf::kv::serialisers::SerialisedEntry&) {
         return f(KSerialiser::from_serialised(k_rep));
       };
       read_handle.foreach(g);
@@ -187,11 +187,11 @@ namespace kv
      * (true) or stop (false)
      */
     template <class F>
-    void foreach_value(F&& f)
+    void foreach_value(F&& f) // NOLINT(cppcoreguidelines-missing-std-forward)
     {
       auto g = [&](
-                 const kv::serialisers::SerialisedEntry&,
-                 const kv::serialisers::SerialisedEntry& v_rep) {
+                 const ccf::kv::serialisers::SerialisedEntry&,
+                 const ccf::kv::serialisers::SerialisedEntry& v_rep) {
         return f(VSerialiser::from_serialised(v_rep));
       };
       read_handle.foreach(g);
@@ -211,16 +211,16 @@ namespace kv
     }
   };
 
-  /** Grants write access to a @c kv::Map, as part of a @c kv::Tx.
+  /** Grants write access to a @c ccf::kv::Map, as part of a @c ccf::kv::Tx.
    */
   template <typename K, typename V, typename KSerialiser, typename VSerialiser>
   class WriteableMapHandle
   {
   protected:
-    kv::untyped::MapHandle& write_handle;
+    ccf::kv::untyped::MapHandle& write_handle;
 
   public:
-    WriteableMapHandle(kv::untyped::MapHandle& uh) : write_handle(uh) {}
+    WriteableMapHandle(ccf::kv::untyped::MapHandle& uh) : write_handle(uh) {}
 
     /** Write value at key.
      *
@@ -255,10 +255,11 @@ namespace kv
     }
   };
 
-  /** Grants read and write access to a @c kv::Map, as part of a @c kv::Tx.
+  /** Grants read and write access to a @c ccf::kv::Map, as part of a @c
+   * ccf::kv::Tx.
    *
-   * @see kv::ReadableMapHandle
-   * @see kv::WriteableMapHandle
+   * @see ccf::kv::ReadableMapHandle
+   * @see ccf::kv::WriteableMapHandle
    */
   template <typename K, typename V, typename KSerialiser, typename VSerialiser>
   class MapHandle : public AbstractHandle,
@@ -266,13 +267,14 @@ namespace kv
                     public WriteableMapHandle<K, V, KSerialiser, VSerialiser>
   {
   protected:
-    kv::untyped::MapHandle untyped_handle;
+    ccf::kv::untyped::MapHandle untyped_handle;
 
     using ReadableBase = ReadableMapHandle<K, V, KSerialiser, VSerialiser>;
     using WriteableBase = WriteableMapHandle<K, V, KSerialiser, VSerialiser>;
 
   public:
-    MapHandle(kv::untyped::ChangeSet& changes, const std::string& map_name) :
+    MapHandle(
+      ccf::kv::untyped::ChangeSet& changes, const std::string& map_name) :
       ReadableBase(untyped_handle),
       WriteableBase(untyped_handle),
       untyped_handle(changes, map_name)

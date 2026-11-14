@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/ds/locking.h"
 #include "ccf/kv/read_only_store.h"
 #include "ccf/tx_id.h"
 
@@ -24,10 +25,11 @@ namespace ccf::indexing
     const std::string name;
 
   public:
-    Strategy(const std::string& name) : name(name) {}
+    Strategy(std::string name) : name(std::move(name)) {}
+
     virtual ~Strategy() = default;
 
-    std::string get_name() const
+    [[nodiscard]] std::string get_name() const
     {
       return name;
     }
@@ -38,7 +40,7 @@ namespace ccf::indexing
      * transaction.
      */
     virtual void handle_committed_transaction(
-      const ccf::TxID& tx_id, const kv::ReadOnlyStorePtr& store) = 0;
+      const ccf::TxID& tx_id, const ccf::kv::ReadOnlyStorePtr& store) = 0;
 
     virtual void tick() {}
 
@@ -68,6 +70,7 @@ namespace ccf::indexing
   class LazyStrategy : public Base
   {
   protected:
+    ccf::ds::Mutex lock;
     ccf::SeqNo max_requested_seqno = 0;
 
   public:
@@ -78,6 +81,7 @@ namespace ccf::indexing
       const auto base = Base::next_requested();
       if (base.has_value())
       {
+        std::lock_guard<ccf::ds::Mutex> guard(lock);
         if (*base <= max_requested_seqno)
         {
           return base;
@@ -89,6 +93,7 @@ namespace ccf::indexing
 
     void extend_index_to(ccf::TxID to_txid)
     {
+      std::lock_guard<ccf::ds::Mutex> guard(lock);
       if (to_txid.seqno > max_requested_seqno)
       {
         max_requested_seqno = to_txid.seqno;

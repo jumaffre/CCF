@@ -1,31 +1,42 @@
 {
   "name": "CCF Development Environment",
-  "image": "ccfmsrc.azurecr.io/ccf/ci:05-09-2023-virtual-clang15",
-  "runArgs": [],
-  "extensions": [
-    "eamodio.gitlens",
-    "esbenp.prettier-vscode",
-    "me-dutour-mathieu.vscode-github-actions",
-    "ms-azure-devops.azure-pipelines",
-    "ms-python.black-formatter",
-    "ms-python.python",
-    "ms-vscode.cpptools"
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "."
+  },
+  "runArgs": [
+    "--cap-add=PERFMON",
+    "--cap-add=SYS_PTRACE",
+    "--cap-add=NET_ADMIN",
+    "--security-opt",
+    "seccomp=unconfined"
   ],
-  "settings": {
-    "python.defaultInterpreterPath": "python3",
-    "[python]": {
-      "editor.defaultFormatter": "ms-python.black-formatter"
-    },
-    "python.formatting.provider": "none",
-    "editor.defaultFormatter": "esbenp.prettier-vscode",
-    "editor.formatOnSave": true,
-    "editor.codeActionsOnSave": {
-      "source.fixAll": true
+  "hostRequirements": {
+    "cpus": 16,
+    "memory": "64gb",
+    "storage": "128gb"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "github.vscode-github-actions",
+        "ms-python.black-formatter",
+        "ms-python.python",
+        "ms-vscode.cpptools",
+        "github.copilot"
+      ],
+      "settings": {
+        "python.defaultInterpreterPath": "python3",
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter"
+        },
+        "python.formatting.provider": "none",
+        "editor.formatOnSave": true,
+        "editor.codeActionsOnSave": {
+          "source.fixAll": true
+        }
+      }
     }
   },
-  "features": {
-    "ghcr.io/devcontainers/features/docker-from-docker:1": {
-      "version": "latest"
-    }
-  }
+  "postCreateCommand": "./.devcontainer/post_create_setup.sh"
 }

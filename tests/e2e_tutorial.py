@@ -1,14 +1,14 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import infra.clients
 import infra.e2e_args
 import infra.network
 import infra.proc
-import infra.clients
 
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         for node in network.nodes:
             node.client_impl = infra.clients.CurlClient

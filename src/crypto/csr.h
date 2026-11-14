@@ -2,20 +2,19 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/crypto/openssl/openssl_wrappers.h"
 #include "ccf/crypto/pem.h"
-#include "crypto/openssl/openssl_wrappers.h"
 
 #include <openssl/bio.h>
 
-namespace crypto
+namespace ccf::crypto
 {
   /** Extracts the public key from a certificate signing request (CSR).
    * @param signing_request CSR to extract the public key from
    * @return extracted public key
    */
-  Pem public_key_pem_from_csr(const Pem& signing_request)
+  inline Pem public_key_pem_from_csr(const Pem& signing_request)
   {
-    X509* icrt = NULL;
     OpenSSL::Unique_BIO mem(signing_request);
     OpenSSL::Unique_X509_REQ csr(mem);
     OpenSSL::Unique_BIO buf;
@@ -24,8 +23,8 @@ namespace crypto
 
     OpenSSL::CHECK1(PEM_write_bio_PUBKEY(buf, req_pubkey));
 
-    BUF_MEM* bptr;
+    BUF_MEM* bptr = nullptr;
     BIO_get_mem_ptr(buf, &bptr);
-    return Pem((uint8_t*)bptr->data, bptr->length);
+    return {reinterpret_cast<uint8_t*>(bptr->data), bptr->length};
   }
 }

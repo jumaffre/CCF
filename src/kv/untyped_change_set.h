@@ -5,16 +5,14 @@
 #include "ccf/byte_vector.h"
 #include "ccf/kv/hooks.h"
 #include "ccf/kv/untyped.h"
+#include "ds/champ_map.h"
 #include "kv/kv_types.h"
+#include "kv/trace.h"
 #include "kv/version_v.h"
 
-#ifndef KV_STATE_RB
-#  include "ds/champ_map.h"
-#else
-#  include "ds/rb_map.h"
-#endif
+#include <optional>
 
-namespace kv::untyped
+namespace ccf::kv::untyped
 {
   using SerialisedEntry = ccf::ByteVector;
   using SerialisedKeyHasher = std::hash<SerialisedEntry>;
@@ -23,53 +21,50 @@ namespace kv::untyped
   using V = SerialisedEntry;
   using H = SerialisedKeyHasher;
 
-  using VersionV = kv::VersionV<V>;
+  using VersionV = ccf::kv::VersionV<V>;
 
-#ifndef KV_STATE_RB
   using State = champ::Map<K, VersionV, H>;
-#else
-  using State = rb::Map<K, VersionV>;
-#endif
 
-  // This is a map of keys and with a tuple of the key's write version and
-  // the version of last transaction which read the key and committed
-  // successfully
-  using LastReadVersion = Version;
-  using Read = std::map<K, std::tuple<Version, LastReadVersion>>;
+  // This is a map of keys and the key's write version when read, or NoVersion
+  // if the key did not exist
+  using Read = std::map<K, Version>;
 
   // This is a container for a write-set + dependencies. It can be applied to
   // a given state, or used to track a set of operations on a state
   struct ChangeSet : public AbstractChangeSet
   {
   protected:
-    ChangeSet() {}
+    ChangeSet() = default;
 
   public:
+#ifdef CCF_KV_TRACING
+    trace::MapMetadata trace_metadata;
+#endif
     const size_t rollback_counter = {};
-    const kv::untyped::State state = {};
-    const kv::untyped::State committed = {};
+    const ccf::kv::untyped::State state;
+    const ccf::kv::untyped::State committed;
     const Version start_version = {};
 
-    Version read_version = NoVersion;
-    kv::untyped::Read reads = {};
-    kv::untyped::Write writes = {};
+    std::optional<Version> read_version = std::nullopt;
+    ccf::kv::untyped::Read reads;
+    ccf::kv::untyped::Write writes;
 
     ChangeSet(
       size_t rollbacks,
-      kv::untyped::State& current_state,
-      kv::untyped::State& committed_state,
-      kv::untyped::Write changed_writes,
+      ccf::kv::untyped::State& current_state,
+      ccf::kv::untyped::State& committed_state,
+      ccf::kv::untyped::Write changed_writes,
       Version current_version) :
       rollback_counter(rollbacks),
       state(current_state),
       committed(committed_state),
       start_version(current_version),
-      writes(changed_writes)
+      writes(std::move(changed_writes))
     {}
 
     ChangeSet(ChangeSet&) = delete;
 
-    bool has_writes() const override
+    [[nodiscard]] bool has_writes() const override
     {
       return !writes.empty();
     }
@@ -81,17 +76,18 @@ namespace kv::untyped
   // obliterates the current state.
   struct SnapshotChangeSet : public ChangeSet
   {
-    const kv::untyped::State state;
+    const ccf::kv::untyped::State state;
     const Version version;
 
-    SnapshotChangeSet(kv::untyped::State&& snapshot_state, Version version_) :
+    SnapshotChangeSet(
+      ccf::kv::untyped::State&& snapshot_state, Version version_) :
       state(std::move(snapshot_state)),
       version(version_)
     {}
 
     SnapshotChangeSet(SnapshotChangeSet&) = delete;
 
-    bool has_writes() const override
+    [[nodiscard]] bool has_writes() const override
     {
       return true;
     }
@@ -101,15 +97,15 @@ namespace kv::untyped
 namespace map
 {
   template <>
-  inline size_t get_size<kv::untyped::VersionV>(
-    const kv::untyped::VersionV& data)
+  inline size_t get_size<ccf::kv::untyped::VersionV>(
+    const ccf::kv::untyped::VersionV& data)
   {
     return sizeof(uint64_t) + sizeof(data.version) + data.value.size();
   }
 
   template <>
-  inline size_t serialize<kv::untyped::VersionV>(
-    const kv::untyped::VersionV& t, uint8_t*& data, size_t& size)
+  inline size_t serialize<ccf::kv::untyped::VersionV>(
+    const ccf::kv::untyped::VersionV& t, uint8_t*& data, size_t& size)
   {
     uint64_t data_size = sizeof(t.version) + t.value.size();
     serialized::write(
@@ -131,29 +127,29 @@ namespace map
   }
 
   template <>
-  inline kv::untyped::VersionV deserialize<kv::untyped::VersionV>(
+  inline ccf::kv::untyped::VersionV deserialize<ccf::kv::untyped::VersionV>(
     const uint8_t*& data, size_t& size)
   {
-    kv::untyped::VersionV ret;
-    uint64_t data_size = serialized::read<uint64_t>(data, size);
-    kv::Version version = serialized::read<kv::Version>(data, size);
+    ccf::kv::untyped::VersionV ret;
+    auto data_size = serialized::read<uint64_t>(data, size);
+    auto version = serialized::read<ccf::kv::Version>(data, size);
     ret.version = version;
-    data_size -= sizeof(kv::Version);
+    data_size -= sizeof(ccf::kv::Version);
     ret.value.append(data, data + data_size);
     serialized::skip(data, size, data_size);
     return ret;
   }
 
   template <>
-  inline size_t get_size<kv::untyped::SerialisedEntry>(
-    const kv::untyped::SerialisedEntry& data)
+  inline size_t get_size<ccf::kv::untyped::SerialisedEntry>(
+    const ccf::kv::untyped::SerialisedEntry& data)
   {
     return sizeof(uint64_t) + data.size();
   }
 
   template <>
-  inline size_t serialize<kv::untyped::SerialisedEntry>(
-    const kv::untyped::SerialisedEntry& t, uint8_t*& data, size_t& size)
+  inline size_t serialize<ccf::kv::untyped::SerialisedEntry>(
+    const ccf::kv::untyped::SerialisedEntry& t, uint8_t*& data, size_t& size)
   {
     uint64_t data_size = t.size();
     serialized::write(
@@ -167,11 +163,11 @@ namespace map
   }
 
   template <>
-  inline kv::untyped::SerialisedEntry deserialize<kv::untyped::SerialisedEntry>(
-    const uint8_t*& data, size_t& size)
+  inline ccf::kv::untyped::SerialisedEntry deserialize<
+    ccf::kv::untyped::SerialisedEntry>(const uint8_t*& data, size_t& size)
   {
-    uint64_t data_size = serialized::read<uint64_t>(data, size);
-    kv::untyped::SerialisedEntry ret;
+    auto data_size = serialized::read<uint64_t>(data, size);
+    ccf::kv::untyped::SerialisedEntry ret;
     ret.append(data, data + data_size);
     serialized::skip(data, size, data_size);
     return ret;

@@ -13,35 +13,14 @@
       }
     },
     "schemas": {
-      "Action": {
+      "BasicJoinPolicy": {
         "properties": {
-          "args": {
-            "$ref": "#/components/schemas/json"
-          },
-          "name": {
-            "$ref": "#/components/schemas/string"
+          "measurements": {
+            "$ref": "#/components/schemas/string_array"
           }
         },
         "required": [
-          "name",
-          "args"
-        ],
-        "type": "object"
-      },
-      "Action_array": {
-        "items": {
-          "$ref": "#/components/schemas/Action"
-        },
-        "type": "array"
-      },
-      "Ballot": {
-        "properties": {
-          "ballot": {
-            "$ref": "#/components/schemas/string"
-          }
-        },
-        "required": [
-          "ballot"
+          "measurements"
         ],
         "type": "object"
       },
@@ -63,130 +42,22 @@
         },
         "type": "object"
       },
-      "CodeStatus": {
-        "enum": [
-          "AllowedToJoin"
-        ],
+      "Cose": {
+        "format": "binary",
         "type": "string"
       },
-      "ConsensusType": {
-        "enum": [
-          "CFT",
-          "BFT"
-        ],
-        "type": "string"
-      },
-      "EndpointKey": {
+      "EncryptedRecoveryShare": {
         "properties": {
-          "uri_path": {
+          "encryptedShare": {
             "$ref": "#/components/schemas/string"
           },
-          "verb": {
-            "$ref": "#/components/schemas/HttpMethod"
+          "memberId": {
+            "$ref": "#/components/schemas/MemberId"
           }
         },
         "required": [
-          "uri_path",
-          "verb"
-        ],
-        "type": "object"
-      },
-      "EndpointKey_to_EndpointProperties": {
-        "items": {
-          "items": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/EndpointKey"
-              },
-              {
-                "$ref": "#/components/schemas/EndpointProperties"
-              }
-            ]
-          },
-          "maxItems": 2,
-          "minItems": 2,
-          "type": "array"
-        },
-        "type": "array"
-      },
-      "EndpointMetrics": {
-        "properties": {
-          "metrics": {
-            "$ref": "#/components/schemas/EndpointMetricsEntry_array"
-          }
-        },
-        "required": [
-          "metrics"
-        ],
-        "type": "object"
-      },
-      "EndpointMetricsEntry": {
-        "properties": {
-          "calls": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "errors": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "failures": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "method": {
-            "$ref": "#/components/schemas/string"
-          },
-          "path": {
-            "$ref": "#/components/schemas/string"
-          },
-          "retries": {
-            "$ref": "#/components/schemas/uint64"
-          }
-        },
-        "required": [
-          "path",
-          "method",
-          "calls",
-          "errors",
-          "failures",
-          "retries"
-        ],
-        "type": "object"
-      },
-      "EndpointMetricsEntry_array": {
-        "items": {
-          "$ref": "#/components/schemas/EndpointMetricsEntry"
-        },
-        "type": "array"
-      },
-      "EndpointProperties": {
-        "properties": {
-          "authn_policies": {
-            "$ref": "#/components/schemas/string_array"
-          },
-          "forwarding_required": {
-            "$ref": "#/components/schemas/ForwardingRequired"
-          },
-          "interpreter_reuse": {
-            "$ref": "#/components/schemas/InterpreterReusePolicy"
-          },
-          "js_function": {
-            "$ref": "#/components/schemas/string"
-          },
-          "js_module": {
-            "$ref": "#/components/schemas/string"
-          },
-          "mode": {
-            "$ref": "#/components/schemas/Mode"
-          },
-          "openapi": {
-            "$ref": "#/components/schemas/json"
-          },
-          "openapi_hidden": {
-            "$ref": "#/components/schemas/boolean"
-          }
-        },
-        "required": [
-          "forwarding_required",
-          "authn_policies"
+          "memberId",
+          "encryptedShare"
         ],
         "type": "object"
       },
@@ -204,69 +75,6 @@
         ],
         "type": "object"
       },
-      "ForwardingRequired": {
-        "enum": [
-          "sometimes",
-          "always",
-          "never"
-        ],
-        "type": "string"
-      },
-      "FullMemberDetails": {
-        "properties": {
-          "cert": {
-            "$ref": "#/components/schemas/Pem"
-          },
-          "member_data": {
-            "$ref": "#/components/schemas/json"
-          },
-          "public_encryption_key": {
-            "$ref": "#/components/schemas/Pem"
-          },
-          "status": {
-            "$ref": "#/components/schemas/MemberStatus"
-          }
-        },
-        "required": [
-          "status",
-          "member_data",
-          "cert",
-          "public_encryption_key"
-        ],
-        "type": "object"
-      },
-      "GetCode__Out": {
-        "properties": {
-          "versions": {
-            "$ref": "#/components/schemas/GetCode__Version_array"
-          }
-        },
-        "required": [
-          "versions"
-        ],
-        "type": "object"
-      },
-      "GetCode__Version": {
-        "properties": {
-          "digest": {
-            "$ref": "#/components/schemas/string"
-          },
-          "status": {
-            "$ref": "#/components/schemas/CodeStatus"
-          }
-        },
-        "required": [
-          "digest",
-          "status"
-        ],
-        "type": "object"
-      },
-      "GetCode__Version_array": {
-        "items": {
-          "$ref": "#/components/schemas/GetCode__Version"
-        },
-        "type": "array"
-      },
       "GetCommit__Out": {
         "properties": {
           "transaction_id": {
@@ -278,17 +86,6 @@
         },
         "required": [
           "transaction_id"
-        ],
-        "type": "object"
-      },
-      "GetRecoveryShare__Out": {
-        "properties": {
-          "encrypted_share": {
-            "$ref": "#/components/schemas/string"
-          }
-        },
-        "required": [
-          "encrypted_share"
         ],
         "type": "object"
       },
@@ -307,143 +104,157 @@
         ],
         "type": "object"
       },
-      "HttpMethod": {
+      "Javascript": {
         "type": "string"
       },
-      "InterpreterReusePolicy": {
-        "oneOf": [
-          {
-            "properties": {
-              "key": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "key"
-            ],
-            "type": "object"
-          }
-        ]
-      },
-      "JSRuntimeOptions": {
+      "JavascriptApp": {
         "properties": {
-          "log_exception_details": {
-            "$ref": "#/components/schemas/boolean"
-          },
-          "max_cached_interpreters": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "max_execution_time_ms": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "max_heap_bytes": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "max_stack_bytes": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "return_exception_details": {
-            "$ref": "#/components/schemas/boolean"
+          "endpoints": {
+            "$ref": "#/components/schemas/json"
           }
         },
         "required": [
-          "max_heap_bytes",
-          "max_stack_bytes",
-          "max_execution_time_ms"
+          "endpoints"
         ],
         "type": "object"
       },
-      "JwtIssuerKeyFilter": {
+      "JavascriptAppCase": {
         "enum": [
-          "all",
-          "sgx"
+          "original"
         ],
         "type": "string"
       },
-      "JwtIssuerKeyPolicy": {
+      "JavascriptModule": {
         "properties": {
-          "sgx_claims": {
-            "$ref": "#/components/schemas/string_to_string"
-          }
-        },
-        "required": [
-          "sgx_claims"
-        ],
-        "type": "object"
-      },
-      "JwtIssuerMetadata": {
-        "properties": {
-          "auto_refresh": {
-            "$ref": "#/components/schemas/boolean"
-          },
-          "ca_cert_bundle_name": {
+          "moduleName": {
             "$ref": "#/components/schemas/string"
-          },
-          "key_filter": {
-            "$ref": "#/components/schemas/JwtIssuerKeyFilter"
-          },
-          "key_policy": {
-            "$ref": "#/components/schemas/JwtIssuerKeyPolicy"
           }
         },
         "required": [
-          "key_filter"
+          "moduleName"
         ],
         "type": "object"
       },
-      "KeyIdInfo": {
+      "JavascriptModule_array": {
+        "items": {
+          "$ref": "#/components/schemas/JavascriptModule"
+        },
+        "type": "array"
+      },
+      "JavascriptModules": {
         "properties": {
-          "cert": {
-            "$ref": "#/components/schemas/Pem"
+          "value": {
+            "$ref": "#/components/schemas/JavascriptModule_array"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "JoinPolicy": {
+        "properties": {
+          "sgx": {
+            "$ref": "#/components/schemas/BasicJoinPolicy"
+          },
+          "snp": {
+            "$ref": "#/components/schemas/SnpJoinPolicy"
+          },
+          "virtual": {
+            "$ref": "#/components/schemas/VirtualJoinPolicy"
+          }
+        },
+        "required": [
+          "sgx",
+          "virtual",
+          "snp"
+        ],
+        "type": "object"
+      },
+      "Jwk": {
+        "properties": {
+          "constraint": {
+            "$ref": "#/components/schemas/json"
           },
           "issuer": {
             "$ref": "#/components/schemas/string"
-          }
-        },
-        "required": [
-          "issuer",
-          "cert"
-        ],
-        "type": "object"
-      },
-      "MDType": {
-        "enum": [
-          "NONE",
-          "SHA1",
-          "SHA256",
-          "SHA384",
-          "SHA512"
-        ],
-        "type": "string"
-      },
-      "MemberAck": {
-        "properties": {
-          "cose_sign1_req": {
-            "$ref": "#/components/schemas/base64string"
           },
-          "signed_req": {
-            "$ref": "#/components/schemas/SignedReq"
-          },
-          "state_digest": {
+          "publicKey": {
             "$ref": "#/components/schemas/string"
           }
         },
         "required": [
-          "state_digest"
+          "publicKey",
+          "issuer",
+          "constraint"
         ],
         "type": "object"
       },
-      "MemberDetails": {
+      "JwkInfo": {
         "properties": {
-          "member_data": {
+          "caCertBundles": {
+            "$ref": "#/components/schemas/string_to_string"
+          },
+          "issuers": {
+            "$ref": "#/components/schemas/string_to_JwtIssuer"
+          },
+          "keys": {
+            "$ref": "#/components/schemas/string_to_Jwk_array"
+          }
+        },
+        "required": [
+          "issuers",
+          "keys",
+          "caCertBundles"
+        ],
+        "type": "object"
+      },
+      "Jwk_array": {
+        "items": {
+          "$ref": "#/components/schemas/Jwk"
+        },
+        "type": "array"
+      },
+      "JwtIssuer": {
+        "properties": {
+          "autoRefresh": {
+            "$ref": "#/components/schemas/boolean"
+          },
+          "caCertBundleName": {
+            "$ref": "#/components/schemas/string"
+          }
+        },
+        "required": [
+          "autoRefresh"
+        ],
+        "type": "object"
+      },
+      "Member": {
+        "properties": {
+          "certificate": {
+            "$ref": "#/components/schemas/string"
+          },
+          "memberData": {
             "$ref": "#/components/schemas/json"
+          },
+          "memberId": {
+            "$ref": "#/components/schemas/MemberId"
+          },
+          "publicEncryptionKey": {
+            "$ref": "#/components/schemas/string"
+          },
+          "recoveryRole": {
+            "$ref": "#/components/schemas/MemberRecoveryRole"
           },
           "status": {
             "$ref": "#/components/schemas/MemberStatus"
           }
         },
         "required": [
-          "status"
+          "memberId",
+          "status",
+          "memberData",
+          "recoveryRole"
         ],
         "type": "object"
       },
@@ -452,45 +263,15 @@
         "pattern": "^[a-f0-9]{64}$",
         "type": "string"
       },
+      "MemberId_array": {
+        "items": {
+          "$ref": "#/components/schemas/MemberId"
+        },
+        "type": "array"
+      },
       "MemberId_to_Failure": {
         "additionalProperties": {
           "$ref": "#/components/schemas/Failure"
-        },
-        "type": "object"
-      },
-      "MemberId_to_FullMemberDetails": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/FullMemberDetails"
-        },
-        "type": "object"
-      },
-      "MemberId_to_MemberAck": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/MemberAck"
-        },
-        "type": "object"
-      },
-      "MemberId_to_MemberDetails": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/MemberDetails"
-        },
-        "type": "object"
-      },
-      "MemberId_to_Pem": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/Pem"
-        },
-        "type": "object"
-      },
-      "MemberId_to_SignedReq": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/SignedReq"
-        },
-        "type": "object"
-      },
-      "MemberId_to_base64string": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/base64string"
         },
         "type": "object"
       },
@@ -500,11 +281,13 @@
         },
         "type": "object"
       },
-      "MemberId_to_string": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/string"
-        },
-        "type": "object"
+      "MemberRecoveryRole": {
+        "enum": [
+          "NonParticipant",
+          "Participant",
+          "Owner"
+        ],
+        "type": "string"
       },
       "MemberStatus": {
         "enum": [
@@ -513,302 +296,75 @@
         ],
         "type": "string"
       },
-      "Mode": {
-        "enum": [
-          "readwrite",
-          "readonly",
-          "historical"
-        ],
-        "type": "string"
-      },
-      "NodeId_to_NodeInfo": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/NodeInfo"
+      "Member_array": {
+        "items": {
+          "$ref": "#/components/schemas/Member"
         },
-        "type": "object"
+        "type": "array"
       },
-      "NodeId_to_Pem": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/Pem"
-        },
-        "type": "object"
-      },
-      "NodeInfo": {
+      "Members": {
         "properties": {
-          "acme": {
-            "properties": {
-              "configurations": {
-                "additionalProperties": {
-                  "properties": {
-                    "ca_certs": {
-                      "items": {
-                        "type": "string"
-                      },
-                      "type": "array"
-                    },
-                    "challenge_type": {
-                      "type": "string"
-                    },
-                    "contact": {
-                      "items": {
-                        "type": "string"
-                      },
-                      "type": "array"
-                    },
-                    "directory_url": {
-                      "type": "string"
-                    },
-                    "service_dns_name": {
-                      "type": "string"
-                    },
-                    "terms_of_service_agreed": {
-                      "type": "boolean"
-                    }
-                  },
-                  "required": [
-                    "ca_certs",
-                    "directory_url",
-                    "service_dns_name",
-                    "contact",
-                    "terms_of_service_agreed",
-                    "challenge_type"
-                  ],
-                  "type": "object"
-                },
-                "type": "object"
-              }
-            },
-            "required": [
-              "configurations"
-            ],
-            "type": "object"
-          },
-          "cert": {
-            "$ref": "#/components/schemas/Pem"
-          },
-          "certificate_signing_request": {
-            "$ref": "#/components/schemas/Pem"
-          },
-          "code_digest": {
+          "value": {
+            "$ref": "#/components/schemas/Member_array"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "NetworkInterface": {
+        "properties": {
+          "protocol": {
             "$ref": "#/components/schemas/string"
           },
-          "encryption_pub_key": {
-            "$ref": "#/components/schemas/Pem"
+          "publishedAddress": {
+            "$ref": "#/components/schemas/string"
+          }
+        },
+        "required": [
+          "publishedAddress"
+        ],
+        "type": "object"
+      },
+      "Node": {
+        "properties": {
+          "certificate": {
+            "$ref": "#/components/schemas/string"
           },
-          "ledger_secret_seqno": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "node_data": {
+          "nodeData": {
             "$ref": "#/components/schemas/json"
           },
-          "node_to_node_interface": {
-            "properties": {
-              "accepted_endpoints": {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              "app_protocol": {
-                "type": "string"
-              },
-              "bind_address": {
-                "type": "string"
-              },
-              "endorsement": {
-                "properties": {
-                  "acme_configuration": {
-                    "type": "string"
-                  },
-                  "authority": {
-                    "enum": [
-                      "Node",
-                      "Service",
-                      "ACME",
-                      "Unsecured"
-                    ],
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "authority"
-                ],
-                "type": "object"
-              },
-              "forwarding_timeout_ms": {
-                "maximum": 18446744073709551615,
-                "minimum": 0,
-                "type": "integer"
-              },
-              "http_configuration": {
-                "properties": {
-                  "initial_window_size": {
-                    "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                    "type": "string"
-                  },
-                  "max_body_size": {
-                    "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                    "type": "string"
-                  },
-                  "max_concurrent_streams_count": {
-                    "maximum": 18446744073709551615,
-                    "minimum": 0,
-                    "type": "integer"
-                  },
-                  "max_frame_size": {
-                    "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                    "type": "string"
-                  },
-                  "max_header_size": {
-                    "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                    "type": "string"
-                  },
-                  "max_headers_count": {
-                    "maximum": 4294967295,
-                    "minimum": 0,
-                    "type": "integer"
-                  }
-                },
-                "type": "object"
-              },
-              "max_open_sessions_hard": {
-                "maximum": 18446744073709551615,
-                "minimum": 0,
-                "type": "integer"
-              },
-              "max_open_sessions_soft": {
-                "maximum": 18446744073709551615,
-                "minimum": 0,
-                "type": "integer"
-              },
-              "protocol": {
-                "type": "string"
-              },
-              "published_address": {
-                "type": "string"
-              }
-            },
-            "required": [
-              "bind_address"
-            ],
-            "type": "object"
+          "nodeId": {
+            "$ref": "#/components/schemas/NodeId"
           },
-          "public_key": {
-            "$ref": "#/components/schemas/Pem"
+          "quoteInfo": {
+            "$ref": "#/components/schemas/json"
           },
-          "quote_info": {
-            "$ref": "#/components/schemas/QuoteInfo"
-          },
-          "retired_committed": {
+          "retiredCommitted": {
             "$ref": "#/components/schemas/boolean"
           },
-          "rpc_interfaces": {
-            "additionalProperties": {
-              "properties": {
-                "accepted_endpoints": {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                "app_protocol": {
-                  "type": "string"
-                },
-                "bind_address": {
-                  "type": "string"
-                },
-                "endorsement": {
-                  "properties": {
-                    "acme_configuration": {
-                      "type": "string"
-                    },
-                    "authority": {
-                      "enum": [
-                        "Node",
-                        "Service",
-                        "ACME",
-                        "Unsecured"
-                      ],
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "authority"
-                  ],
-                  "type": "object"
-                },
-                "forwarding_timeout_ms": {
-                  "maximum": 18446744073709551615,
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "http_configuration": {
-                  "properties": {
-                    "initial_window_size": {
-                      "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                      "type": "string"
-                    },
-                    "max_body_size": {
-                      "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                      "type": "string"
-                    },
-                    "max_concurrent_streams_count": {
-                      "maximum": 18446744073709551615,
-                      "minimum": 0,
-                      "type": "integer"
-                    },
-                    "max_frame_size": {
-                      "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                      "type": "string"
-                    },
-                    "max_header_size": {
-                      "pattern": "^[0-9]+(B|KB|MB|GB|TB|PB)?$",
-                      "type": "string"
-                    },
-                    "max_headers_count": {
-                      "maximum": 4294967295,
-                      "minimum": 0,
-                      "type": "integer"
-                    }
-                  },
-                  "type": "object"
-                },
-                "max_open_sessions_hard": {
-                  "maximum": 18446744073709551615,
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "max_open_sessions_soft": {
-                  "maximum": 18446744073709551615,
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "protocol": {
-                  "type": "string"
-                },
-                "published_address": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "bind_address"
-              ],
-              "type": "object"
-            },
-            "type": "object"
+          "rpcInterfaces": {
+            "$ref": "#/components/schemas/string_to_NetworkInterface"
           },
           "status": {
             "$ref": "#/components/schemas/NodeStatus"
           }
         },
         "required": [
-          "node_to_node_interface",
-          "rpc_interfaces",
-          "quote_info",
-          "encryption_pub_key",
-          "status"
+          "nodeId",
+          "status",
+          "nodeData",
+          "retiredCommitted",
+          "quoteInfo",
+          "rpcInterfaces"
         ],
         "type": "object"
+      },
+      "NodeId": {
+        "format": "hex",
+        "pattern": "^[a-f0-9]{64}$",
+        "type": "string"
       },
       "NodeStatus": {
         "enum": [
@@ -818,77 +374,67 @@
         ],
         "type": "string"
       },
-      "Pem": {
-        "type": "string"
+      "Node_array": {
+        "items": {
+          "$ref": "#/components/schemas/Node"
+        },
+        "type": "array"
+      },
+      "Nodes": {
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/Node_array"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
       },
       "Proposal": {
         "properties": {
-          "actions": {
-            "$ref": "#/components/schemas/Action_array"
-          }
-        },
-        "required": [
-          "actions"
-        ],
-        "type": "object"
-      },
-      "ProposalInfo": {
-        "properties": {
-          "ballots": {
-            "$ref": "#/components/schemas/MemberId_to_string"
-          },
-          "failure": {
-            "$ref": "#/components/schemas/Failure"
-          },
-          "final_votes": {
-            "$ref": "#/components/schemas/MemberId_to_boolean"
-          },
-          "proposer_id": {
-            "$ref": "#/components/schemas/MemberId"
-          },
-          "state": {
-            "$ref": "#/components/schemas/ProposalState"
-          },
-          "vote_failures": {
-            "$ref": "#/components/schemas/MemberId_to_Failure"
-          }
-        },
-        "required": [
-          "proposer_id",
-          "state",
-          "ballots"
-        ],
-        "type": "object"
-      },
-      "ProposalInfoSummary": {
-        "properties": {
-          "ballot_count": {
+          "ballotCount": {
             "$ref": "#/components/schemas/uint64"
           },
+          "ballotSubmitters": {
+            "$ref": "#/components/schemas/MemberId_array"
+          },
           "failure": {
             "$ref": "#/components/schemas/Failure"
           },
-          "proposal_id": {
+          "finalVotes": {
+            "$ref": "#/components/schemas/MemberId_to_boolean"
+          },
+          "proposalId": {
             "$ref": "#/components/schemas/string"
           },
-          "proposer_id": {
-            "$ref": "#/components/schemas/MemberId"
-          },
-          "state": {
+          "proposalState": {
             "$ref": "#/components/schemas/ProposalState"
           },
-          "vote_failures": {
-            "$ref": "#/components/schemas/MemberId_to_Failure"
+          "proposerId": {
+            "$ref": "#/components/schemas/MemberId"
           },
-          "votes": {
-            "$ref": "#/components/schemas/MemberId_to_boolean"
+          "voteFailures": {
+            "$ref": "#/components/schemas/MemberId_to_Failure"
           }
         },
         "required": [
-          "proposal_id",
-          "proposer_id",
-          "state",
-          "ballot_count"
+          "proposalId",
+          "proposerId",
+          "proposalState",
+          "ballotCount",
+          "ballotSubmitters"
+        ],
+        "type": "object"
+      },
+      "ProposalList": {
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/Proposal_array"
+          }
+        },
+        "required": [
+          "value"
         ],
         "type": "object"
       },
@@ -903,87 +449,79 @@
         ],
         "type": "string"
       },
-      "QuoteFormat": {
-        "enum": [
-          "OE_SGX_v1",
-          "Insecure_Virtual",
-          "AMD_SEV_SNP_v1"
-        ],
-        "type": "string"
+      "Proposal_array": {
+        "items": {
+          "$ref": "#/components/schemas/Proposal"
+        },
+        "type": "array"
       },
-      "QuoteInfo": {
+      "RecoveryResponse": {
         "properties": {
-          "endorsed_tcb": {
+          "fullKeySubmitted": {
+            "$ref": "#/components/schemas/boolean"
+          },
+          "message": {
             "$ref": "#/components/schemas/string"
           },
-          "endorsements": {
-            "$ref": "#/components/schemas/base64string"
+          "recoveryThreshold": {
+            "$ref": "#/components/schemas/uint64"
           },
-          "format": {
-            "$ref": "#/components/schemas/QuoteFormat"
-          },
-          "quote": {
-            "$ref": "#/components/schemas/base64string"
-          },
-          "uvm_endorsements": {
-            "$ref": "#/components/schemas/base64string"
+          "submittedCount": {
+            "$ref": "#/components/schemas/uint64"
           }
         },
         "required": [
-          "format",
-          "quote",
-          "endorsements"
+          "message",
+          "submittedCount",
+          "recoveryThreshold",
+          "fullKeySubmitted"
         ],
         "type": "object"
       },
-      "ReconfigurationType": {
-        "enum": [
-          "OneTransaction",
-          "TwoTransaction"
-        ],
-        "type": "string"
-      },
       "ServiceConfiguration": {
         "properties": {
-          "consensus": {
-            "$ref": "#/components/schemas/ConsensusType"
-          },
-          "maximum_node_certificate_validity_days": {
+          "maximumNodeCertificateValidityDays": {
             "$ref": "#/components/schemas/uint64"
           },
-          "maximum_service_certificate_validity_days": {
+          "maximumServiceCertificateValidityDays": {
             "$ref": "#/components/schemas/uint64"
           },
-          "recent_cose_proposals_window_size": {
+          "recentCoseProposalsWindowSize": {
             "$ref": "#/components/schemas/uint64"
           },
-          "reconfiguration_type": {
-            "$ref": "#/components/schemas/ReconfigurationType"
-          },
-          "recovery_threshold": {
+          "recoveryThreshold": {
             "$ref": "#/components/schemas/uint64"
           }
         },
         "required": [
-          "recovery_threshold"
+          "recoveryThreshold",
+          "maximumNodeCertificateValidityDays",
+          "maximumServiceCertificateValidityDays",
+          "recentCoseProposalsWindowSize"
         ],
         "type": "object"
       },
       "ServiceInfo": {
         "properties": {
-          "cert": {
-            "$ref": "#/components/schemas/Pem"
+          "certificate": {
+            "$ref": "#/components/schemas/string"
           },
-          "current_service_create_txid": {
+          "configuration": {
+            "$ref": "#/components/schemas/ServiceConfiguration"
+          },
+          "creationTransactionId": {
             "$ref": "#/components/schemas/TransactionId"
           },
-          "previous_service_identity_version": {
+          "pqCertificate": {
+            "$ref": "#/components/schemas/string"
+          },
+          "previousServiceCreationTransactionId": {
+            "$ref": "#/components/schemas/TransactionId"
+          },
+          "recoveryCount": {
             "$ref": "#/components/schemas/uint64"
           },
-          "recovery_count": {
-            "$ref": "#/components/schemas/uint64"
-          },
-          "service_data": {
+          "serviceData": {
             "$ref": "#/components/schemas/json"
           },
           "status": {
@@ -991,8 +529,10 @@
           }
         },
         "required": [
-          "cert",
-          "status"
+          "status",
+          "certificate",
+          "recoveryCount",
+          "serviceData"
         ],
         "type": "object"
       },
@@ -1005,132 +545,79 @@
         ],
         "type": "string"
       },
-      "SgxAttestationMeasurement": {
-        "format": "hex",
-        "pattern": "^[a-f0-9]64$",
-        "type": "string"
-      },
-      "SgxAttestationMeasurement_to_CodeStatus": {
-        "items": {
-          "items": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/SgxAttestationMeasurement"
-              },
-              {
-                "$ref": "#/components/schemas/CodeStatus"
-              }
-            ]
-          },
-          "maxItems": 2,
-          "minItems": 2,
-          "type": "array"
-        },
-        "type": "array"
-      },
-      "Sha256Digest": {
-        "format": "hex",
-        "pattern": "^[a-f0-9]{32}$",
-        "type": "string"
-      },
-      "Sha256Digest_to_string": {
-        "items": {
-          "items": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Sha256Digest"
-              },
-              {
-                "$ref": "#/components/schemas/string"
-              }
-            ]
-          },
-          "maxItems": 2,
-          "minItems": 2,
-          "type": "array"
-        },
-        "type": "array"
-      },
-      "SignedReq": {
+      "SnpJoinPolicy": {
         "properties": {
-          "key_id": {
-            "$ref": "#/components/schemas/string"
+          "hostData": {
+            "$ref": "#/components/schemas/string_to_string"
           },
-          "md": {
-            "$ref": "#/components/schemas/MDType"
+          "measurements": {
+            "$ref": "#/components/schemas/string_array"
           },
-          "req": {
-            "$ref": "#/components/schemas/base64string"
+          "tcbVersions": {
+            "$ref": "#/components/schemas/string_to_TcbVersionPolicy"
           },
-          "request_body": {
-            "$ref": "#/components/schemas/base64string"
-          },
-          "sig": {
-            "$ref": "#/components/schemas/base64string"
+          "uvmEndorsements": {
+            "$ref": "#/components/schemas/string_to_string_to_UVMEndorsementsData"
           }
         },
         "required": [
-          "sig",
-          "req",
-          "request_body",
-          "md",
-          "key_id"
+          "measurements",
+          "hostData",
+          "uvmEndorsements",
+          "tcbVersions"
         ],
         "type": "object"
-      },
-      "SnpAttestationMeasurement": {
-        "format": "hex",
-        "pattern": "^[a-f0-9]96$",
-        "type": "string"
-      },
-      "SnpAttestationMeasurement_to_CodeStatus": {
-        "items": {
-          "items": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/SnpAttestationMeasurement"
-              },
-              {
-                "$ref": "#/components/schemas/CodeStatus"
-              }
-            ]
-          },
-          "maxItems": 2,
-          "minItems": 2,
-          "type": "array"
-        },
-        "type": "array"
       },
       "StateDigest": {
         "properties": {
-          "state_digest": {
+          "memberId": {
+            "$ref": "#/components/schemas/MemberId"
+          },
+          "stateDigest": {
             "$ref": "#/components/schemas/string"
           }
         },
         "required": [
-          "state_digest"
+          "memberId",
+          "stateDigest"
         ],
         "type": "object"
       },
-      "SubmitRecoveryShare__In": {
+      "TcbVersionPolicy": {
         "properties": {
-          "share": {
+          "boot_loader": {
+            "$ref": "#/components/schemas/uint32"
+          },
+          "fmc": {
+            "$ref": "#/components/schemas/uint32"
+          },
+          "hexstring": {
             "$ref": "#/components/schemas/string"
+          },
+          "microcode": {
+            "$ref": "#/components/schemas/uint32"
+          },
+          "snp": {
+            "$ref": "#/components/schemas/uint32"
+          },
+          "tee": {
+            "$ref": "#/components/schemas/uint32"
           }
         },
-        "required": [
-          "share"
-        ],
         "type": "object"
       },
-      "SubmitRecoveryShare__Out": {
+      "Transaction": {
         "properties": {
-          "message": {
-            "$ref": "#/components/schemas/string"
+          "status": {
+            "$ref": "#/components/schemas/TxStatus"
+          },
+          "transactionId": {
+            "$ref": "#/components/schemas/TransactionId"
           }
         },
         "required": [
-          "message"
+          "status",
+          "transactionId"
         ],
         "type": "object"
       },
@@ -1164,32 +651,61 @@
         ],
         "type": "object"
       },
-      "UserDetails": {
+      "User": {
         "properties": {
-          "user_data": {
+          "certificate": {
+            "$ref": "#/components/schemas/string"
+          },
+          "userData": {
             "$ref": "#/components/schemas/json"
+          },
+          "userId": {
+            "$ref": "#/components/schemas/UserId"
           }
         },
         "required": [
-          "user_data"
+          "userId",
+          "certificate",
+          "userData"
         ],
         "type": "object"
       },
-      "UserId_to_Pem": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/Pem"
-        },
-        "type": "object"
-      },
-      "UserId_to_UserDetails": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/UserDetails"
-        },
-        "type": "object"
-      },
-      "base64string": {
-        "format": "base64",
+      "UserId": {
+        "format": "hex",
+        "pattern": "^[a-f0-9]{64}$",
         "type": "string"
+      },
+      "User_array": {
+        "items": {
+          "$ref": "#/components/schemas/User"
+        },
+        "type": "array"
+      },
+      "Users": {
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/User_array"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "type": "object"
+      },
+      "VirtualJoinPolicy": {
+        "properties": {
+          "hostData": {
+            "$ref": "#/components/schemas/string_array"
+          },
+          "measurements": {
+            "$ref": "#/components/schemas/string_array"
+          }
+        },
+        "required": [
+          "measurements",
+          "hostData"
+        ],
+        "type": "object"
       },
       "boolean": {
         "type": "boolean"
@@ -1204,39 +720,33 @@
         },
         "type": "array"
       },
-      "string_to_JwtIssuerMetadata": {
+      "string_to_Jwk_array": {
         "additionalProperties": {
-          "$ref": "#/components/schemas/JwtIssuerMetadata"
+          "$ref": "#/components/schemas/Jwk_array"
         },
         "type": "object"
       },
-      "string_to_KeyIdInfo": {
+      "string_to_JwtIssuer": {
         "additionalProperties": {
-          "$ref": "#/components/schemas/KeyIdInfo"
+          "$ref": "#/components/schemas/JwtIssuer"
         },
         "type": "object"
       },
-      "string_to_Pem": {
+      "string_to_NetworkInterface": {
         "additionalProperties": {
-          "$ref": "#/components/schemas/Pem"
+          "$ref": "#/components/schemas/NetworkInterface"
         },
         "type": "object"
       },
-      "string_to_ProposalInfo": {
+      "string_to_TcbVersionPolicy": {
         "additionalProperties": {
-          "$ref": "#/components/schemas/ProposalInfo"
+          "$ref": "#/components/schemas/TcbVersionPolicy"
         },
         "type": "object"
       },
       "string_to_UVMEndorsementsData": {
         "additionalProperties": {
           "$ref": "#/components/schemas/UVMEndorsementsData"
-        },
-        "type": "object"
-      },
-      "string_to_base64string": {
-        "additionalProperties": {
-          "$ref": "#/components/schemas/base64string"
         },
         "type": "object"
       },
@@ -1252,17 +762,15 @@
         },
         "type": "object"
       },
+      "uint32": {
+        "maximum": 4294967295,
+        "minimum": 0,
+        "type": "integer"
+      },
       "uint64": {
         "maximum": 18446744073709551615,
         "minimum": 0,
         "type": "integer"
-      }
-    },
-    "securitySchemes": {
-      "member_cose_sign1": {
-        "description": "Request payload must be a COSE Sign1 document, with expected protected headers. Signer must be a member identity registered with this service.",
-        "scheme": "cose_sign1",
-        "type": "http"
       }
     },
     "x-ccf-forwarding": {
@@ -1281,73 +789,15 @@
     }
   },
   "info": {
-    "description": "This API is used to submit and query proposals which affect CCF's public governance tables.",
-    "title": "CCF Governance API",
-    "version": "4.1.3"
+    "description": "The governance API implemented by this CCF build. This document describes the moving 'latest' API and does not guarantee that older document versions remain available.",
+    "title": "CCF Governance",
+    "version": "5.0.1"
   },
   "openapi": "3.0.0",
   "paths": {
-    "/gov/ack": {
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/StateDigest"
-              }
-            }
-          },
-          "description": "Auto-generated request body schema"
-        },
-        "responses": {
-          "204": {
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "security": [
-          {
-            "member_cose_sign1": []
-          }
-        ],
-        "summary": "Provide a member endorsement of a service state digest",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/always"
-        }
-      }
-    },
-    "/gov/ack/update_state_digest": {
-      "post": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StateDigest"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "security": [
-          {
-            "member_cose_sign1": []
-          }
-        ],
-        "summary": "Update and fetch a service state digest, for the purpose of member endorsement",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/always"
-        }
-      }
-    },
     "/gov/api": {
       "get": {
+        "operationId": "GetGovApi",
         "responses": {
           "200": {
             "content": {
@@ -1367,59 +817,24 @@
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
-      }
-    },
-    "/gov/api/metrics": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EndpointMetrics"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
           }
-        },
-        "summary": "Usage metrics for endpoints",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
-      }
-    },
-    "/gov/code": {
-      "get": {
-        "deprecated": true,
-        "description": "Permitted SGX code identities",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GetCode__Out"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "summary": "This endpoint is deprecated. It is replaced by /gov/kv/nodes/code_ids endpoint",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
+      ]
     },
     "/gov/commit": {
       "get": {
         "description": "Latest transaction ID that has been committed on the service",
+        "operationId": "GetGovCommit",
         "parameters": [
           {
             "in": "query",
@@ -1457,50 +872,29 @@
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
-      }
-    },
-    "/gov/encrypted_recovery_share/{member_id}": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/GetRecoveryShare__Out"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "summary": "A member's recovery share",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/always"
-        }
       },
       "parameters": [
         {
-          "in": "path",
-          "name": "member_id",
-          "required": true,
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
           "schema": {
+            "default": "latest",
             "type": "string"
           }
         }
       ]
     },
-    "/gov/jwt_keys/all": {
+    "/gov/members/proposals": {
       "get": {
-        "deprecated": true,
+        "operationId": "GetGovMembersProposals",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/string_to_KeyIdInfo"
+                  "$ref": "#/components/schemas/ProposalList"
                 }
               }
             },
@@ -1510,834 +904,27 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "summary": "This endpoint is deprecated. It is replaced by /gov/kv/jwt/public_signing_keys, /gov/kv/jwt/public_signing_key_issue, and /gov/kv/jwt/issuers endpoints.",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/always"
-        }
-      }
-    },
-    "/gov/kv/constitution": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "$ref": "#/components/schemas/string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/cose_history": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemberId_to_base64string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/cose_recent_proposals": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/endpoints": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EndpointKey_to_EndpointProperties"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/history": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemberId_to_SignedReq"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/interpreter/flush": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/boolean"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/js_runtime_options": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/JSRuntimeOptions"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/jwt/issuers": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_JwtIssuerMetadata"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/jwt/public_signing_key_issuer": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/jwt/public_signing_keys": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_base64string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/members/acks": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemberId_to_MemberAck"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/members/certs": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemberId_to_Pem"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/members/encryption_public_keys": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemberId_to_Pem"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/members/info": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemberId_to_MemberDetails"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/modules": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/modules_quickjs_bytecode": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_base64string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/modules_quickjs_version": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "$ref": "#/components/schemas/string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/nodes/code_ids": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SgxAttestationMeasurement_to_CodeStatus"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/nodes/endorsed_certificates": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NodeId_to_Pem"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/nodes/info": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NodeId_to_NodeInfo"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/nodes/snp/host_data": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Sha256Digest_to_string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/nodes/snp/measurements": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SnpAttestationMeasurement_to_CodeStatus"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/nodes/snp/uvm_endorsements": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_string_to_UVMEndorsementsData"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/proposals": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_base64string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/proposals_info": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_ProposalInfo"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/service/acme_certificates": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_Pem"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/service/config": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ServiceConfiguration"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/service/info": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ServiceInfo"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/service/previous_service_identity": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Pem"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/tls/ca_cert_bundles": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_string"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/users/certs": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UserId_to_Pem"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/kv/users/info": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/UserId_to_UserDetails"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/members": {
-      "get": {
-        "deprecated": true,
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/MemberId_to_FullMemberDetails"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "summary": "This endpoint is deprecated. It is replaced by /gov/kv/members/certs, /gov/kv/members/encryption_public_keys, /gov/kv/members/info endpoints.",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      }
-    },
-    "/gov/proposals": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/string_to_ProposalInfo"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "summary": "Proposed changes to the service pending resolution",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/sometimes"
-        }
-      },
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Proposal"
-              }
-            }
-          },
-          "description": "Auto-generated request body schema"
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProposalInfoSummary"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "security": [
-          {
-            "member_cose_sign1": []
-          }
-        ],
-        "summary": "Submit a proposed change to the service",
-        "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/always"
-        }
-      }
-    },
-    "/gov/proposals/{proposal_id}": {
-      "get": {
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ProposalInfo"
-                }
-              }
-            },
-            "description": "Default response description"
-          },
-          "default": {
-            "$ref": "#/components/responses/default"
-          }
-        },
-        "summary": "Information about a proposed change to the service",
+        "summary": "List governance proposals",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
       },
       "parameters": [
         {
-          "in": "path",
-          "name": "proposal_id",
-          "required": true,
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
           "schema": {
+            "default": "latest",
             "type": "string"
           }
         }
       ]
     },
-    "/gov/proposals/{proposal_id}/actions": {
+    "/gov/members/proposals/{proposalId}": {
       "get": {
+        "operationId": "GetGovMembersProposalsProposalId",
         "responses": {
           "200": {
             "content": {
@@ -2353,7 +940,7 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "summary": "Actions contained in a proposed change to the service",
+        "summary": "Get a governance proposal",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
@@ -2361,42 +948,34 @@
       "parameters": [
         {
           "in": "path",
-          "name": "proposal_id",
+          "name": "proposalId",
           "required": true,
           "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
             "type": "string"
           }
         }
       ]
     },
-    "/gov/proposals/{proposal_id}/ballots": {
-      "parameters": [
-        {
-          "in": "path",
-          "name": "proposal_id",
-          "required": true,
-          "schema": {
-            "type": "string"
-          }
-        }
-      ],
-      "post": {
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Ballot"
-              }
-            }
-          },
-          "description": "Auto-generated request body schema"
-        },
+    "/gov/members/proposals/{proposalId}/actions": {
+      "get": {
+        "operationId": "GetGovMembersProposalsProposalIdActions",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProposalInfoSummary"
+                  "$ref": "#/components/schemas/json"
                 }
               }
             },
@@ -2406,25 +985,243 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "security": [
-          {
-            "member_cose_sign1": []
+        "summary": "Get a proposal's actions",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "proposalId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
           }
-        ],
-        "summary": "Ballots submitted against a proposed change to the service",
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/members/proposals/{proposalId}/ballots/{memberId}": {
+      "get": {
+        "operationId": "GetGovMembersProposalsProposalIdBallotsMemberId",
+        "responses": {
+          "200": {
+            "content": {
+              "text/javascript": {
+                "schema": {
+                  "$ref": "#/components/schemas/Javascript"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get a member's ballot",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "proposalId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "memberId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/members/proposals/{proposalId}/ballots/{memberId}:submit": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "proposalId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "in": "path",
+          "name": "memberId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "PostGovMembersProposalsProposalIdBallotsMemberIdSubmit",
+        "requestBody": {
+          "content": {
+            "application/cose": {
+              "schema": {
+                "$ref": "#/components/schemas/Cose"
+              }
+            }
+          },
+          "description": "Auto-generated request body schema",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Proposal"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Submit a ballot",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/always"
         }
       }
     },
-    "/gov/proposals/{proposal_id}/ballots/{member_id}": {
-      "get": {
+    "/gov/members/proposals/{proposalId}:withdraw": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "proposalId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "PostGovMembersProposalsProposalIdWithdraw",
+        "requestBody": {
+          "content": {
+            "application/cose": {
+              "schema": {
+                "$ref": "#/components/schemas/Cose"
+              }
+            }
+          },
+          "description": "Auto-generated request body schema",
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Ballot"
+                  "$ref": "#/components/schemas/Proposal"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "204": {
+            "description": "The proposal no longer exists."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Withdraw a governance proposal",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/always"
+        }
+      }
+    },
+    "/gov/members/proposals:create": {
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "PostGovMembersProposalsCreate",
+        "requestBody": {
+          "content": {
+            "application/cose": {
+              "schema": {
+                "$ref": "#/components/schemas/Cose"
+              }
+            }
+          },
+          "description": "Auto-generated request body schema",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Proposal"
                 }
               }
             },
@@ -2434,7 +1231,31 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "summary": "Ballot for a given member about a proposed change to the service",
+        "summary": "Create a governance proposal",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/always"
+        }
+      }
+    },
+    "/gov/members/state-digests/{memberId}": {
+      "get": {
+        "operationId": "GetGovMembersStateDigestsMemberId",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StateDigest"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get a member's state digest",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
@@ -2442,40 +1263,115 @@
       "parameters": [
         {
           "in": "path",
-          "name": "proposal_id",
+          "name": "memberId",
           "required": true,
           "schema": {
+            "pattern": "^[a-f0-9]{64}$",
             "type": "string"
           }
         },
         {
-          "in": "path",
-          "name": "member_id",
-          "required": true,
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
           "schema": {
+            "default": "latest",
             "type": "string"
           }
         }
       ]
     },
-    "/gov/proposals/{proposal_id}/withdraw": {
+    "/gov/members/state-digests/{memberId}:ack": {
       "parameters": [
         {
           "in": "path",
-          "name": "proposal_id",
+          "name": "memberId",
           "required": true,
           "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
             "type": "string"
           }
         }
       ],
       "post": {
+        "operationId": "PostGovMembersStateDigestsMemberIdAck",
+        "requestBody": {
+          "content": {
+            "application/cose": {
+              "schema": {
+                "$ref": "#/components/schemas/Cose"
+              }
+            }
+          },
+          "description": "Auto-generated request body schema",
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Acknowledge a member's state digest",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/always"
+        }
+      }
+    },
+    "/gov/members/state-digests/{memberId}:update": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "memberId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ],
+      "post": {
+        "operationId": "PostGovMembersStateDigestsMemberIdUpdate",
+        "requestBody": {
+          "content": {
+            "application/cose": {
+              "schema": {
+                "$ref": "#/components/schemas/Cose"
+              }
+            }
+          },
+          "description": "Auto-generated request body schema",
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ProposalInfo"
+                  "$ref": "#/components/schemas/StateDigest"
                 }
               }
             },
@@ -2485,12 +1381,7 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "security": [
-          {
-            "member_cose_sign1": []
-          }
-        ],
-        "summary": "Withdraw a proposed change to the service",
+        "summary": "Update a member's state digest",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/always"
         }
@@ -2499,6 +1390,7 @@
     "/gov/receipt": {
       "get": {
         "description": "A signed statement from the service over a transaction entry in the ledger",
+        "operationId": "GetGovReceipt",
         "parameters": [
           {
             "in": "query",
@@ -2520,6 +1412,16 @@
             },
             "description": "Default response description"
           },
+          "202": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/string"
+                }
+              }
+            },
+            "description": "The transaction is not yet available. The response describes why and the Retry-After header indicates when to retry."
+          },
           "default": {
             "$ref": "#/components/responses/default"
           }
@@ -2528,17 +1430,86 @@
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
-      }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
     },
-    "/gov/recovery_share": {
+    "/gov/receipt/cose": {
       "get": {
-        "deprecated": true,
+        "description": "A COSE Sign1 envelope containing a signed statement from the service over a transaction entry in the ledger, with a Merkle proof in the unprotected header. See https://datatracker.ietf.org/doc/draft-ietf-scitt-receipts-ccf-profile/ for a complete description.",
+        "operationId": "GetGovReceiptCose",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "transaction_id",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/TransactionId"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/cose": {
+                "schema": {
+                  "$ref": "#/components/schemas/Cose"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "202": {
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/string"
+                }
+              }
+            },
+            "description": "The transaction is not yet available. The response describes why and the Retry-After header indicates when to retry."
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "COSE receipt for a transaction",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/recovery/encrypted-shares/{memberId}": {
+      "get": {
+        "operationId": "GetGovRecoveryEncryptedSharesMemberId",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GetRecoveryShare__Out"
+                  "$ref": "#/components/schemas/EncryptedRecoveryShare"
                 }
               }
             },
@@ -2548,33 +1519,74 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "security": [
-          {
-            "member_cose_sign1": []
-          }
-        ],
-        "summary": "A member's recovery share",
+        "summary": "Get an encrypted recovery share",
         "x-ccf-forwarding": {
-          "$ref": "#/components/x-ccf-forwarding/always"
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
       },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "memberId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/recovery/members/{memberId}:recover": {
+      "parameters": [
+        {
+          "in": "path",
+          "name": "memberId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ],
       "post": {
+        "operationId": "PostGovRecoveryMembersMemberIdRecover",
         "requestBody": {
           "content": {
-            "application/json": {
+            "application/cose": {
               "schema": {
-                "$ref": "#/components/schemas/SubmitRecoveryShare__In"
+                "$ref": "#/components/schemas/Cose"
               }
             }
           },
-          "description": "Auto-generated request body schema"
+          "description": "Auto-generated request body schema",
+          "required": true
         },
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SubmitRecoveryShare__Out"
+                  "$ref": "#/components/schemas/RecoveryResponse"
                 }
               }
             },
@@ -2584,20 +1596,610 @@
             "$ref": "#/components/responses/default"
           }
         },
-        "security": [
-          {
-            "member_cose_sign1": []
-          }
-        ],
-        "summary": "Provide a recovery share for the purpose of completing a service recovery",
+        "summary": "Submit a recovery share",
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/always"
         }
       }
+    },
+    "/gov/service/constitution": {
+      "get": {
+        "operationId": "GetGovServiceConstitution",
+        "responses": {
+          "200": {
+            "content": {
+              "text/javascript": {
+                "schema": {
+                  "$ref": "#/components/schemas/Javascript"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get the service constitution",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/info": {
+      "get": {
+        "operationId": "GetGovServiceInfo",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceInfo"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get service information",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/javascript-app": {
+      "get": {
+        "operationId": "GetGovServiceJavascriptApp",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "case",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/JavascriptAppCase"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JavascriptApp"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get the installed JavaScript application",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/javascript-modules": {
+      "get": {
+        "operationId": "GetGovServiceJavascriptModules",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JavascriptModules"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "List JavaScript modules",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/javascript-modules/{moduleName}": {
+      "get": {
+        "operationId": "GetGovServiceJavascriptModulesModuleName",
+        "responses": {
+          "200": {
+            "content": {
+              "text/javascript": {
+                "schema": {
+                  "$ref": "#/components/schemas/Javascript"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get a JavaScript module",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "moduleName",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/join-policy": {
+      "get": {
+        "operationId": "GetGovServiceJoinPolicy",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JoinPolicy"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get the service join policy",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/jwk": {
+      "get": {
+        "operationId": "GetGovServiceJwk",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JwkInfo"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get accepted JWT issuers and keys",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/members": {
+      "get": {
+        "operationId": "GetGovServiceMembers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Members"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "List consortium members",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/members/{memberId}": {
+      "get": {
+        "operationId": "GetGovServiceMembersMemberId",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Member"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get a consortium member",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "memberId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/nodes": {
+      "get": {
+        "operationId": "GetGovServiceNodes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Nodes"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "List service nodes",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/nodes/{nodeId}": {
+      "get": {
+        "operationId": "GetGovServiceNodesNodeId",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Node"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get a service node",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "nodeId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/transactions/commit": {
+      "get": {
+        "operationId": "GetGovServiceTransactionsCommit",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get the latest committed transaction",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/transactions/{transactionId}": {
+      "get": {
+        "operationId": "GetGovServiceTransactionsTransactionId",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Transaction"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get transaction status",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "transactionId",
+          "required": true,
+          "schema": {
+            "pattern": "^[0-9]+\\.[0-9]+$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/users": {
+      "get": {
+        "operationId": "GetGovServiceUsers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Users"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "List application users",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
+    },
+    "/gov/service/users/{userId}": {
+      "get": {
+        "operationId": "GetGovServiceUsersUserId",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "Default response description"
+          },
+          "default": {
+            "$ref": "#/components/responses/default"
+          }
+        },
+        "summary": "Get an application user",
+        "x-ccf-forwarding": {
+          "$ref": "#/components/x-ccf-forwarding/sometimes"
+        }
+      },
+      "parameters": [
+        {
+          "in": "path",
+          "name": "userId",
+          "required": true,
+          "schema": {
+            "pattern": "^[a-f0-9]{64}$",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
     },
     "/gov/tx": {
       "get": {
         "description": "Possible statuses returned are Unknown, Pending, Committed or Invalid.",
+        "operationId": "GetGovTx",
         "parameters": [
           {
             "in": "query",
@@ -2627,7 +2229,19 @@
         "x-ccf-forwarding": {
           "$ref": "#/components/x-ccf-forwarding/sometimes"
         }
-      }
+      },
+      "parameters": [
+        {
+          "description": "Optional API selector. 'latest' selects the API implemented by this CCF build and does not identify a frozen contract. Dated versions select frozen compatibility contracts while they remain supported.",
+          "in": "query",
+          "name": "api-version",
+          "required": false,
+          "schema": {
+            "default": "latest",
+            "type": "string"
+          }
+        }
+      ]
     }
   },
   "servers": []

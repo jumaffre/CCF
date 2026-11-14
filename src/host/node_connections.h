@@ -2,40 +2,77 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "consensus/aft/raft_types.h"
+#include "consensus/aft/cft_types.h"
+#include "ds/serialized.h"
 #include "ledger.h"
+#include "ledger_subsystem.h"
+#include "node/node_transport.h"
 #include "node/node_types.h"
 #include "tcp.h"
 #include "timer.h"
 
+#include <chrono>
+#include <deque>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <variant>
 
 namespace asynchost
 {
   static const auto UnassociatedNode = ccf::NodeId("Unknown");
 
-  class NodeConnections
+  // See NodeConnectionsImpl::simultaneous_connect_window.
+  static constexpr auto default_simultaneous_connect_window =
+    std::chrono::seconds(2);
+
+  // Host implementation of the node-to-node transport.
+  //
+  // Outbound operations may be called from any thread and are handled in two
+  // steps. An AppendEntries message must not read the ledger until the appends
+  // the node submitted before it have been applied, so each operation is first
+  // submitted to the same lane as ledger mutations, where any ledger entries
+  // are read and the frame is assembled. The result is queued for the libuv
+  // thread, which owns the sockets and drains the queue from flush_outbound().
+  // Address and close updates take the same path so that their order relative
+  // to sends is preserved. All other state is confined to the libuv thread.
+  //
+  // Inbound frames are copied into owned storage and passed to the inbound
+  // handler on the libuv thread.
+  template <class ConnType>
+  class NodeConnectionsImpl : public ccf::AbstractNodeTransport
   {
   private:
-    class NodeConnectionBehaviour : public SocketBehaviour<TCP>
+    // Identifies the current connection with a peer, whether we opened it, and
+    // when it was created. Knowing this is what allows two nodes which dialled
+    // each other at the same moment to agree on which connection to keep.
+    struct ConnectionInfo
+    {
+      ConnType socket = nullptr;
+      bool outgoing = false;
+      std::chrono::steady_clock::time_point created =
+        std::chrono::steady_clock::now();
+    };
+
+    class NodeConnectionBehaviour : public SocketBehaviour<ConnType>
     {
     private:
     public:
-      NodeConnections& parent;
+      NodeConnectionsImpl& parent;
       std::optional<ccf::NodeId> node;
       std::optional<size_t> msg_size = std::nullopt;
       std::vector<uint8_t> pending;
 
       NodeConnectionBehaviour(
         const char* name,
-        NodeConnections& parent,
+        NodeConnectionsImpl& parent,
         std::optional<ccf::NodeId> node = std::nullopt) :
-        SocketBehaviour<TCP>(name, "TCP"),
+        SocketBehaviour<ConnType>(name, "TCP"),
         parent(parent),
-        node(node)
+        node(std::move(node))
       {}
 
-      void on_read(size_t len, uint8_t*& incoming, sockaddr)
+      bool on_read(size_t len, uint8_t*& incoming, sockaddr /*unused*/) override
       {
         LOG_DEBUG_FMT(
           "from node {} received {} bytes",
@@ -58,6 +95,19 @@ namespace asynchost
             }
 
             msg_size = serialized::read<uint32_t>(data, size);
+
+            // Reject before buffering the body, since the size is
+            // peer-controlled
+            if (msg_size.value() > parent.max_inbound_frame_size)
+            {
+              LOG_FAIL_FMT(
+                "Received node-to-node frame of {} bytes from {}, exceeding "
+                "the maximum of {}. Closing connection.",
+                msg_size.value(),
+                node.value_or(UnassociatedNode),
+                parent.max_inbound_frame_size);
+              return false;
+            }
           }
 
           if (size < msg_size.value())
@@ -71,15 +121,57 @@ namespace asynchost
           }
 
           const auto size_pre_headers = size;
-          auto msg_type = serialized::read<ccf::NodeMsgType>(data, size);
-          ccf::NodeId from = serialized::read<ccf::NodeId::Value>(data, size);
+
+          ccf::NodeMsgType msg_type{};
+          try
+          {
+            msg_type = serialized::read<ccf::NodeMsgType>(data, size);
+          }
+          catch (const std::exception& e)
+          {
+            LOG_DEBUG_FMT(
+              "Received invalid node-to-node traffic. Unable to read message "
+              "type ({}). Closing connection.",
+              e.what());
+            return false;
+          }
+
+          ccf::NodeId from;
+          try
+          {
+            from = serialized::read<ccf::NodeId::Value>(data, size);
+          }
+          catch (const std::exception& e)
+          {
+            LOG_DEBUG_FMT(
+              "Received invalid node-to-node traffic. Unable to read sender "
+              "node ID ({}). Closing connection.",
+              e.what());
+            return false;
+          }
+
           const auto size_post_headers = size;
-          const size_t payload_size =
-            msg_size.value() - (size_pre_headers - size_post_headers);
+          const auto header_size = size_pre_headers - size_post_headers;
+          if (header_size > msg_size.value())
+          {
+            LOG_DEBUG_FMT(
+              "Received invalid node-to-node traffic. Total msg size {} "
+              "doesn't even contain headers (of size {})",
+              msg_size.value(),
+              header_size);
+            return false;
+          }
+          const size_t payload_size = msg_size.value() - header_size;
 
           if (!node.has_value())
           {
-            associate_incoming(from);
+            if (!associate_incoming(from))
+            {
+              // We are keeping an existing connection with this peer in
+              // preference to this one. Close it, rather than leaving two
+              // connections up and having to guess which one to write to.
+              return false;
+            }
             node = from;
           }
 
@@ -89,12 +181,8 @@ namespace asynchost
             msg_size.value(),
             msg_type);
 
-          RINGBUFFER_WRITE_MESSAGE(
-            ccf::node_inbound,
-            parent.to_enclave,
-            msg_type,
-            from.value(),
-            serializer::ByteRange{data, payload_size});
+          parent.deliver_inbound(
+            msg_type, from, std::vector<uint8_t>(data, data + payload_size));
 
           data += payload_size;
           size -= payload_size;
@@ -107,25 +195,33 @@ namespace asynchost
         {
           pending.erase(pending.begin(), pending.begin() + used);
         }
+
+        return true;
       }
 
-      virtual void associate_incoming(const ccf::NodeId&) {}
+      /// Returns false if this connection should be dropped rather than used.
+      virtual bool associate_incoming(const ccf::NodeId& /*unused*/)
+      {
+        return true;
+      }
     };
 
     class NodeIncomingBehaviour : public NodeConnectionBehaviour
     {
     public:
+      using NodeConnectionBehaviour::parent;
+
       size_t id;
       std::optional<ccf::NodeId> node_id;
 
-      NodeIncomingBehaviour(NodeConnections& parent, size_t id_) :
+      NodeIncomingBehaviour(NodeConnectionsImpl& parent, size_t id_) :
         NodeConnectionBehaviour("Node Incoming", parent),
         id(id_)
       {}
 
       void on_disconnect() override
       {
-        LOG_DEBUG_FMT("Disconnecting incoming connection {}", id);
+        LOG_INFO_FMT("Disconnecting incoming connection {}", id);
         parent.unassociated_incoming.erase(id);
 
         if (node_id.has_value())
@@ -134,10 +230,8 @@ namespace asynchost
         }
       }
 
-      void associate_incoming(const ccf::NodeId& n) override
+      bool associate_incoming(const ccf::NodeId& n) override
       {
-        node_id = n;
-
         const auto unassociated = parent.unassociated_incoming.find(id);
         CCF_ASSERT_FMT(
           unassociated != parent.unassociated_incoming.end(),
@@ -146,268 +240,494 @@ namespace asynchost
           n,
           id);
 
-        // Always prefer this (probably) newer connection. Pathological case is
-        // where both nodes open outgoings to each other at the same time, both
-        // see the corresponding incoming connections and _drop_ their outgoing
-        // connections. Both have a useless incoming connection they think they
-        // can use. Assumption is that they progress at different rates, and one
-        // of them eventually spots the dead connection and opens a new one
-        // which succeeds.
-        parent.connections[n] = unassociated->second;
+        // If we already have a *recently created* outgoing connection to this
+        // peer, then the two of us dialled each other at the same time and
+        // there are now two connections where one is needed. Both nodes must
+        // independently pick the same one to keep. If they do not, each
+        // destroys the connection the other is relying on, and both are left
+        // holding a socket whose far end is gone. Ordering by node ID gives
+        // both sides the same answer using only information they already have.
+        //
+        // The age check matters. An incoming connection from a peer we already
+        // have a settled connection to means that peer believes the link is
+        // broken, and it is in a better position to know - it may have seen an
+        // error we did not. Defending our own connection indefinitely would
+        // deny the peer the only means it has of repairing a link that is dead
+        // in a way we cannot detect, which is precisely the failure this change
+        // exists to prevent. So we only defend a connection young enough to
+        // still be part of a genuine race; anything older yields, as before.
+        const auto existing = parent.connections.find(n);
+        if (
+          existing != parent.connections.end() && existing->second.outgoing &&
+          (std::chrono::steady_clock::now() - existing->second.created) <
+            parent.simultaneous_connect_window &&
+          !parent.prefer_incoming_from(n))
+        {
+          LOG_INFO_FMT(
+            "Refusing incoming node connection ({}) from {}: keeping our "
+            "existing outgoing connection to resolve a simultaneous connect",
+            id,
+            n);
+          return false;
+        }
+
+        node_id = n;
+        parent.connections[n] = {unassociated->second, false};
         parent.unassociated_incoming.erase(unassociated);
 
-        LOG_DEBUG_FMT(
-          "Node incoming connection ({}) associated with {}", id, n);
+        LOG_INFO_FMT("Node incoming connection ({}) associated with {}", id, n);
+        return true;
       }
     };
 
     class NodeOutgoingBehaviour : public NodeConnectionBehaviour
     {
     public:
-      NodeOutgoingBehaviour(NodeConnections& parent, const ccf::NodeId& node) :
+      using NodeConnectionBehaviour::node;
+      using NodeConnectionBehaviour::parent;
+
+      NodeOutgoingBehaviour(
+        NodeConnectionsImpl& parent, const ccf::NodeId& node) :
         NodeConnectionBehaviour("Node Outgoing", parent, node)
       {}
 
       void on_bind_failed() override
       {
-        LOG_DEBUG_FMT(
+        LOG_INFO_FMT(
           "Disconnecting outgoing connection with {}: bind failed",
-          node.value());
-        parent.remove_connection(node.value());
+          *node); // NOLINT(bugprone-unchecked-optional-access)
+        parent.remove_connection(
+          *node); // NOLINT(bugprone-unchecked-optional-access)
       }
 
       void on_resolve_failed() override
       {
-        LOG_DEBUG_FMT(
+        LOG_INFO_FMT(
           "Disconnecting outgoing connection with {}: resolve failed",
-          node.value());
-        parent.remove_connection(node.value());
+          *node); // NOLINT(bugprone-unchecked-optional-access)
+        parent.remove_connection(
+          *node); // NOLINT(bugprone-unchecked-optional-access)
       }
 
       void on_connect_failed() override
       {
-        LOG_DEBUG_FMT(
+        LOG_INFO_FMT(
           "Disconnecting outgoing connection with {}: connect failed",
-          node.value());
-        parent.remove_connection(node.value());
+          *node); // NOLINT(bugprone-unchecked-optional-access)
+        parent.remove_connection(
+          *node); // NOLINT(bugprone-unchecked-optional-access)
       }
 
       void on_disconnect() override
       {
-        LOG_DEBUG_FMT(
+        LOG_INFO_FMT(
           "Disconnecting outgoing connection with {}: disconnected",
-          node.value());
-        parent.remove_connection(node.value());
+          *node); // NOLINT(bugprone-unchecked-optional-access)
+        parent.remove_connection(
+          *node); // NOLINT(bugprone-unchecked-optional-access)
       }
     };
 
-    class NodeServerBehaviour : public SocketBehaviour<TCP>
+    class NodeServerBehaviour : public SocketBehaviour<ConnType>
     {
     public:
-      NodeConnections& parent;
+      NodeConnectionsImpl& parent;
 
-      NodeServerBehaviour(NodeConnections& parent) :
-        SocketBehaviour<TCP>("Node Server", "TCP"),
+      NodeServerBehaviour(NodeConnectionsImpl& parent) :
+        SocketBehaviour<ConnType>("Node Server", "TCP"),
         parent(parent)
       {}
 
-      void on_accept(TCP& peer) override
+      void on_accept(ConnType& peer) override
       {
         auto id = parent.get_next_id();
         peer->set_behaviour(
           std::make_unique<NodeIncomingBehaviour>(parent, id));
         parent.unassociated_incoming.emplace(id, peer);
-        LOG_DEBUG_FMT("Accepted new incoming node connection ({})", id);
+        LOG_INFO_FMT("Accepted new incoming node connection ({})", id);
       }
     };
 
     Ledger& ledger;
-    TCP listener;
+    ConnType listener;
 
     std::unordered_map<ccf::NodeId, std::pair<std::string, std::string>>
       node_addresses;
 
-    std::unordered_map<ccf::NodeId, TCP> connections;
+    std::unordered_map<ccf::NodeId, ConnectionInfo> connections;
 
-    std::unordered_map<size_t, TCP> unassociated_incoming;
+    // How recently we must have opened an outgoing connection to treat an
+    // incoming connection from the same peer as a simultaneous connect rather
+    // than as that peer trying to repair a link it believes is broken. A real
+    // race is resolved within a round trip; this only needs to be long enough
+    // to cover one, and short enough that a peer's repair is not denied for
+    // any meaningful time.
+    std::chrono::milliseconds simultaneous_connect_window{
+      default_simultaneous_connect_window};
+
+    // This node's own ID, which the host is never told directly. It is carried
+    // in the sender field of every outbound message, and is only needed once
+    // an outgoing connection exists - which implies we have already sent.
+    std::optional<ccf::NodeId> self_node_id = std::nullopt;
+
+    std::unordered_map<size_t, ConnType> unassociated_incoming;
     size_t next_id = 1;
 
-    ringbuffer::WriterPtr to_enclave;
+    // Declared frame sizes above this are rejected and the connection closed.
+    size_t max_inbound_frame_size;
+
+    std::mutex inbound_handler_mutex;
+    std::shared_ptr<ccf::NodeInboundHandler> inbound_handler;
 
     std::optional<std::string> client_interface = std::nullopt;
     std::optional<std::chrono::milliseconds> client_connection_timeout =
       std::nullopt;
 
+    LedgerSubsystem& ledger_subsystem;
+
+    // Work handed from the ledger lane back to the loop thread, in order.
+    struct AssociateAddress
+    {
+      ccf::NodeId node_id;
+      std::string host;
+      std::string port;
+    };
+
+    struct CloseOutbound
+    {
+      ccf::NodeId node_id;
+    };
+
+    struct SendFrame
+    {
+      ccf::NodeId to;
+      ccf::NodeId from;
+      std::vector<uint8_t> frame;
+    };
+
+    using OutboundItem =
+      std::variant<AssociateAddress, CloseOutbound, SendFrame>;
+
+    std::mutex outbound_mutex;
+    std::deque<OutboundItem> outbound_ready;
+
+    // Runs fn after every ledger mutation submitted before it. fn must only
+    // enqueue to outbound_ready; the loop thread applies the result.
+    template <typename F>
+    void ordered(const char* what, F&& fn)
+    {
+      if (!ledger_subsystem.run_in_mutation_order(what, std::forward<F>(fn)))
+      {
+        LOG_DEBUG_FMT("Dropping {} because the host is shutting down", what);
+      }
+    }
+
+    void enqueue_ready(OutboundItem&& item)
+    {
+      std::lock_guard guard(outbound_mutex);
+      outbound_ready.push_back(std::move(item));
+    }
+
+    void deliver_inbound(
+      ccf::NodeMsgType msg_type,
+      const ccf::NodeId& from,
+      std::vector<uint8_t>&& payload)
+    {
+      std::shared_ptr<ccf::NodeInboundHandler> handler;
+      {
+        std::lock_guard guard(inbound_handler_mutex);
+        handler = inbound_handler;
+      }
+
+      if (handler == nullptr)
+      {
+        LOG_DEBUG_FMT(
+          "Ignoring node message from {}: no inbound handler", from);
+        return;
+      }
+
+      handler->recv_node_inbound(msg_type, from, std::move(payload));
+    }
+
   public:
-    NodeConnections(
-      messaging::Dispatcher<ringbuffer::Message>& disp,
+    NodeConnectionsImpl(
       Ledger& ledger,
-      ringbuffer::AbstractWriterFactory& writer_factory,
+      LedgerSubsystem& ledger_subsystem_,
       std::string& host,
       std::string& port,
+      size_t max_inbound_frame_size_,
       const std::optional<std::string>& client_interface = std::nullopt,
       std::optional<std::chrono::milliseconds> client_connection_timeout_ =
         std::nullopt) :
       ledger(ledger),
-      to_enclave(writer_factory.create_writer_to_inside()),
+      max_inbound_frame_size(max_inbound_frame_size_),
       client_interface(client_interface),
-      client_connection_timeout(client_connection_timeout_)
+      client_connection_timeout(client_connection_timeout_),
+      ledger_subsystem(ledger_subsystem_)
     {
       listener->set_behaviour(std::make_unique<NodeServerBehaviour>(*this));
       listener->listen(host, port);
       host = listener->get_host();
       port = listener->get_port();
-
-      register_message_handlers(disp);
     }
 
-    void register_message_handlers(
-      messaging::Dispatcher<ringbuffer::Message>& disp)
+    // Only used by tests, to exercise the behaviour either side of the window
+    // without having to wait for real time to pass.
+    void set_simultaneous_connect_window(std::chrono::milliseconds window)
     {
-      DISPATCHER_SET_MESSAGE_HANDLER(
-        disp,
-        ccf::associate_node_address,
-        [this](const uint8_t* data, size_t size) {
-          auto [node_id, hostname, port] =
-            ringbuffer::read_message<ccf::associate_node_address>(data, size);
+      simultaneous_connect_window = window;
+    }
 
-          node_addresses[node_id] = {hostname, port};
-        });
+    void set_inbound_handler(
+      std::shared_ptr<ccf::NodeInboundHandler> handler) override
+    {
+      std::lock_guard guard(inbound_handler_mutex);
+      inbound_handler = std::move(handler);
+    }
 
-      DISPATCHER_SET_MESSAGE_HANDLER(
-        disp,
-        ccf::close_node_outbound,
-        [this](const uint8_t* data, size_t size) {
-          auto [node_id] =
-            ringbuffer::read_message<ccf::close_node_outbound>(data, size);
+    void associate_node_address(
+      const ccf::NodeId& node_id,
+      const std::string& hostname,
+      const std::string& port) override
+    {
+      ordered("Node address association", [this, node_id, hostname, port]() {
+        enqueue_ready(AssociateAddress{node_id, hostname, port});
+      });
+    }
 
-          remove_connection(node_id);
-        });
+    void close(const ccf::NodeId& node_id) override
+    {
+      ordered("Node connection close", [this, node_id]() {
+        enqueue_ready(CloseOutbound{node_id});
+      });
+    }
 
-      DISPATCHER_SET_MESSAGE_HANDLER(
-        disp, ccf::node_outbound, [this](const uint8_t* data, size_t size) {
-          // Read piece-by-piece rather than all at once
-          ccf::NodeId to = serialized::read<ccf::NodeId::Value>(data, size);
-
-          TCP outbound_connection = nullptr;
+    void send(
+      const ccf::NodeId& to,
+      ccf::NodeMsgType msg_type,
+      const ccf::NodeId& from,
+      std::vector<uint8_t>&& payload) override
+    {
+      ordered(
+        "Node send",
+        [this, to, msg_type, from, payload = std::move(payload)]() {
+          auto frame = assemble_frame(to, msg_type, from, payload);
+          if (frame.has_value())
           {
-            const auto connection_it = connections.find(to);
-            if (connection_it == connections.end())
-            {
-              const auto address_it = node_addresses.find(to);
-              if (address_it == node_addresses.end())
-              {
-                LOG_TRACE_FMT("Ignoring node_outbound to unknown node {}", to);
-                return;
-              }
+            enqueue_ready(SendFrame{to, from, std::move(frame.value())});
+          }
+        });
+    }
 
-              const auto& [host, port] = address_it->second;
-              outbound_connection = create_connection(to, host, port);
-              if (outbound_connection.is_null())
-              {
-                LOG_FAIL_FMT(
-                  "Unable to connect to {}, dropping outbound message message",
-                  to);
-                return;
-              }
+    // Loop thread, once the loop has exited and the node has stopped. Closes
+    // every socket now rather than when the last owner releases this object,
+    // since the node may retain its reference until process exit. Frames not
+    // yet written are discarded, as when the loop stops with them queued.
+    void shutdown()
+    {
+      set_inbound_handler(nullptr);
+      {
+        std::lock_guard guard(outbound_mutex);
+        outbound_ready.clear();
+      }
+      connections.clear();
+      unassociated_incoming.clear();
+      node_addresses.clear();
+      listener = nullptr;
+    }
+
+    // Loop thread: apply everything the ledger lane has finished, in order.
+    void flush_outbound()
+    {
+      std::deque<OutboundItem> ready;
+      {
+        std::lock_guard guard(outbound_mutex);
+        std::swap(ready, outbound_ready);
+      }
+
+      for (auto& item : ready)
+      {
+        std::visit(
+          [this](auto&& it) {
+            using T = std::decay_t<decltype(it)>;
+            if constexpr (std::is_same_v<T, AssociateAddress>)
+            {
+              node_addresses[it.node_id] = {it.host, it.port};
+            }
+            else if constexpr (std::is_same_v<T, CloseOutbound>)
+            {
+              remove_connection(it.node_id);
             }
             else
             {
-              outbound_connection = connection_it->second;
-            }
-          }
-
-          // Rather than reading and reserialising, use the msg_type and from_id
-          // that are already serialised on the ringbuffer
-          auto data_to_send = data;
-          auto size_to_send = size;
-
-          // If the message is a consensus append entries message, affix the
-          // corresponding ledger entries
-          auto msg_type = serialized::read<ccf::NodeMsgType>(data, size);
-          serialized::read<ccf::NodeId::Value>(data, size); // Ignore from_id
-          if (
-            msg_type == ccf::NodeMsgType::consensus_msg &&
-            (serialized::read<aft::RaftMsgType>(data, size) ==
-             aft::raft_append_entries))
-          {
-            // Parse the indices to be sent to the recipient.
-            const auto& ae =
-              serialized::overlay<consensus::AppendEntriesIndex>(data, size);
-
-            // Find the total frame size, and write it along with the header.
-            uint32_t frame = (uint32_t)size_to_send;
-
-            if (ae.idx > ae.prev_idx)
-            {
-              std::optional<asynchost::LedgerReadResult> read_result =
-                ledger.read_entries(ae.prev_idx + 1, ae.idx);
-
-              if (!read_result.has_value())
+              // The sender field of outbound messages is the only place the
+              // host learns its own node ID, which is needed to resolve
+              // simultaneous connects consistently on both sides.
+              if (!self_node_id.has_value())
               {
-                LOG_FAIL_FMT(
-                  "Unable to send AppendEntries ({}, {}]: Ledger read failed",
-                  ae.prev_idx,
-                  ae.idx);
-                return;
+                self_node_id = it.from;
               }
-              else if (ae.idx != read_result->end_idx)
-              {
-                // NB: This should never happen since we do not pass a max_size
-                // to read_entries
-                LOG_FAIL_FMT(
-                  "Unable to send AppendEntries ({}, {}]: Ledger read returned "
-                  "entries to {}",
-                  ae.prev_idx,
-                  ae.idx,
-                  read_result->end_idx);
-                return;
-              }
-              else
-              {
-                const auto& framed_entries = read_result->data;
-                frame += (uint32_t)framed_entries.size();
-                outbound_connection->write(sizeof(uint32_t), (uint8_t*)&frame);
-                outbound_connection->write(size_to_send, data_to_send);
-
-                outbound_connection->write(
-                  framed_entries.size(), framed_entries.data());
-              }
+              send_frame(it.to, it.frame);
             }
-            else
-            {
-              // Header-only AE
-              outbound_connection->write(sizeof(uint32_t), (uint8_t*)&frame);
-              outbound_connection->write(size_to_send, data_to_send);
-            }
-
-            LOG_DEBUG_FMT(
-              "send AE to node {} [{}]: {}, {}",
-              to,
-              frame,
-              ae.idx,
-              ae.prev_idx);
-          }
-          else
-          {
-            // Write as framed data to the recipient.
-            uint32_t frame = (uint32_t)size_to_send;
-
-            LOG_DEBUG_FMT("node send to {} [{}]", to, frame);
-
-            outbound_connection->write(sizeof(uint32_t), (uint8_t*)&frame);
-            outbound_connection->write(size_to_send, data_to_send);
-          }
-        });
+          },
+          item);
+      }
     }
 
   private:
-    TCP create_connection(
+    // Ordered step: for an AppendEntries message, read the ledger entries it
+    // refers to and append them to the message. Returns the complete framed
+    // bytes to write to the peer, or nullopt if the message must be dropped.
+    //
+    // Wire format: [u32 frame size][msg type][sender ID][payload][entries].
+    std::optional<std::vector<uint8_t>> assemble_frame(
+      const ccf::NodeId& to,
+      ccf::NodeMsgType msg_type,
+      const ccf::NodeId& from,
+      const std::vector<uint8_t>& payload)
+    {
+      const auto& from_value = from.value();
+      std::vector<uint8_t> header(
+        sizeof(msg_type) + sizeof(size_t) + from_value.size());
+      {
+        auto* hdata = header.data();
+        auto hsize = header.size();
+        serialized::write(hdata, hsize, msg_type);
+        serialized::write(hdata, hsize, from_value);
+      }
+
+      const uint8_t* data = payload.data();
+      size_t size = payload.size();
+
+      std::vector<uint8_t> entries;
+      std::optional<::consensus::AppendEntriesIndex> ae_index;
+
+      if (
+        msg_type == ccf::NodeMsgType::consensus_msg &&
+        (serialized::read<aft::CftMsgType>(data, size) == aft::append_entries))
+      {
+        const auto& ae =
+          serialized::overlay<::consensus::AppendEntriesIndex>(data, size);
+        ae_index = ae;
+
+        if (ae.idx > ae.prev_idx)
+        {
+          std::optional<asynchost::LedgerReadResult> read_result =
+            ledger.read_entries(ae.prev_idx + 1, ae.idx);
+
+          if (!read_result.has_value())
+          {
+            LOG_FAIL_FMT(
+              "Unable to send AppendEntries ({}, {}]: Ledger read failed",
+              ae.prev_idx,
+              ae.idx);
+            return std::nullopt;
+          }
+
+          if (ae.idx != read_result->end_idx)
+          {
+            // NB: This should never happen since we do not pass a max_size
+            // to read_entries
+            LOG_FAIL_FMT(
+              "Unable to send AppendEntries ({}, {}]: Ledger read returned "
+              "entries to {}",
+              ae.prev_idx,
+              ae.idx,
+              read_result->end_idx);
+            return std::nullopt;
+          }
+
+          entries = std::move(read_result->data);
+        }
+      }
+
+      const auto frame_size =
+        static_cast<uint32_t>(header.size() + payload.size() + entries.size());
+      std::vector<uint8_t> frame;
+      frame.reserve(sizeof(frame_size) + frame_size);
+      frame.insert(
+        frame.end(),
+        reinterpret_cast<const uint8_t*>(&frame_size),
+        reinterpret_cast<const uint8_t*>(&frame_size) + sizeof(frame_size));
+      frame.insert(frame.end(), header.begin(), header.end());
+      frame.insert(frame.end(), payload.begin(), payload.end());
+      frame.insert(frame.end(), entries.begin(), entries.end());
+
+      if (ae_index.has_value())
+      {
+        LOG_DEBUG_FMT(
+          "send AE to node {} [{}]: {}, {}",
+          to,
+          frame_size,
+          ae_index->idx,
+          ae_index->prev_idx);
+      }
+      else
+      {
+        LOG_DEBUG_FMT("node send to {} [{}]", to, frame_size);
+      }
+
+      return frame;
+    }
+
+    // Loop step: find or open the connection to the peer and write the frame.
+    void send_frame(const ccf::NodeId& to, const std::vector<uint8_t>& frame)
+    {
+      ConnType outbound_connection = nullptr;
+      const auto connection_it = connections.find(to);
+      if (connection_it == connections.end())
+      {
+        const auto address_it = node_addresses.find(to);
+        if (address_it == node_addresses.end())
+        {
+          LOG_TRACE_FMT("Ignoring node send to unknown node {}", to);
+          return;
+        }
+
+        const auto& [host, port] = address_it->second;
+        outbound_connection = create_connection(to, host, port);
+        if (outbound_connection.is_null())
+        {
+          LOG_FAIL_FMT(
+            "Unable to connect to {}, dropping outbound message message", to);
+          return;
+        }
+      }
+      else
+      {
+        outbound_connection = connection_it->second.socket;
+      }
+
+      outbound_connection->write(frame.size(), frame.data());
+    }
+
+    // Decide which of two simultaneously-created connections with a peer to
+    // keep. Both nodes evaluate this for the same pair and must agree: the node
+    // with the lower ID keeps the connection it opened, and the node with the
+    // higher ID prefers the one its peer opened. Exactly one of the two
+    // connections therefore survives, and both ends of it agree.
+    bool prefer_incoming_from(const ccf::NodeId& peer) const
+    {
+      if (!self_node_id.has_value())
+      {
+        // We cannot have an outgoing connection without having sent a message,
+        // so this should be unreachable. Fall back to the previous behaviour of
+        // always preferring the newer connection.
+        LOG_FAIL_FMT(
+          "Resolving simultaneous connect with {} without knowing own node ID",
+          peer);
+        return true;
+      }
+
+      return self_node_id.value().value() > peer.value();
+    }
+
+    ConnType create_connection(
       const ccf::NodeId& node_id,
       const std::string& host,
       const std::string& port)
     {
-      auto s = TCP(true, client_connection_timeout);
+      auto s = ConnType(true, client_connection_timeout);
       s->set_behaviour(std::make_unique<NodeOutgoingBehaviour>(*this, node_id));
 
       if (!s->connect(host, port, client_interface))
@@ -416,14 +736,15 @@ namespace asynchost
         return nullptr;
       }
 
-      connections.emplace(node_id, s);
-      LOG_DEBUG_FMT(
+      connections[node_id] = {s, true};
+      LOG_INFO_FMT(
         "Added node connection with {} ({}:{})", node_id, host, port);
 
       return s;
     }
 
-    bool remove_connection(const ccf::NodeId& node)
+    // Remove the connection with this peer, if any.
+    bool remove_connection(ccf::NodeId node)
     {
       if (connections.erase(node) < 1)
       {
@@ -431,7 +752,7 @@ namespace asynchost
         return false;
       }
 
-      LOG_DEBUG_FMT("Removed node connection with {}", node);
+      LOG_INFO_FMT("Removed node connection with {}", node);
       return true;
     }
 
@@ -447,4 +768,22 @@ namespace asynchost
       return id;
     }
   };
+
+  using NodeConnections = NodeConnectionsImpl<TCP>;
+
+  class FlushNodeOutboundImpl
+  {
+  private:
+    NodeConnections& node;
+
+  public:
+    FlushNodeOutboundImpl(NodeConnections& node_) : node(node_) {}
+
+    void on_timer()
+    {
+      node.flush_outbound();
+    }
+  };
+
+  using FlushNodeOutbound = ccf::uv::proxy_ptr<Timer<FlushNodeOutboundImpl>>;
 }

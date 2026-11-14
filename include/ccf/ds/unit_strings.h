@@ -7,10 +7,11 @@
 
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 
-namespace ds
+namespace ccf::ds
 {
   // Inspired by CLI11's AsNumberWithUnit
   class UnitStringConverter
@@ -20,21 +21,21 @@ namespace ds
     static size_t convert(
       const std::string_view& input,
       std::map<std::string_view, T>& mapping,
-      F&& f)
+      F&& f) // NOLINT(cppcoreguidelines-missing-std-forward)
     {
       if (input.empty())
       {
         throw std::logic_error("Cannot convert empty unit string");
       }
 
-      auto unit_begin = input.end();
+      const auto* unit_begin = input.end();
       while (unit_begin > input.begin() && std::isalpha(*(unit_begin - 1)))
       {
         unit_begin--;
       }
 
       auto unit = std::string(unit_begin, input.end());
-      nonstd::to_lower(unit);
+      ccf::nonstd::to_lower(unit);
       auto value = std::string(input.begin(), unit_begin);
 
       size_t ret = 0;
@@ -81,7 +82,27 @@ namespace ds
 
     return UnitStringConverter::convert(
       input, size_suffix_to_power, [](size_t value, size_t power) {
-        return value * std::pow(1024, power);
+        constexpr size_t base = 1024;
+        size_t factor = 1;
+        for (size_t i = 0; i < power; ++i)
+        {
+          if (factor > std::numeric_limits<size_t>::max() / base)
+          {
+            throw std::logic_error("Size string unit multiplier is too large");
+          }
+          factor *= base;
+        }
+
+        if (value > std::numeric_limits<size_t>::max() / factor)
+        {
+          throw std::logic_error(fmt::format(
+            "Size string value {} with multiplier {} exceeds the largest "
+            "representable size",
+            value,
+            factor));
+        }
+
+        return value * factor;
       });
   }
 
@@ -108,6 +129,7 @@ namespace ds
     std::string str;
 
     UnitString() = default;
+
     UnitString(const std::string_view& str_) : str(str_) {}
 
     bool operator==(const UnitString&) const = default;
@@ -120,15 +142,26 @@ namespace ds
 
   struct SizeString : UnitString
   {
-    size_t value;
+    size_t value = 0;
 
     SizeString() = default;
+
     SizeString(const std::string_view& str_) :
       UnitString(str_),
       value(convert_size_string(str_))
     {}
 
-    inline operator size_t() const
+    SizeString(const char* str_) :
+      UnitString(str_),
+      value(convert_size_string(str_))
+    {}
+
+    operator size_t() const
+    {
+      return value;
+    }
+
+    [[nodiscard]] size_t count_bytes() const
     {
       return value;
     }
@@ -139,12 +172,14 @@ namespace ds
     s = j.get<std::string_view>();
   }
 
-  inline std::string schema_name(const SizeString*)
+  inline std::string schema_name(
+    [[maybe_unused]] const SizeString* size_string_type)
   {
-    return "TimeString";
+    return "SizeString";
   }
 
-  inline void fill_json_schema(nlohmann::json& schema, const SizeString*)
+  inline void fill_json_schema(
+    nlohmann::json& schema, [[maybe_unused]] const SizeString* size_string_type)
   {
     schema["type"] = "string";
     schema["pattern"] = "^[0-9]+(B|KB|MB|GB|TB|PB)?$";
@@ -152,37 +187,38 @@ namespace ds
 
   struct TimeString : UnitString
   {
-    std::chrono::microseconds value;
+    std::chrono::microseconds value = {};
 
     TimeString() = default;
+
     TimeString(const std::string_view& str_) :
       UnitString(str_),
       value(convert_time_string(str_))
     {}
 
-    inline operator std::chrono::microseconds() const
+    operator std::chrono::microseconds() const
     {
       return value;
     }
 
-    inline operator std::chrono::milliseconds() const
+    operator std::chrono::milliseconds() const
     {
       return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::microseconds(*this));
     }
 
-    inline operator std::chrono::seconds() const
+    operator std::chrono::seconds() const
     {
       return std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::microseconds(*this));
     }
 
-    size_t count_ms() const
+    [[nodiscard]] size_t count_ms() const
     {
       return std::chrono::milliseconds(*this).count();
     }
 
-    size_t count_s() const
+    [[nodiscard]] size_t count_s() const
     {
       return std::chrono::seconds(*this).count();
     }
@@ -193,12 +229,14 @@ namespace ds
     s = j.get<std::string_view>();
   }
 
-  inline std::string schema_name(const TimeString*)
+  inline std::string schema_name(
+    [[maybe_unused]] const TimeString* time_string_type)
   {
     return "TimeString";
   }
 
-  inline void fill_json_schema(nlohmann::json& schema, const TimeString*)
+  inline void fill_json_schema(
+    nlohmann::json& schema, [[maybe_unused]] const TimeString* time_string_type)
   {
     schema["type"] = "string";
     schema["pattern"] = "^[0-9]+(us|ms|s|min|h)?$";
@@ -206,8 +244,9 @@ namespace ds
 }
 
 FMT_BEGIN_NAMESPACE
+
 template <>
-struct formatter<ds::SizeString>
+struct formatter<ccf::ds::SizeString>
 {
   template <typename ParseContext>
   constexpr auto parse(ParseContext& ctx)
@@ -216,11 +255,12 @@ struct formatter<ds::SizeString>
   }
 
   template <typename FormatContext>
-  auto format(const ds::SizeString& v, FormatContext& ctx) const
+  auto format(const ccf::ds::SizeString& v, FormatContext& ctx) const
   {
     std::stringstream ss;
     ss << v.str;
     return format_to(ctx.out(), "{}", ss.str());
   }
 };
+
 FMT_END_NAMESPACE

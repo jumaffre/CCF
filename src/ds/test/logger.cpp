@@ -1,10 +1,43 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
 
-#include "ccf/ds/logger.h"
+#include "ds/internal_logger.h"
+#include "ds/time_bound_logger.h"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include <chrono>
+#include <cstdint>
+#include <ctime>
 #include <doctest/doctest.h>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <sstream>
+#include <thread>
+#include <utility>
+#include <vector>
+
+TEST_CASE("Thread IDs are provided by the logger headers")
+{
+  ccf::threading::reset_thread_id_generator();
+  ccf::threading::set_current_thread_id(ccf::threading::MAIN_THREAD_ID);
+
+  REQUIRE(
+    ccf::threading::get_current_thread_id() == ccf::threading::MAIN_THREAD_ID);
+
+  ccf::threading::set_current_thread_id(42);
+  REQUIRE(ccf::threading::get_current_thread_id() == 42);
+
+  ccf::threading::reset_thread_id_generator(7);
+  ccf::threading::ThreadID thread_id = ccf::threading::invalid_thread_id;
+  std::thread t(
+    [&thread_id] { thread_id = ccf::threading::get_current_thread_id(); });
+  t.join();
+  REQUIRE(thread_id == 7);
+
+  ccf::threading::reset_thread_id_generator();
+  ccf::threading::set_current_thread_id(ccf::threading::MAIN_THREAD_ID);
+}
 
 template <typename Base>
 class TestLogger : public Base
@@ -20,14 +53,216 @@ public:
   }
 };
 
-using TestTextLogger = TestLogger<logger::TextConsoleLogger>;
-using TestJsonLogger = TestLogger<logger::JsonConsoleLogger>;
+using TestTextLogger = TestLogger<ccf::logger::TextConsoleLogger>;
+using TestJsonLogger = TestLogger<ccf::logger::JsonConsoleLogger>;
+
+TEST_CASE("JSON logs retain wall-clock timestamps and string messages")
+{
+  std::vector<std::string> logs;
+  TestJsonLogger logger(logs);
+  ccf::logger::LogLine line(ccf::LoggerLevel::INFO, "test", __FILE__, __LINE__);
+  line.msg = R"({"function":"replicate"})";
+  logger.write(line);
+
+  REQUIRE(logs.size() == 1);
+  const auto record = nlohmann::json::parse(logs.front());
+  CHECK(record["msg"] == line.msg);
+  const auto timestamp = record["h_ts"].get<std::string>();
+  REQUIRE(timestamp.size() == 27);
+  CHECK(timestamp[10] == 'T');
+  CHECK(timestamp.back() == 'Z');
+}
+
+class ScopedLoggerConfig
+{
+  const ccf::LoggerLevel previous_level = ccf::logger::config::level();
+  const std::chrono::microseconds previous_default_max_time =
+    ccf::ds::TimeBoundLogger::default_max_time;
+  std::vector<std::unique_ptr<ccf::logger::AbstractLogger>> previous_loggers;
+
+public:
+  ScopedLoggerConfig() :
+    previous_loggers(std::exchange(ccf::logger::config::loggers(), {}))
+  {}
+
+  ScopedLoggerConfig(const ScopedLoggerConfig&) = delete;
+  ScopedLoggerConfig& operator=(const ScopedLoggerConfig&) = delete;
+
+  ~ScopedLoggerConfig()
+  {
+    ccf::logger::config::loggers() = std::move(previous_loggers);
+    ccf::logger::config::level() = previous_level;
+    ccf::ds::TimeBoundLogger::default_max_time = previous_default_max_time;
+  }
+};
+
+class ScopedCerrCapture
+{
+  std::ostringstream captured;
+  std::streambuf* previous = std::cerr.rdbuf(captured.rdbuf());
+
+public:
+  ScopedCerrCapture() = default;
+  ScopedCerrCapture(const ScopedCerrCapture&) = delete;
+  ScopedCerrCapture& operator=(const ScopedCerrCapture&) = delete;
+
+  ~ScopedCerrCapture()
+  {
+    std::cerr.rdbuf(previous);
+  }
+
+  std::string str() const
+  {
+    return captured.str();
+  }
+};
+
+class ScopedCoutCapture
+{
+  std::ostringstream captured;
+  std::streambuf* previous = std::cout.rdbuf(captured.rdbuf());
+
+public:
+  ScopedCoutCapture() = default;
+  ScopedCoutCapture(const ScopedCoutCapture&) = delete;
+  ScopedCoutCapture& operator=(const ScopedCoutCapture&) = delete;
+
+  ~ScopedCoutCapture()
+  {
+    std::cout.rdbuf(previous);
+  }
+
+  void clear()
+  {
+    captured.str("");
+    captured.clear();
+  }
+
+  std::string str() const
+  {
+    return captured.str();
+  }
+};
+
+#ifndef CCF_CFT_TRACING
+TEST_CASE("Logger timestamp retains microsecond precision")
+{
+  std::tm tm{};
+  tm.tm_year = 126;
+  tm.tm_mon = 5;
+  tm.tm_mday = 16;
+  tm.tm_hour = 5;
+  tm.tm_min = 30;
+  tm.tm_sec = 6;
+  ::timespec ts{};
+
+  CHECK(ccf::logger::get_timestamp(tm, ts) == "2026-06-16T05:30:06.000000Z");
+  ts.tv_nsec = 123456789;
+  CHECK(ccf::logger::get_timestamp(tm, ts) == "2026-06-16T05:30:06.123456Z");
+  ts.tv_nsec = 999999999;
+  CHECK(ccf::logger::get_timestamp(tm, ts) == "2026-06-16T05:30:06.999999Z");
+}
+#endif
+
+TEST_CASE("Application log formatting preserves text and JSON messages")
+{
+  using namespace std::string_literals;
+
+  std::vector<std::string> text_logs;
+  std::vector<std::string> json_logs;
+  const ScopedLoggerConfig restore_config;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
+  ccf::logger::config::loggers().emplace_back(
+    std::make_unique<TestTextLogger>(text_logs));
+  ccf::logger::config::loggers().emplace_back(
+    std::make_unique<TestJsonLogger>(json_logs));
+
+  const std::vector<uint8_t> bytes = {0, 1, 127, 255};
+  CCF_APP_INFO(
+    "value={:.2f} hex={:02x} enum={} optional={}",
+    1.25,
+    fmt::join(bytes, ""),
+    ccf::LoggerLevel::INFO,
+    std::optional{7});
+  CCF_APP_INFO("escaped={{}}\n{}\0{}", "before", "after");
+
+  const std::vector<std::string> expected = {
+    "value=1.25 hex=00017fff enum=2 optional=optional(7)",
+    "escaped={}\nbefore\0after"s};
+  REQUIRE(text_logs.size() == expected.size());
+  REQUIRE(json_logs.size() == expected.size());
+  for (size_t i = 0; i < expected.size(); ++i)
+  {
+    CHECK(text_logs[i].ends_with(expected[i] + "\n"));
+    CHECK(nlohmann::json::parse(json_logs[i]).at("msg") == expected[i]);
+  }
+}
+
+TEST_CASE("Time-bound logger duration formatting")
+{
+  using ccf::ds::TimeBoundLogger;
+  using namespace std::chrono_literals;
+
+  CHECK(TimeBoundLogger::human_time(0us) == "  0.000us");
+  CHECK(TimeBoundLogger::human_time(999us) == "999.000us");
+  CHECK(TimeBoundLogger::human_time(1000us) == "  1.000ms");
+  CHECK(TimeBoundLogger::human_time(999999us) == "999.999ms");
+  CHECK(TimeBoundLogger::human_time(1s) == "  1.000s");
+}
+
+TEST_CASE("Time-bound logger captures the configured default")
+{
+  using ccf::ds::TimeBoundLogger;
+  using namespace std::chrono_literals;
+
+  const ScopedLoggerConfig restore_config;
+  TimeBoundLogger::default_max_time = 1s;
+  TimeBoundLogger first("first");
+  TimeBoundLogger::default_max_time = 2s;
+  TimeBoundLogger second("second");
+  TimeBoundLogger explicit_threshold("explicit", 3s);
+
+  CHECK(first.max_time == 1s);
+  CHECK(second.max_time == 2s);
+  CHECK(explicit_threshold.max_time == 3s);
+}
+
+TEST_CASE("Time-bound logger reports slow operations at the expected level")
+{
+  using ccf::ds::TimeBoundLogger;
+  using namespace std::chrono_literals;
+
+  std::vector<std::string> logs;
+  const ScopedLoggerConfig restore_config;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
+  ccf::logger::config::loggers().emplace_back(
+    std::make_unique<TestTextLogger>(logs));
+
+  {
+    TimeBoundLogger timer("fast", 1h);
+    timer.start_time -= 30min;
+  }
+  {
+    TimeBoundLogger timer("slow", 1h);
+    timer.start_time -= 2h;
+  }
+  {
+    TimeBoundLogger timer("very slow", 1h);
+    timer.start_time -= 200h;
+  }
+
+  REQUIRE(logs.size() == 2);
+  CHECK(logs[0].contains("info"));
+  CHECK(logs[0].contains("): slow"));
+  CHECK(logs[1].contains("fail"));
+  CHECK(logs[1].contains("): very slow"));
+}
 
 TEST_CASE("Framework logging macros")
 {
   std::vector<std::string> logs;
 
-  logger::config::loggers().emplace_back(
+  ccf::logger::config::loggers().emplace_back(
     std::make_unique<TestTextLogger>(logs));
 
   {
@@ -36,9 +271,9 @@ TEST_CASE("Framework logging macros")
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("info") != std::string::npos);
-    REQUIRE(log.find("logger.cpp") != std::string::npos);
-    REQUIRE(log.find("Hello A") != std::string::npos);
+    REQUIRE(log.contains("info"));
+    REQUIRE(log.contains("logger.cpp"));
+    REQUIRE(log.contains("Hello A"));
 
     logs.clear();
   }
@@ -49,34 +284,66 @@ TEST_CASE("Framework logging macros")
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("fail") != std::string::npos);
-    REQUIRE(log.find("logger.cpp") != std::string::npos);
-    REQUIRE(log.find("Hello B") != std::string::npos);
+    REQUIRE(log.contains("fail"));
+    REQUIRE(log.contains("logger.cpp"));
+    REQUIRE(log.contains("Hello B"));
 
     logs.clear();
   }
 
   {
     REQUIRE(logs.empty());
-    REQUIRE_THROWS(LOG_FATAL_FMT("Hello C"));
+    LOG_FATAL_FMT("Hello C");
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("fatal") != std::string::npos);
-    REQUIRE(log.find("logger.cpp") != std::string::npos);
-    REQUIRE(log.find("Hello C") != std::string::npos);
+    REQUIRE(log.contains("fatal"));
+    REQUIRE(log.contains("logger.cpp"));
+    REQUIRE(log.contains("Hello C"));
 
     logs.clear();
   }
 
-  logger::config::loggers().clear();
+  ccf::logger::config::loggers().clear();
+}
+
+TEST_CASE("Only explicit fatal diagnostics write to stderr")
+{
+  const ScopedLoggerConfig restore_config;
+  ccf::logger::config::level() = ccf::LoggerLevel::TRACE;
+  ScopedCoutCapture captured_out;
+  ScopedCerrCapture captured_err;
+
+  const auto check_console_logger = [&](auto logger) {
+    auto& loggers = ccf::logger::config::loggers();
+    loggers.clear();
+    loggers.emplace_back(std::move(logger));
+    captured_out.clear();
+
+    LOG_INFO_FMT("Recoverable information");
+    LOG_FAIL_FMT("Recoverable failure");
+    LOG_FATAL_FMT("Fatal severity label without termination");
+
+    CHECK(captured_err.str().empty());
+    const auto output = captured_out.str();
+    CHECK(output.contains("Recoverable information"));
+    CHECK(output.contains("Recoverable failure"));
+    CHECK(output.contains("Fatal severity label without termination"));
+  };
+
+  check_console_logger(std::make_unique<ccf::logger::TextConsoleLogger>());
+  check_console_logger(std::make_unique<ccf::logger::JsonConsoleLogger>());
+  captured_out.clear();
+  ccf::logger::write_fatal_diagnostic("Node terminated");
+  CHECK(captured_out.str().empty());
+  CHECK(captured_err.str() == "Fatal error: Node terminated\n");
 }
 
 TEST_CASE("Application logging macros")
 {
   std::vector<std::string> logs;
 
-  logger::config::loggers().emplace_back(
+  ccf::logger::config::loggers().emplace_back(
     std::make_unique<TestTextLogger>(logs));
 
   {
@@ -85,10 +352,10 @@ TEST_CASE("Application logging macros")
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("info") != std::string::npos);
-    REQUIRE(log.find("[app]") != std::string::npos);
-    REQUIRE(log.find("logger.cpp") != std::string::npos);
-    REQUIRE(log.find("Hello A") != std::string::npos);
+    REQUIRE(log.contains("info"));
+    REQUIRE(log.contains("[app]"));
+    REQUIRE(log.contains("logger.cpp"));
+    REQUIRE(log.contains("Hello A"));
 
     logs.clear();
   }
@@ -99,29 +366,29 @@ TEST_CASE("Application logging macros")
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("fail") != std::string::npos);
-    REQUIRE(log.find("[app]") != std::string::npos);
-    REQUIRE(log.find("logger.cpp") != std::string::npos);
-    REQUIRE(log.find("Hello B") != std::string::npos);
+    REQUIRE(log.contains("fail"));
+    REQUIRE(log.contains("[app]"));
+    REQUIRE(log.contains("logger.cpp"));
+    REQUIRE(log.contains("Hello B"));
 
     logs.clear();
   }
 
   {
     REQUIRE(logs.empty());
-    REQUIRE_THROWS(CCF_APP_FATAL("Hello C"));
+    CCF_APP_FATAL("Hello C");
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("fatal") != std::string::npos);
-    REQUIRE(log.find("[app]") != std::string::npos);
-    REQUIRE(log.find("logger.cpp") != std::string::npos);
-    REQUIRE(log.find("Hello C") != std::string::npos);
+    REQUIRE(log.contains("fatal"));
+    REQUIRE(log.contains("[app]"));
+    REQUIRE(log.contains("logger.cpp"));
+    REQUIRE(log.contains("Hello C"));
 
     logs.clear();
   }
 
-  logger::config::loggers().clear();
+  ccf::logger::config::loggers().clear();
 }
 
 constexpr auto custom_tag = "my tag";
@@ -135,7 +402,7 @@ TEST_CASE("Custom logging macros")
 {
   std::vector<std::string> logs;
 
-  logger::config::loggers().emplace_back(
+  ccf::logger::config::loggers().emplace_back(
     std::make_unique<TestTextLogger>(logs));
 
   {
@@ -144,10 +411,10 @@ TEST_CASE("Custom logging macros")
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("info") != std::string::npos);
-    REQUIRE(log.find(custom_tag) != std::string::npos);
-    REQUIRE(log.find("logger.cpp") != std::string::npos);
-    REQUIRE(log.find("Some message") != std::string::npos);
+    REQUIRE(log.contains("info"));
+    REQUIRE(log.contains(custom_tag));
+    REQUIRE(log.contains("logger.cpp"));
+    REQUIRE(log.contains("Some message"));
 
     logs.clear();
   }
@@ -158,24 +425,23 @@ TEST_CASE("Custom logging macros")
     REQUIRE(logs.size() == 1);
 
     const auto& log = logs[0];
-    REQUIRE(log.find("info") != std::string::npos);
+    REQUIRE(log.contains("info"));
     // Search for smaller prefixes of the long tag, expect that one is
     // eventually present
     std::string truncated_tag = custom_long_tag;
     while (truncated_tag.size() > 0)
     {
-      const auto search = log.find(truncated_tag);
-      if (search != std::string::npos)
+      if (log.contains(truncated_tag))
       {
         break;
       }
       truncated_tag.resize(truncated_tag.size() - 1);
     }
     REQUIRE(truncated_tag.size() > 0);
-    REQUIRE(log.find("Some other message") != std::string::npos);
+    REQUIRE(log.contains("Some other message"));
 
     logs.clear();
   }
 
-  logger::config::loggers().clear();
+  ccf::logger::config::loggers().clear();
 }

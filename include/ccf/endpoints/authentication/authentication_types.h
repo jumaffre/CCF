@@ -30,7 +30,7 @@ namespace ccf
     virtual ~AuthnPolicy() = default;
 
     virtual std::unique_ptr<AuthnIdentity> authenticate(
-      kv::ReadOnlyTx& tx,
+      ccf::kv::ReadOnlyTx& tx,
       const std::shared_ptr<ccf::RpcContext>& ctx,
       std::string& error_reason) = 0;
 
@@ -38,13 +38,10 @@ namespace ccf
       std::shared_ptr<ccf::RpcContext> ctx, std::string&& error_reason)
     {}
 
-    virtual std::optional<OpenAPISecuritySchema> get_openapi_security_schema()
-      const = 0;
+    [[nodiscard]] virtual std::optional<OpenAPISecuritySchema>
+    get_openapi_security_schema() const = 0;
 
-    virtual std::string get_security_scheme_name()
-    {
-      return "BaseAuthPolicy";
-    }
+    virtual std::string get_security_scheme_name() = 0;
   };
 
   using AuthnPolicies = std::vector<std::shared_ptr<AuthnPolicy>>;

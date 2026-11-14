@@ -4,23 +4,19 @@
 
 set -e
 
-if [ ! -f "python/version.py" ]; then
-    echo "Generate version.py if it doesn't already exist"
-    mkdir -p tmp_build && cd tmp_build
-    cmake -L -GNinja -DCOMPILE_TARGET=virtual ..
-    cd .. && rm -rf tmp_build
-fi
-
 echo "Setting up Python environment..."
 if [ ! -f "env/bin/activate" ]
     then
-        python3.8 -m venv env
+        python3 -m venv --without-pip env
 fi
 
+bash ./scripts/install_uv.sh env/bin
 source env/bin/activate
-pip install -U pip
-pip install -q -U -e ./python/
-pip install -q -U -r ./doc/requirements.txt
+if [ -n "${PIP_INDEX_URL:-}" ] && [ -z "${UV_INDEX_URL:-}" ]; then
+    export UV_INDEX_URL="$PIP_INDEX_URL"
+fi
+uv pip install -q -e ./python/
+uv pip install -q -r ./doc/requirements.txt
 echo "Python environment successfully setup"
 
 sphinx-autobuild -b html doc doc/html --host localhost --port 8080

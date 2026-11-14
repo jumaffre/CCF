@@ -1,0 +1,464 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "ccf-[567].*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the full pipeline without creating a GitHub release"
+        type: boolean
+        default: true
+
+permissions: read-all
+
+env:
+  IMAGE: mcr.microsoft.com/azurelinux/base/core:3.0
+
+jobs:
+  make_sbom:
+    name: SBOM Generation
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: "Install SBOM tool"
+        run: |
+          set -ex
+          curl -Lo sbom-tool https://github.com/microsoft/sbom-tool/releases/latest/download/sbom-tool-linux-x64 > sbom-tool
+          chmod +x sbom-tool
+        shell: bash
+      - name: "Produce SBOM"
+        run: |
+          set -ex
+          CCF_VERSION=${{ github.ref_name }}
+          CCF_VERSION=${CCF_VERSION#ccf-}
+          ./sbom-tool generate -b . -bc . -pn CCF -ps Microsoft -nsb https://sbom.microsoft -pv $CCF_VERSION -V Error
+        shell: bash
+      - name: "Upload SBOM"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: _manifest/spdx_2.2/*
+
+  release_notes:
+    name: Release Notes
+    if: ${{ !inputs.dry_run || startsWith(github.ref, 'refs/tags/ccf-') }}
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: "Produce Release Notes"
+        run: |
+          set -ex
+          set -o pipefail
+          ./scripts/extract-release-notes.py --from-changes --target-git-version --describe-path-changes "./samples/constitution" | tee rel-notes.md
+      - name: "Upload Release Notes"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: relnotes
+          path: rel-notes.md
+
+  image_digest:
+    name: Snapshot Build Image Digest and SOURCE_DATE_EPOCH
+    runs-on: [gha-vmss-d16av7-ci]
+    outputs:
+      image_digest: ${{ steps.digest.outputs.digest }}
+      SOURCE_DATE_EPOCH: ${{ steps.set_epoch.outputs.SOURCE_DATE_EPOCH }}
+    steps:
+      - id: digest
+        run: |
+          set -ex
+          docker pull $IMAGE
+          echo "digest=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE)" >> "$GITHUB_OUTPUT"
+
+      - name: Set SOURCE_DATE_EPOCH
+        id: set_epoch
+        run: |
+          set -ex
+          epoch=$(date +%s)
+          echo "SOURCE_DATE_EPOCH=$epoch" >> $GITHUB_OUTPUT
+          echo "$epoch"
+
+  build_release:
+    name: Build Release
+    needs: image_digest
+    runs-on: [gha-vmss-d16av7-ci]
+    env:
+      CCF_USE_RELEASED_PYTHON_PACKAGE: "1"
+    container:
+      image: ${{ needs.image_digest.outputs.image_digest }}
+      options: "--user root --publish-all --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE --sysctl net.ipv6.conf.all.disable_ipv6=0 --sysctl net.ipv6.conf.default.disable_ipv6=0 --sysctl net.ipv6.conf.lo.disable_ipv6=0"
+
+    steps:
+      - name: "Set SOURCE_DATE_EPOCH"
+        shell: bash
+        run: |
+          set -ex
+          echo "Setting SOURCE_DATE_EPOCH env variable to ${{ needs.image_digest.outputs.SOURCE_DATE_EPOCH }}"
+          echo "SOURCE_DATE_EPOCH=${{ needs.image_digest.outputs.SOURCE_DATE_EPOCH }}" >> $GITHUB_ENV
+
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          set -ex
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf --snapshottime=$SOURCE_DATE_EPOCH -y update
+          tdnf --snapshottime=$SOURCE_DATE_EPOCH -y install ca-certificates git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: "Install dependencies"
+        shell: bash
+        run: |
+          set -ex
+          ./scripts/setup-ci.sh
+
+      - name: "Build Release"
+        shell: bash
+        run: |
+          set -ex
+          set -o pipefail
+          git config --global --add safe.directory /__w/CCF/CCF
+          # Ensure all files have timestamps strictly after SOURCE_DATE_EPOCH,
+          # otherwise rpmbuild will not clamp to SOURCE_DATE_EPOCH and the build
+          # will not be reproducible.
+          find . -type f -exec touch {} +
+          mkdir build
+          cd build
+          cmake -GNinja -DCLIENT_PROTOCOLS_TEST=ON -DCMAKE_BUILD_TYPE=Release ..
+          ninja -v | tee build.log
+
+      - name: "Test"
+        run: |
+          set -ex
+          cd build
+          rm -rf /github/home/.cache
+          mkdir -p /github/home/.cache
+          # Unit tests
+          ./tests.sh --output-on-failure -L unit -j$(nproc --all)
+          # Suite tests
+          ./tests.sh --timeout 600 --output-on-failure -L "suite"
+          # Most tests
+          ./tests.sh --timeout 360 --output-on-failure -LE "suite|benchmark|unit"
+        shell: bash
+
+      - name: "Upload logs"
+        if: success() || failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs
+          path: |
+            build/workspace/*/*.config.json
+            build/workspace/*/out
+            build/workspace/*/err
+            build/workspace/*/*.ledger/*
+            build/workspace/*/*.ledger.*/*
+            build/workspace/*/stack_trace
+            build/workspace/**/openapi_coverage.json
+          if-no-files-found: ignore
+
+      - name: "Make .rpm (devel) Package"
+        id: make_rpm_devel
+        run: |
+          set -ex
+          set -o pipefail
+          cd build
+
+          # Reset cmake config to affect cpack settings
+          rm CMakeCache.txt
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
+
+          cmake -L .. 2>/dev/null | grep CMAKE_INSTALL_PREFIX: | cut -d = -f 2 > /tmp/install_prefix
+          cpack -V -G RPM
+          INITIAL_PKG=`ls *devel*.rpm`
+          CCF_GITHUB_PKG=${INITIAL_PKG//\~/_}
+          if [[ "$INITIAL_PKG" != "$CCF_GITHUB_PKG" ]]; then
+            mv $INITIAL_PKG $CCF_GITHUB_PKG
+          fi
+          echo "name=$CCF_GITHUB_PKG" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: "Install CCF package"
+        run: |
+          set -ex
+          cd build
+          tdnf -y install ./${{ steps.make_rpm_devel.outputs.name }}
+        shell: bash
+
+      - name: "Test Installed CCF"
+        run: |
+          set -ex
+          set -o pipefail
+          cd build
+          cat /tmp/install_prefix | xargs -i ./test_install.sh {}
+        shell: bash
+
+      - name: "Recovery Benchmark for Installed CCF"
+        run: |
+          set -ex
+          set -o pipefail
+          cd build
+          cat /tmp/install_prefix | xargs -i ./recovery_benchmark.sh {}
+        shell: bash
+
+      - name: "Test Building `logging` Sample App Against Installed CCF"
+        run: |
+          set -ex
+          ./tests/test_install_build.sh
+        shell: bash
+
+      - name: "Upload `logging` Sample App"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logging
+          path: build_against_install/logging
+
+      - name: "Upload SNP Canary"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify_uvm_attestation_and_endorsements
+          path: build/verify_uvm_attestation_and_endorsements
+
+      - name: "Upload .rpm Package"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pkg
+          path: build/${{ steps.make_rpm_devel.outputs.name }}
+
+      - name: "Upload Compatibility Report"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compatibility
+          path: build/compatibility_report.json
+
+      - name: "Upload TLS Report"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tls
+          path: build/tls_report.html
+
+      - name: "Build TS Package"
+        id: build_tstgz
+        run: |
+          set -ex
+          cd js/ccf-app
+          CCF_VERSION=$(<../../build/VERSION_LONG)
+          CCF_VERSION=${CCF_VERSION#ccf-}
+          echo "Setting npm package version to ${CCF_VERSION}"
+          npm version $CCF_VERSION
+          npm pack
+          PKG=`ls *.tgz`
+          echo "name=$PKG" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: "Upload TS Package"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tstgz
+          path: js/ccf-app/${{ steps.build_tstgz.outputs.name }}
+
+      - name: "Generate Reproducibility Metadata"
+        id: metadata
+        shell: bash
+        run: |
+          set -ex
+          commit_id=$(git rev-parse HEAD)
+          echo "commit_sha=$commit_id" >> $GITHUB_OUTPUT
+          filename=reproduce.json
+
+          cat <<EOF > $filename
+          {
+            "build_container_image": "${{needs.image_digest.outputs.image_digest}}",
+            "tdnf_snapshottime": $SOURCE_DATE_EPOCH,
+            "commit_sha": "$commit_id"
+          }
+          EOF
+          cat $filename
+
+      - name: "Upload Reproducibility Metadata"
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reproduce-metadata
+          path: reproduce.json
+
+  test_rpm_against_app:
+    name: "Test building against CCF package"
+    needs: build_release
+    runs-on: [gha-vmss-d16av7-ci]
+    container:
+      image: mcr.microsoft.com/azurelinux/base/core:3.0
+      options: --user root --publish-all --cap-add NET_ADMIN --cap-add NET_RAW --cap-add SYS_PTRACE
+
+    steps:
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          set -ex
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf -y update
+          tdnf -y install ca-certificates git
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Download RPM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: DOWNLOAD_DIR
+          pattern: pkg
+          merge-multiple: true
+
+      - name: Test against RPM
+        shell: bash
+        run: |
+          set -ex
+          PKG=`ls DOWNLOAD_DIR/*.rpm`
+          tdnf -y install $PKG
+          cd tests/ccfapp
+          mkdir -p build
+          cd build
+          CC=clang CXX=clang++ cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
+          ninja -v
+          ./ccfapp > out.txt
+          grep "I'm a CCF test app" out.txt
+          grep "Exported headers are usable" out.txt
+          /opt/ccf/bin/ensure-snmalloc.sh ccfapp
+
+  reproduce_rpm:
+    name: Test Reproducibility
+    needs:
+      - build_release
+      - image_digest
+    runs-on: [gha-vmss-d16av7-ci]
+    env:
+      REPRO_DIR: /tmp/reproduced
+    container:
+      image: ${{ needs.image_digest.outputs.image_digest }}
+      options: "--user root"
+    steps:
+      - name: "Checkout dependencies"
+        shell: bash
+        run: |
+          set -ex
+          gpg --import /etc/pki/rpm-gpg/MICROSOFT-RPM-GPG-KEY
+          tdnf --snapshottime=${{ needs.image_digest.outputs.SOURCE_DATE_EPOCH }} -y update
+          tdnf --snapshottime=${{ needs.image_digest.outputs.SOURCE_DATE_EPOCH }} -y install ca-certificates git
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Download Prebuilt Packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: DOWNLOAD_DIR
+          pattern: pkg
+          merge-multiple: true
+      - name: Download Reproducibility Metadata
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: repro
+          pattern: reproduce-metadata
+          merge-multiple: true
+      - name: Reproduce RPMs
+        id: reproduce
+        shell: bash
+        run: |
+          set -ex
+          tdnf install --snapshottime=${{ needs.image_digest.outputs.SOURCE_DATE_EPOCH }} -y jq
+          git config --global --add safe.directory /__w/CCF/CCF
+          # Ensure all files have timestamps strictly after SOURCE_DATE_EPOCH,
+          # otherwise rpmbuild will not clamp to SOURCE_DATE_EPOCH and the build
+          # will not be reproducible.
+          find . -type f -exec touch {} +
+          ./reproduce/reproduce_rpm.sh repro/reproduce.json
+          RPM_NAME=$(ls "$REPRO_DIR" || true)
+          if [ -z "$RPM_NAME" ]; then
+            echo "ERROR: No reproduced package found in $REPRO_DIR"
+            exit 1
+          fi
+      - name: Verify reproducibility
+        id: verify
+        shell: bash
+        run: |
+          set -ex
+          PKG=`ls "$REPRO_DIR"/*.rpm`
+          cmp "$PKG" "DOWNLOAD_DIR/$(basename "$PKG")"
+      - name: Upload Non-Reproduced Package
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: not-reproduced
+          path: ${{ env.REPRO_DIR }}
+
+  create_release:
+    if: ${{ !inputs.dry_run }}
+    permissions:
+      contents: write
+    needs:
+      - reproduce_rpm
+      - test_rpm_against_app
+      - build_release
+      - release_notes
+      - make_sbom
+    name: Create Release
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Download Packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: pkg
+          pattern: pkg*
+          merge-multiple: true
+      - name: Download Release Notes
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: relnotes
+      - name: Download Compatibility Report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: compatibility
+      - name: Download TLS Report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tls
+      - name: Download TS Package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: tstgz
+          name: tstgz
+      - name: Download SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: sbom
+          name: sbom
+      - name: Download Logging Sample App
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: logging
+      - name: Download SNP Canary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: verify_uvm_attestation_and_endorsements
+      - name: Download Reproducibility Metadata
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: repro
+          pattern: reproduce*
+          merge-multiple: true
+      - run: |
+          set -ex
+          CCF_VERSION=${{ github.ref_name }}
+          CCF_VERSION=${CCF_VERSION#ccf-}
+          gh release create --title $CCF_VERSION --draft --notes-file rel-notes.md ${{ github.ref_name }} pkg/* tstgz/*.tgz sbom/* tls_report.html compatibility_report.json repro/* logging verify_uvm_attestation_and_endorsements ./reproduce/start_container_and_reproduce_rpm.sh
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}

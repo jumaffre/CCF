@@ -1,0 +1,144 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the Apache 2.0 License.
+#pragma once
+
+#include "ccf/crypto/hash_provider.h"
+#include "ccf/ds/quote_info.h"
+#include "ccf/pal/attestation.h"
+#include "ccf/pal/attestation_sev_snp.h"
+#include "ccf/pal/platform.h"
+#include "ccf/pal/snp_ioctl.h"
+#include "ds/files.h"
+
+#include <nlohmann/json.hpp>
+#include <string>
+
+namespace ccf::pal
+{
+  static std::string virtual_attestation_path(const std::string& suffix)
+  {
+    return fmt::format("ccf_virtual_attestation.{}.{}", ::getpid(), suffix);
+  };
+
+  static void emit_virtual_measurement()
+  {
+    const auto package_path = std::filesystem::canonical("/proc/self/exe");
+    auto hasher = ccf::crypto::make_incremental_sha256();
+    std::ifstream f(package_path, std::ios::binary | std::ios::ate);
+    if (!f)
+    {
+      throw std::runtime_error(fmt::format(
+        "Cannot emit virtual measurement: Cannot open file {}", package_path));
+    }
+
+    const size_t size = f.tellg();
+    f.seekg(0, std::ios::beg);
+
+    static constexpr size_t buf_size = 4096;
+    char buf[buf_size];
+
+    size_t handled = 0;
+    while (handled < size)
+    {
+      const auto this_read = std::min(size - handled, buf_size);
+      f.read(buf, this_read);
+
+      hasher->update_hash(
+        {static_cast<const uint8_t*>(static_cast<const void*>(buf)),
+         this_read});
+
+      handled += this_read;
+    }
+
+    const auto package_hash = hasher->finalise();
+
+    auto j = nlohmann::json::object();
+
+    j["measurement"] = "Insecure hard-coded virtual measurement v1";
+    j["host_data"] = package_hash.hex_str();
+
+    files::dump(j.dump(2), virtual_attestation_path("measurement"));
+  }
+
+  static void generate_virtual_quote(
+    PlatformAttestationReportData& report_data,
+    RetrieveEndorsementCallback endorsement_cb,
+    [[maybe_unused]] const snp::EndorsementsServers& endorsements_servers = {})
+  {
+    auto quote = files::slurp_json(virtual_attestation_path("measurement"));
+    quote["report_data"] = ccf::crypto::b64_from_raw(report_data.data);
+
+    files::dump(quote.dump(2), virtual_attestation_path("attestation"));
+
+    auto dumped_quote = quote.dump();
+    std::vector<uint8_t> quote_vec(dumped_quote.begin(), dumped_quote.end());
+
+    endorsement_cb(
+      {.format = QuoteFormat::insecure_virtual,
+       .quote = quote_vec,
+       .endorsements = {},
+       .uvm_endorsements = {},
+       .endorsed_tcb = {}},
+      {});
+  }
+
+  static void generate_snp_quote(
+    PlatformAttestationReportData& report_data,
+    RetrieveEndorsementCallback endorsement_cb,
+    const snp::EndorsementsServers& endorsements_servers = {})
+  {
+    QuoteInfo node_quote_info = {};
+    node_quote_info.format = QuoteFormat::amd_sev_snp_v1;
+    node_quote_info.quote = snp::get_attestation(report_data)->get_raw();
+    auto report =
+      snp::parse_attestation_report_unverified(node_quote_info.quote);
+
+    if (
+      tav_snp_attestation_report_version(report.get()) <
+      pal::snp::minimum_attestation_version)
+    {
+      throw std::logic_error(fmt::format(
+        "SEV-SNP: attestation version {} is less than the minimum supported "
+        "version {}",
+        tav_snp_attestation_report_version(report.get()),
+        pal::snp::minimum_attestation_version));
+    }
+
+    if (endorsement_cb != nullptr)
+    {
+      endorsement_cb(
+        node_quote_info,
+        snp::make_endorsement_endpoint_configuration(
+          report, endorsements_servers));
+    }
+  }
+
+  static void generate_quote(
+    PlatformAttestationReportData& report_data,
+    RetrieveEndorsementCallback endorsement_cb,
+    const snp::EndorsementsServers& endorsements_servers = {})
+  {
+    switch (ccf::pal::platform)
+    {
+      case (ccf::pal::Platform::SNP):
+      {
+        generate_snp_quote(report_data, endorsement_cb, endorsements_servers);
+        return;
+      }
+
+      case (ccf::pal::Platform::Virtual):
+      {
+        generate_virtual_quote(
+          report_data, endorsement_cb, endorsements_servers);
+        return;
+      }
+      case (ccf::pal::Platform::SGX):
+      case (ccf::pal::Platform::Unknown):
+      default:
+      {
+        throw std::logic_error(fmt::format(
+          "Unsupported platform for quote generation: {}", ccf::pal::platform));
+      }
+    }
+  }
+}

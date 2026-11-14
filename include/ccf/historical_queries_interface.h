@@ -16,18 +16,18 @@ namespace ccf::historical
   struct State
   {
     /// Read-only historical store at transaction_id
-    kv::ReadOnlyStorePtr store = nullptr;
+    ccf::kv::ReadOnlyStorePtr store = nullptr;
     /// Receipt for ledger entry at transaction_id
     TxReceiptImplPtr receipt = nullptr;
     /// View and Sequence Number for the State
     ccf::TxID transaction_id;
 
     State(
-      const kv::ReadOnlyStorePtr& store_,
-      const TxReceiptImplPtr& receipt_,
+      ccf::kv::ReadOnlyStorePtr store_,
+      TxReceiptImplPtr receipt_,
       const ccf::TxID& transaction_id_) :
-      store(store_),
-      receipt(receipt_),
+      store(std::move(store_)),
+      receipt(std::move(receipt_)),
       transaction_id(transaction_id_)
     {}
 
@@ -47,7 +47,13 @@ namespace ccf::historical
    */
   using RequestHandle = size_t;
 
+  /** Query retention duration. Queries throw std::overflow_error if the
+   * duration or resulting deadline cannot fit in the cache's millisecond
+   * clock.
+   */
   using ExpiryDuration = std::chrono::seconds;
+
+  using CacheSize = size_t;
 
   /** Stores the progress of historical query requests.
    *
@@ -64,7 +70,7 @@ namespace ccf::historical
   class AbstractStateCache : public ccf::AbstractNodeSubSystem
   {
   public:
-    virtual ~AbstractStateCache() = default;
+    ~AbstractStateCache() override = default;
 
     static char const* get_subsystem_name()
     {
@@ -78,6 +84,13 @@ namespace ccf::historical
      */
     virtual void set_default_expiry_duration(
       ExpiryDuration seconds_until_expiry) = 0;
+
+    /** Set the cache limit (in bytes) to evict least recently used requests
+     * from the cache after its size grows beyond this limit. The limit is not
+     * strict. It is estimated based on serialized states' sizes approximation
+     * and is checked once per tick, and so it can overflow for a short time.
+     */
+    virtual void set_soft_cache_limit(CacheSize cache_limit) = 0;
 
     /** EXPERIMENTAL: Set the tracking of deletes on missing keys for historical
      * queries.
@@ -93,7 +106,7 @@ namespace ccf::historical
      * is equivalent to get_store_at(handle, seqno, seqno), but returns nullptr
      * if the state is currently unavailable.
      */
-    virtual kv::ReadOnlyStorePtr get_store_at(
+    virtual ccf::kv::ReadOnlyStorePtr get_store_at(
       RequestHandle handle,
       ccf::SeqNo seqno,
       ExpiryDuration seconds_until_expiry) = 0;
@@ -101,7 +114,7 @@ namespace ccf::historical
     /** Same as @c get_store_at but uses default expiry value.
      * @see get_store_at
      */
-    virtual kv::ReadOnlyStorePtr get_store_at(
+    virtual ccf::kv::ReadOnlyStorePtr get_store_at(
       RequestHandle handle, ccf::SeqNo seqno) = 0;
 
     /** Retrieve a full state at a given seqno, including the Store, the TxID
@@ -135,7 +148,7 @@ namespace ccf::historical
      * vector will be of length (end_seqno - start_seqno + 1) and will contain
      * no nullptrs.
      */
-    virtual std::vector<kv::ReadOnlyStorePtr> get_store_range(
+    virtual std::vector<ccf::kv::ReadOnlyStorePtr> get_store_range(
       RequestHandle handle,
       ccf::SeqNo start_seqno,
       ccf::SeqNo end_seqno,
@@ -144,7 +157,7 @@ namespace ccf::historical
     /** Same as @c get_store_range but uses default expiry value.
      * @see get_store_range
      */
-    virtual std::vector<kv::ReadOnlyStorePtr> get_store_range(
+    virtual std::vector<ccf::kv::ReadOnlyStorePtr> get_store_range(
       RequestHandle handle, ccf::SeqNo start_seqno, ccf::SeqNo end_seqno) = 0;
 
     /** Retrieve a range of states at the given indices, including the Store,
@@ -165,11 +178,11 @@ namespace ccf::historical
 
     /** Retrieve stores for a set of given indices.
      */
-    virtual std::vector<kv::ReadOnlyStorePtr> get_stores_for(
+    virtual std::vector<ccf::kv::ReadOnlyStorePtr> get_stores_for(
       RequestHandle handle,
       const SeqNoCollection& seqnos,
       ExpiryDuration seconds_until_expiry) = 0;
-    virtual std::vector<kv::ReadOnlyStorePtr> get_stores_for(
+    virtual std::vector<ccf::kv::ReadOnlyStorePtr> get_stores_for(
       RequestHandle handle, const SeqNoCollection& seqnos) = 0;
 
     /** Retrieve states for a set of given indices.
@@ -187,5 +200,9 @@ namespace ccf::historical
      * more aggressively than waiting for the states to expire.
      */
     virtual bool drop_cached_states(RequestHandle handle) = 0;
+
+    /** Get the estimated size in bytes of all cached stores.
+     */
+    virtual size_t get_estimated_store_cache_size() = 0;
   };
 }

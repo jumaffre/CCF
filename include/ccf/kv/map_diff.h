@@ -4,23 +4,23 @@
 
 #include "ccf/kv/untyped_map_diff.h"
 
-namespace kv
+namespace ccf::kv
 {
   template <typename K, typename V, typename KSerialiser, typename VSerialiser>
   class MapDiff : public AbstractHandle
   {
   protected:
-    kv::untyped::MapDiff map_diff;
+    friend class ccf::kv::BaseTx;
+
+    ccf::kv::untyped::MapDiff map_diff;
+
+    MapDiff(ccf::kv::untyped::ChangeSet& changes, const std::string& map_name) :
+      map_diff(changes, map_name)
+    {}
 
   public:
     using KeyType = K;
     using ValueType = V;
-
-    MapDiff(kv::untyped::MapDiff map_diff_) : map_diff(map_diff_) {}
-
-    MapDiff(kv::untyped::ChangeSet& changes, const std::string& map_name) :
-      map_diff(changes, map_name)
-    {}
 
     /** Get value for key.
      *
@@ -39,6 +39,9 @@ namespace kv
         {
           return VSerialiser::from_serialised(opt_v_rep.value().value());
         }
+
+        // Key was deleted by this transaction.
+        return std::optional<V>(std::nullopt);
       }
 
       return std::nullopt;
@@ -82,12 +85,12 @@ namespace kv
      * should continue (true) or stop (false)
      */
     template <class F>
-    void foreach(F&& f)
+    void foreach(F&& f) // NOLINT(cppcoreguidelines-missing-std-forward)
     {
       const auto& g =
         [&](
-          const kv::serialisers::SerialisedEntry& k_rep,
-          const std::optional<kv::serialisers::SerialisedEntry>& v_rep)
+          const ccf::kv::serialisers::SerialisedEntry& k_rep,
+          const std::optional<ccf::kv::serialisers::SerialisedEntry>& v_rep)
         -> bool {
         const auto k = KSerialiser::from_serialised(k_rep);
         if (v_rep.has_value())
@@ -96,11 +99,8 @@ namespace kv
             VSerialiser::from_serialised(v_rep.value());
           return f(k, v);
         }
-        else
-        {
-          const std::optional<V> v = std::nullopt;
-          return f(k, v);
-        }
+        const std::optional<V> v = std::nullopt;
+        return f(k, v);
       };
       map_diff.foreach(g);
     }
@@ -113,11 +113,11 @@ namespace kv
      * (true) or stop (false)
      */
     template <class F>
-    void foreach_key(F&& f)
+    void foreach_key(F&& f) // NOLINT(cppcoreguidelines-missing-std-forward)
     {
       auto g = [&](
-                 const kv::serialisers::SerialisedEntry& k_rep,
-                 const kv::serialisers::SerialisedEntry&) {
+                 const ccf::kv::serialisers::SerialisedEntry& k_rep,
+                 const std::optional<ccf::kv::serialisers::SerialisedEntry>&) {
         return f(KSerialiser::from_serialised(k_rep));
       };
       map_diff.foreach(g);
@@ -131,19 +131,21 @@ namespace kv
      * continue (true) or stop (false)
      */
     template <class F>
-    void foreach_value(F&& f)
+    void foreach_value(F&& f) // NOLINT(cppcoreguidelines-missing-std-forward)
     {
-      auto g = [&](
-                 const kv::serialisers::SerialisedEntry&,
-                 const std::optional<kv::serialisers::SerialisedEntry>& v_rep) {
+      auto g =
+        [&](
+          const ccf::kv::serialisers::SerialisedEntry&,
+          const std::optional<ccf::kv::serialisers::SerialisedEntry>& v_rep)
+        -> bool {
         if (v_rep.has_value())
         {
-          return f(VSerialiser::from_serialised(v_rep));
+          const std::optional<V> v =
+            VSerialiser::from_serialised(v_rep.value());
+          return f(v);
         }
-        else
-        {
-          return f(std::nullopt);
-        }
+        const std::optional<V> v = std::nullopt;
+        return f(v);
       };
       map_diff.foreach(g);
     }

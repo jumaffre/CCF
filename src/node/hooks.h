@@ -2,11 +2,13 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ds/logger.h"
+#include "ccf/reconfiguration_type.h"
 #include "ccf/service/node_info_network.h"
-#include "enclave/reconfiguration_type.h"
+#include "ds/internal_logger.h"
 #include "service/tables/config.h"
 #include "service/tables/signatures.h"
+
+#include <stdexcept>
 
 namespace ccf
 {
@@ -16,26 +18,38 @@ namespace ccf
     std::string port;
   };
 
-  class ConfigurationChangeHook : public kv::ConsensusHook
+  class ConfigurationChangeHook : public ccf::kv::ConsensusHook
   {
-    kv::Version version;
+    ccf::kv::Version version;
     std::map<NodeId, std::optional<NodeAddr>> cfg_delta;
-    std::unordered_set<NodeId> learners;
-    std::unordered_set<NodeId> retired_nodes;
+    std::vector<NodeId> retired_committed;
 
   public:
-    ConfigurationChangeHook(kv::Version version_, const Nodes::Write& w) :
+    ConfigurationChangeHook(ccf::kv::Version version_, const Nodes::Write& w) :
       version(version_)
     {
       for (const auto& [node_id, opt_ni] : w)
       {
         if (!opt_ni.has_value())
         {
-          // Deleted node will have already been retired
+          // A node is normally written as RETIRED before its row is deleted,
+          // and that RETIRED write already removes it from consensus. Disaster
+          // recovery is different: replaying the public ledger rebuilds the
+          // previous service's trusted-node configuration in the new consensus
+          // instance, then the recovery create transaction deletes those rows
+          // directly. The deletions must therefore also remove the old nodes
+          // from consensus, or they remain voters and the recovery nodes may be
+          // unable to elect a primary. If a node was already retired, erasing
+          // it from the configuration is a no-op.
+          cfg_delta.try_emplace(node_id, std::nullopt);
           continue;
         }
 
         const auto& ni = opt_ni.value();
+        if (ni.retired_committed)
+        {
+          retired_committed.push_back(node_id);
+        }
         const auto [host, port] =
           split_net_address(ni.node_to_node_interface.published_address);
         switch (ni.status)
@@ -54,34 +68,47 @@ namespace ccf
           case NodeStatus::RETIRED:
           {
             cfg_delta.try_emplace(node_id, std::nullopt);
-            retired_nodes.insert(node_id);
             break;
           }
           default:
           {
+            throw std::logic_error(fmt::format(
+              "Unknown node status {} for node {} in configuration change hook",
+              static_cast<uint8_t>(ni.status),
+              node_id));
           }
         }
       }
     }
 
-    void call(kv::ConfigurableConsensus* consensus) override
+    // Called under the consensus lock when the write is replicated or applied,
+    // and without it when installing a snapshot or recovering a public ledger.
+    // Traces retired_committed nodes before any add_configuration.
+    void call(ccf::kv::ConfigurableConsensus* consensus) override
     {
+      if (!retired_committed.empty())
+      {
+        consensus->trace_retired_committed_tx(version, retired_committed);
+      }
+
       auto configuration = consensus->get_latest_configuration_unsafe();
+      bool configuration_changed = false;
       for (const auto& [node_id, opt_ni] : cfg_delta)
       {
         if (opt_ni.has_value())
         {
-          configuration.try_emplace(node_id, opt_ni->hostname, opt_ni->port);
+          configuration_changed |=
+            configuration.try_emplace(node_id, opt_ni->hostname, opt_ni->port)
+              .second;
         }
         else
         {
-          configuration.erase(node_id);
+          configuration_changed |= configuration.erase(node_id) > 0;
         }
       }
-      if (!cfg_delta.empty())
+      if (configuration_changed)
       {
-        consensus->add_configuration(
-          version, configuration, learners, retired_nodes);
+        consensus->add_configuration(version, configuration);
       }
     }
   };

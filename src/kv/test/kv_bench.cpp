@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the Apache 2.0 License.
-#define PICOBENCH_IMPLEMENT_WITH_MAIN
+#define PICOBENCH_IMPLEMENT
 
+#include "crypto/openssl/hash.h"
 #include "kv/store.h"
 #include "kv/test/stub_consensus.h"
 #include "node/encryptor.h"
@@ -9,9 +10,9 @@
 #include <picobench/picobench.hpp>
 #include <string>
 
-using KeyType = kv::serialisers::SerialisedEntry;
-using ValueType = kv::serialisers::SerialisedEntry;
-using MapType = kv::untyped::Map;
+using KeyType = ccf::kv::serialisers::SerialisedEntry;
+using ValueType = ccf::kv::serialisers::SerialisedEntry;
+using MapType = ccf::kv::untyped::Map;
 
 inline void clobber_memory()
 {
@@ -38,23 +39,24 @@ std::shared_ptr<ccf::LedgerSecrets> create_ledger_secrets()
   return secrets;
 }
 
-std::string build_map_name(const std::string& core_name, kv::SecurityDomain sd)
+std::string build_map_name(
+  const std::string& core_name, ccf::kv::SecurityDomain sd)
 {
-  if (sd == kv::SecurityDomain::PUBLIC)
+  if (sd == ccf::kv::SecurityDomain::PUBLIC)
   {
-    return fmt::format("{}{}", kv::public_domain_prefix, core_name);
+    return fmt::format("{}{}", ccf::kv::public_domain_prefix, core_name);
   }
 
   return core_name;
 }
 
 // Test functions
-template <kv::SecurityDomain SD>
+template <ccf::kv::SecurityDomain SD>
 static void serialise(picobench::state& s)
 {
-  logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
   auto secrets = create_ledger_secrets();
   auto encryptor = std::make_shared<ccf::NodeEncryptor>(secrets);
   kv_store.set_encryptor(encryptor);
@@ -76,20 +78,52 @@ static void serialise(picobench::state& s)
 
   s.start_timer();
   auto rc = tx.commit();
-  if (rc != kv::CommitResult::SUCCESS)
+  if (rc != ccf::kv::CommitResult::SUCCESS)
     throw std::logic_error("Transaction commit failed: " + std::to_string(rc));
   s.stop_timer();
 }
 
-template <kv::SecurityDomain SD>
+template <ccf::kv::SecurityDomain SD>
+static void serialise_small(picobench::state& s)
+{
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
+  ccf::kv::Store kv_store;
+  auto encryptor =
+    std::make_shared<ccf::NodeEncryptor>(create_ledger_secrets());
+  kv_store.set_encryptor(encryptor);
+  const auto map_name = build_map_name("small", SD);
+
+  std::vector<KeyType> keys;
+  std::vector<ValueType> values;
+  for (int i = 0; i < s.iterations(); ++i)
+  {
+    keys.push_back(gen_key(i));
+    values.push_back(gen_value(i));
+  }
+
+  s.start_timer();
+  for (auto _ : s)
+  {
+    auto tx = kv_store.create_tx();
+    tx.rw<MapType>(map_name)->put(keys[_], values[_]);
+    if (tx.commit() != ccf::kv::CommitResult::SUCCESS)
+    {
+      throw std::logic_error("Transaction commit failed");
+    }
+    clobber_memory();
+  }
+  s.stop_timer();
+}
+
+template <ccf::kv::SecurityDomain SD>
 static void deserialise(picobench::state& s)
 {
-  logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
-  kv::Store kv_store;
-  kv::Store kv_store2;
+  ccf::kv::Store kv_store;
+  ccf::kv::Store kv_store2;
 
-  auto consensus = std::make_shared<kv::test::StubConsensus>();
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
   kv_store.set_consensus(consensus);
 
   auto secrets = create_ledger_secrets();
@@ -116,18 +150,65 @@ static void deserialise(picobench::state& s)
   s.start_timer();
   auto rc =
     kv_store2.deserialize(consensus->get_latest_data().value())->apply();
-  if (rc != kv::ApplyResult::PASS)
+  if (rc != ccf::kv::ApplyResult::PASS)
     throw std::logic_error(
       "Transaction deserialisation failed: " + std::to_string(rc));
   s.stop_timer();
 }
 
+// Mirrors an indexing strategy: an entry is deserialised into a fresh store,
+// and its changes are then read once through a TxDiff
+static void tx_diff(picobench::state& s)
+{
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
+
+  ccf::kv::Store kv_store;
+  ccf::kv::Store kv_store2;
+
+  auto consensus = std::make_shared<ccf::kv::test::StubConsensus>();
+  kv_store.set_consensus(consensus);
+
+  auto secrets = create_ledger_secrets();
+  auto encryptor = std::make_shared<ccf::NodeEncryptor>(secrets);
+  kv_store.set_encryptor(encryptor);
+  kv_store2.set_encryptor(encryptor);
+
+  const auto map0 = build_map_name("map0", ccf::kv::SecurityDomain::PUBLIC);
+
+  auto tx = kv_store.create_tx();
+  auto tx0 = tx.rw<MapType>(map0);
+  for (int i = 0; i < s.iterations(); i++)
+  {
+    tx0->put(gen_key(i), gen_value(i));
+  }
+  tx.commit();
+
+  auto rc =
+    kv_store2.deserialize(consensus->get_latest_data().value())->apply(true);
+  if (rc != ccf::kv::ApplyResult::PASS)
+    throw std::logic_error(
+      "Transaction deserialisation failed: " + std::to_string(rc));
+
+  s.start_timer();
+  auto diff_tx = kv_store2.create_tx_diff();
+  size_t count = 0;
+  diff_tx.diff<MapType>(map0)->foreach(
+    [&count](const KeyType&, const std::optional<ValueType>&) {
+      ++count;
+      return true;
+    });
+  s.stop_timer();
+
+  if (count != static_cast<size_t>(s.iterations()))
+    throw std::logic_error("Diff visited unexpected number of entries");
+}
+
 template <size_t S>
 static void commit_latency(picobench::state& s)
 {
-  logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
   auto secrets = create_ledger_secrets();
   auto encryptor = std::make_shared<ccf::NodeEncryptor>(secrets);
   kv_store.set_encryptor(encryptor);
@@ -140,7 +221,7 @@ static void commit_latency(picobench::state& s)
     auto tx = kv_store.create_tx();
     auto tx0 = tx.rw<MapType>(map0);
     auto tx1 = tx.rw<MapType>(map1);
-    for (int iTx = 0; iTx < S; iTx++)
+    for (size_t iTx = 0; iTx < S; iTx++)
     {
       const auto key = gen_key(i, std::to_string(iTx));
       const auto value = gen_value(i);
@@ -149,7 +230,7 @@ static void commit_latency(picobench::state& s)
     }
 
     auto rc = tx.commit();
-    if (rc != kv::CommitResult::SUCCESS)
+    if (rc != ccf::kv::CommitResult::SUCCESS)
     {
       throw std::logic_error(
         "Transaction commit failed: " + std::to_string(rc));
@@ -163,9 +244,9 @@ static void commit_latency(picobench::state& s)
 template <size_t KEY_COUNT>
 static void ser_snap(picobench::state& s)
 {
-  logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
-  kv::Store kv_store;
+  ccf::kv::Store kv_store;
   auto secrets = create_ledger_secrets();
   auto encryptor = std::make_shared<ccf::NodeEncryptor>(secrets);
   kv_store.set_encryptor(encryptor);
@@ -174,7 +255,7 @@ static void ser_snap(picobench::state& s)
   for (int i = 0; i < s.iterations(); i++)
   {
     auto handle = tx.rw<MapType>(fmt::format("map{}", i));
-    for (int j = 0; j < KEY_COUNT; j++)
+    for (size_t j = 0; j < KEY_COUNT; j++)
     {
       const auto key = gen_key(j);
       const auto value = gen_value(j);
@@ -184,14 +265,14 @@ static void ser_snap(picobench::state& s)
   }
 
   auto rc = tx.commit();
-  if (rc != kv::CommitResult::SUCCESS)
+  if (rc != ccf::kv::CommitResult::SUCCESS)
     throw std::logic_error("Transaction commit failed: " + std::to_string(rc));
 
   s.start_timer();
 
-  std::unique_ptr<kv::AbstractStore::AbstractSnapshot> snap = nullptr;
+  std::unique_ptr<ccf::kv::AbstractStore::AbstractSnapshot> snap = nullptr;
   {
-    kv::ScopedStoreMapsLock maps_lock(&kv_store);
+    ccf::kv::ScopedStoreMapsLock maps_lock(&kv_store);
     snap = kv_store.snapshot_unsafe_maps(tx.commit_version());
   }
   kv_store.serialise_snapshot(std::move(snap));
@@ -201,10 +282,10 @@ static void ser_snap(picobench::state& s)
 template <size_t KEY_COUNT>
 static void des_snap(picobench::state& s)
 {
-  logger::config::level() = LoggerLevel::INFO;
+  ccf::logger::config::level() = ccf::LoggerLevel::INFO;
 
-  kv::Store kv_store;
-  kv::Store kv_store2;
+  ccf::kv::Store kv_store;
+  ccf::kv::Store kv_store2;
   auto secrets = create_ledger_secrets();
   auto encryptor = std::make_shared<ccf::NodeEncryptor>(secrets);
   kv_store.set_encryptor(encryptor);
@@ -214,7 +295,7 @@ static void des_snap(picobench::state& s)
   for (int i = 0; i < s.iterations(); i++)
   {
     auto handle = tx.rw<MapType>(fmt::format("map{}", i));
-    for (int j = 0; j < KEY_COUNT; j++)
+    for (size_t j = 0; j < KEY_COUNT; j++)
     {
       const auto key = gen_key(j);
       const auto value = gen_value(j);
@@ -224,17 +305,17 @@ static void des_snap(picobench::state& s)
   }
 
   auto rc = tx.commit();
-  if (rc != kv::CommitResult::SUCCESS)
+  if (rc != ccf::kv::CommitResult::SUCCESS)
     throw std::logic_error("Transaction commit failed: " + std::to_string(rc));
 
-  std::unique_ptr<kv::AbstractStore::AbstractSnapshot> snap = nullptr;
+  std::unique_ptr<ccf::kv::AbstractStore::AbstractSnapshot> snap = nullptr;
   {
-    kv::ScopedStoreMapsLock maps_lock(&kv_store);
+    ccf::kv::ScopedStoreMapsLock maps_lock(&kv_store);
     snap = kv_store.snapshot_unsafe_maps(tx.commit_version());
   }
   auto serialised_snap = kv_store.serialise_snapshot(std::move(snap));
 
-  kv::ConsensusHookPtrs hooks;
+  ccf::kv::ConsensusHookPtrs hooks;
   s.start_timer();
   kv_store2.deserialise_snapshot(
     serialised_snap.data(), serialised_snap.size(), hooks);
@@ -244,11 +325,11 @@ static void des_snap(picobench::state& s)
 const std::vector<int> tx_count = {10, 100, 1000};
 const uint32_t sample_size = 100;
 
-using SD = kv::SecurityDomain;
+using SD = ccf::kv::SecurityDomain;
 
 PICOBENCH_SUITE("commit_latency");
-PICOBENCH(commit_latency<10>).iterations(tx_count).samples(10).baseline();
-PICOBENCH(commit_latency<100>).iterations(tx_count).samples(10);
+PICOBENCH(commit_latency<10>).iterations(tx_count).baseline();
+PICOBENCH(commit_latency<100>).iterations(tx_count);
 
 PICOBENCH_SUITE("serialise");
 PICOBENCH(serialise<SD::PUBLIC>)
@@ -257,6 +338,15 @@ PICOBENCH(serialise<SD::PUBLIC>)
   .baseline();
 PICOBENCH(serialise<SD::PRIVATE>).iterations(tx_count).samples(sample_size);
 
+PICOBENCH_SUITE("serialise small transactions");
+PICOBENCH(serialise_small<SD::PUBLIC>)
+  .iterations({100, 1000})
+  .samples(sample_size)
+  .baseline();
+PICOBENCH(serialise_small<SD::PRIVATE>)
+  .iterations({100, 1000})
+  .samples(sample_size);
+
 PICOBENCH_SUITE("deserialise");
 PICOBENCH(deserialise<SD::PUBLIC>)
   .iterations(tx_count)
@@ -264,19 +354,22 @@ PICOBENCH(deserialise<SD::PUBLIC>)
   .baseline();
 PICOBENCH(deserialise<SD::PRIVATE>).iterations(tx_count).samples(sample_size);
 
-const uint32_t snapshot_sample_size = 10;
+PICOBENCH_SUITE("tx_diff");
+PICOBENCH(tx_diff).iterations(tx_count).samples(sample_size);
+
 const std::vector<int> map_count = {20, 100};
 
 PICOBENCH_SUITE("serialise_snapshot");
-PICOBENCH(ser_snap<100>)
-  .iterations(map_count)
-  .samples(snapshot_sample_size)
-  .baseline();
-PICOBENCH(ser_snap<1000>).iterations(map_count).samples(snapshot_sample_size);
+PICOBENCH(ser_snap<100>).iterations(map_count).baseline();
+PICOBENCH(ser_snap<1000>).iterations(map_count);
 
 PICOBENCH_SUITE("deserialise_snapshot");
-PICOBENCH(des_snap<100>)
-  .iterations(map_count)
-  .samples(snapshot_sample_size)
-  .baseline();
-PICOBENCH(des_snap<1000>).iterations(map_count).samples(snapshot_sample_size);
+PICOBENCH(des_snap<100>).iterations(map_count).baseline();
+PICOBENCH(des_snap<1000>).iterations(map_count);
+
+int main(int argc, char** argv)
+{
+  picobench::runner runner;
+  runner.parse_cmd_line(argc, argv);
+  return runner.run();
+}

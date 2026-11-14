@@ -1,26 +1,22 @@
-wheel
-paramiko
-loguru
-psutil
-cimetrics>=0.2.1
-openapi-spec-validator
-PyJWT
-docutils
-python-iptables
-py-spy
-GitPython
-docker
-better_exceptions
-pyasn1
-Jinja2
-httpx[http2] == 0.23.*
-locust
-pyOpenSSL
-grpcio-tools == 1.44.0 # Pin to a working version for SNP platform
-JWCrypto
-pycose
-# Piccolo dependencies
-fastparquet==2023.*
-prettytable==3.*
-polars
-plotext
+wheel >= 0.46.2, < 0.47
+loguru >= 0.7.3, < 0.8
+openapi-spec-validator >= 0.7.2, < 0.8
+openapi-core >= 0.19.5, < 0.20
+PyJWT >= 2.10.0, < 3
+docutils >= 0.22.2, < 0.23
+GitPython >= 3.1.45, < 4
+better_exceptions >= 0.3.3, < 0.4
+pyasn1 >= 0.6.1, < 0.7
+Jinja2 >= 3.1.6, < 4
+httpx[http2] >= 0.28.1, < 0.29
+locust >= 2.41.6, < 3
+msgpack >= 1.1.0, < 2
+JWCrypto >= 1.5.6, < 2
+rich >= 14.2.0, < 15
+gelidum >= 0.9.1, < 1
+matplotlib >= 3.10.7, < 4
+polars >= 1.41.2, < 2
+boofuzz >= 0.4.2, < 0.5
+numpy >= 1.26.4, < 2
+cwt >= 4.0.0, < 5
+aiohttp >= 3.13.0, < 4

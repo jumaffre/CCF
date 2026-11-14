@@ -1,24 +1,113 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
-from hashlib import md5
+import http
 import itertools
+import json
+import os
+import re
 import time
+from hashlib import sha256
 
+import infra.checker
+import infra.e2e_args
+import infra.net
 import infra.network
 import infra.proc
-import infra.net
-import infra.checker
 import suite.test_requirements as reqs
-import infra.e2e_args
-
 from loguru import logger as LOG
 
 id_gen = itertools.count()
 
+SIZE_SUFFIXES = {
+    "": 1,
+    "b": 1,
+    "kb": 1024,
+    "mb": 1024**2,
+    "gb": 1024**3,
+    "tb": 1024**4,
+    "pb": 1024**5,
+}
+
+
+def size_string_to_bytes(size):
+    match = re.fullmatch(r"(\d+)([a-zA-Z]*)", size)
+    if match is None:
+        raise ValueError(f"Invalid size string: {size}")
+
+    value, suffix = match.groups()
+    try:
+        multiplier = SIZE_SUFFIXES[suffix.lower()]
+    except KeyError as e:
+        raise ValueError(f"Invalid size suffix: {suffix}") from e
+    return int(value) * multiplier
+
+
+def get_node_response_sizes(node):
+    config_path = os.path.join(node.common_dir, f"{node.local_node_id}.config.json")
+    with open(config_path, encoding="utf-8") as f:
+        config = json.load(f)
+
+    large_response_size = 16 * 1024 * 1024
+    max_message_size = size_string_to_bytes(config["ledger"]["max_read_size"])
+
+    return (
+        large_response_size,
+        # Leave headroom for the QuickJS string and response serialization.
+        max_message_size // 2,
+    )
+
+
+@reqs.description("Generate large responses")
+def test_large_responses(network, args):
+    primary, _ = network.find_primary()
+    large_response_size, max_response_size = get_node_response_sizes(primary)
+    large_response_sizes = (large_response_size, max_response_size)
+    invalid_response_sizes = (-1, 1.5, max_response_size + 1)
+
+    with primary.client("member0") as c:
+        response = c.post(
+            "/app/batch/generate/config",
+            {"max_response_size": max_response_size},
+        )
+        assert response.status_code == http.HTTPStatus.NO_CONTENT, (
+            f"Expected {http.HTTPStatus.NO_CONTENT}, got {response.status_code}: "
+            f"{response.body.data()[:200]!r}"
+        )
+
+    with primary.client("user0") as c:
+        for response_size in large_response_sizes:
+            LOG.info(f"Generating a {response_size} byte response")
+            response = c.post(
+                "/app/batch/generate", {"size": response_size}, timeout=30
+            )
+            assert response.status_code == http.HTTPStatus.OK, (
+                f"Expected {http.HTTPStatus.OK}, got {response.status_code}: "
+                f"{response.body.data()[:200]!r}"
+            )
+            body = response.body.data()
+            assert len(body) == response_size
+            assert body[:1] == b"X"
+            assert body[-1:] == b"X"
+
+        for response_size in invalid_response_sizes:
+            response = c.post("/app/batch/generate", {"size": response_size})
+            assert response.status_code == http.HTTPStatus.BAD_REQUEST, (
+                f"Expected {http.HTTPStatus.BAD_REQUEST}, got {response.status_code}: "
+                f"{response.body.data()[:200]!r}"
+            )
+
+    return network, large_response_size
+
 
 @reqs.description("Running batch submission of new entries")
-@reqs.supports_methods("/app/batch/submit", "/app/batch/fetch")
-def test(network, args, batch_size=100, write_key_divisor=1, write_size_multiplier=1):
+def test(
+    network,
+    args,
+    batch_size=100,
+    write_key_divisor=1,
+    write_size_multiplier=1,
+    expect_transaction_too_large=False,
+):
     LOG.info(f"Number of batched entries: {batch_size}")
     primary, _ = network.find_primary()
 
@@ -28,23 +117,29 @@ def test(network, args, batch_size=100, write_key_divisor=1, write_size_multipli
 
         message_ids = [next(id_gen) for _ in range(batch_size)]
         messages = [
-            {"id": i, "msg": f"A unique message: {md5(bytes(i)).hexdigest()}"}
+            {"id": i, "msg": f"A unique message: {sha256(i.to_bytes(8)).hexdigest()}"}
             for i in message_ids
         ]
 
         pre_submit = time.time()
-        check(
-            c.post(
-                "/app/batch/submit",
-                {
-                    "entries": messages,
-                    "write_key_divisor": write_key_divisor,
-                    "write_size_multiplier": write_size_multiplier,
-                },
-                timeout=30,
-            ),
-            result=len(messages),
+        response = c.post(
+            "/app/batch/submit",
+            {
+                "entries": messages,
+                "write_key_divisor": write_key_divisor,
+                "write_size_multiplier": write_size_multiplier,
+            },
+            timeout=30,
         )
+
+        if expect_transaction_too_large:
+            assert (
+                response.status_code == http.HTTPStatus.REQUEST_ENTITY_TOO_LARGE.value
+            )
+            assert response.body.json()["error"]["code"] == "TransactionTooLarge"
+            return network
+
+        check(response, result=len(messages))
         post_submit = time.time()
         LOG.warning(
             f"Submitting {batch_size} new keys took {post_submit - pre_submit}s"
@@ -60,10 +155,11 @@ def test(network, args, batch_size=100, write_key_divisor=1, write_size_multipli
 
 def run(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
+        network, large_response_size = test_large_responses(network, args)
         network = test(network, args, batch_size=1)
         network = test(network, args, batch_size=10)
         network = test(network, args, batch_size=100)
@@ -89,55 +185,44 @@ def run(args):
         #     network = test(network, args, batch_size=bs)
         #     bs += step_size
 
+        return large_response_size
 
-def run_to_destruction(args):
+
+def run_to_transaction_limit(args):
     with infra.network.network(
-        args.nodes, args.binary_dir, args.debug_nodes, args.perf_nodes, pdb=args.pdb
+        args.nodes, args.binary_dir, args.debug_nodes, pdb=args.pdb
     ) as network:
         network.start_and_open(args)
 
-        LOG.warning("About to issue transactions until destruction")
-        try:
-            wsm = 5000
-            while True:
-                LOG.info(f"Trying with writes scaled by {wsm}")
-                network = test(network, args, batch_size=10, write_size_multiplier=wsm)
-                if wsm > 1000000:
-                    LOG.error(
-                        f"Run to destruction still hasn't caused exception with write sizes multiplied by {wsm}. Infinite loop, or not actually submitting?"
-                    )
-                    raise ValueError(wsm)
-                else:
-                    wsm += 50000  # Grow very quickly, expect to fail on the second iteration
+        LOG.warning("About to issue a transaction above the configured limit")
+        network = test(network, args, batch_size=10, write_size_multiplier=5000)
+        network = test(
+            network,
+            args,
+            batch_size=10,
+            write_size_multiplier=105000,
+            expect_transaction_too_large=True,
+        )
 
-        except Exception as e:
-            timeout = 10
+        exit_codes = [node.remote.remote.proc.poll() for node in network.nodes]
+        assert all(exit_code is None for exit_code in exit_codes), exit_codes
 
-            LOG.info("Large write set caused an exception, as expected")
-            LOG.info(f"Exception was: {e}")
-            LOG.info(f"Polling for {timeout}s for node to terminate")
-
-            end_time = time.time() + timeout
-            while time.time() < end_time:
-                time.sleep(0.1)
-                exit_code = network.nodes[0].remote.remote.proc.poll()
-                if exit_code is not None:
-                    LOG.info(f"Node terminated with exit code {exit_code}")
-                    assert exit_code != 0
-                    break
-
-            if time.time() > end_time:
-                raise TimeoutError(
-                    f"Node took longer than {timeout}s to terminate"
-                ) from e
-
-            network.ignore_errors_on_shutdown()
+        # The rejected transaction must not prevent subsequent commits.
+        network = test(network, args, batch_size=10)
 
 
 if __name__ == "__main__":
     args = infra.e2e_args.cli_args()
-    args.package = "libjs_generic"
+    args.package = "js_generic"
     args.nodes = infra.e2e_args.min_nodes(args, f=1)
 
-    run(args)
-    run_to_destruction(args)
+    large_response_size = run(args)
+
+    # Keep this stress test's successful write below the configured transaction
+    # limit while allowing the next, much larger write to exercise clean
+    # rejection.
+    args.ledger_max_read_bytes = f"{large_response_size}"
+    args.node_to_node_max_message_bytes = f"{large_response_size}"
+    args.ledger_max_transaction_bytes = f"{1024 * 1024 * 15}"  # 15MB
+
+    run_to_transaction_limit(args)

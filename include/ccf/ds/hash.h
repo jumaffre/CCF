@@ -6,11 +6,11 @@
 
 #include <array>
 #include <cstdint>
-#include <small_vector/SmallVector.h>
+#include <functional>
 #include <string_view>
 #include <vector>
 
-namespace ds::hashutils
+namespace ccf::ds::hashutils
 {
   template <typename T>
   inline void hash_combine(size_t& n, const T& v, std::hash<T>& h)
@@ -33,6 +33,7 @@ namespace ds::hashutils
   }
 }
 
+// NOLINTBEGIN(cert-dcl58-cpp)
 namespace std
 {
   template <>
@@ -42,9 +43,9 @@ namespace std
     {
       // For cryptographically secure hashing, use SipHash directly with a
       // secret key. For std::hash, we use this fixed key
-      static constexpr siphash::SipKey k{
+      static constexpr ccf::siphash::SipKey k{
         0x7720796f726c694b, 0x2165726568207361};
-      return siphash::siphash<2, 4>(v, k);
+      return ccf::siphash::siphash<2, 4>(v, k);
     }
   };
 
@@ -53,7 +54,7 @@ namespace std
   {
     size_t operator()(const std::vector<T>& v) const
     {
-      return ds::hashutils::hash_container(v);
+      return ccf::ds::hashutils::hash_container(v);
     }
   };
 
@@ -62,7 +63,7 @@ namespace std
   {
     size_t operator()(const std::array<T, N>& v) const
     {
-      return ds::hashutils::hash_container(v);
+      return ccf::ds::hashutils::hash_container(v);
     }
   };
 
@@ -74,10 +75,10 @@ namespace std
       size_t n = 0x444e414c544f4353;
 
       std::hash<A> h_a{};
-      ds::hashutils::hash_combine(n, v.first, h_a);
+      ccf::ds::hashutils::hash_combine(n, v.first, h_a);
 
       std::hash<B> h_b{};
-      ds::hashutils::hash_combine(n, v.second, h_b);
+      ccf::ds::hashutils::hash_combine(n, v.second, h_b);
 
       return n;
     }
@@ -85,10 +86,12 @@ namespace std
 
 }
 
-namespace ds
+// NOLINTEND(cert-dcl58-cpp)
+
+namespace ccf::ds
 {
   /// Simple, fast constexpr hash function (NOT cryptographically sound)
-  namespace
+  namespace fnv
   {
     template <typename T>
     struct fnv_parameters
@@ -112,7 +115,7 @@ namespace ds
   template <typename T>
   static constexpr T fnv_1a(const std::string_view& sv)
   {
-    using params = fnv_parameters<T>;
+    using params = fnv::fnv_parameters<T>;
 
     T hash = params::offset_basis;
 

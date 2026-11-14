@@ -1,5 +1,47 @@
-Example app (C++)
-=================
+C++ Application
+===============
+
+The repository contains a C++ implementation of a simple example application for logging, located in the :ccf_repo:`samples/apps/logging/` folder.
+It is meant to serve as a template for building more useful applications and to showcase core features.
+This page walks through that sample, and describes how to build and package a C++ application.
+
+Logging Sample Overview
+~~~~~~~~~~~~~~~~~~~~~~~
+
+The logging application stores log messages, identified by an integer ``id``, in two key-value maps: a private ``records`` map, whose contents are encrypted on the ledger, and a public ``public:records`` map, whose contents are written to the ledger in the clear.
+
+The core of the application is made up of the following endpoints:
+
+- :http:POST:`/app/log/private` and :http:POST:`/app/log/public`, which write a private or public log message with a given ``id``, for example:
+
+  .. code-block:: json
+
+      {
+          "id": 42,
+          "msg": "A sample private log message"
+      }
+
+  Private messages are encrypted on the ledger, and are only readable by nodes on the network.
+  Public messages are not encrypted, and are readable by anyone with access to the ledger.
+
+- :http:GET:`/app/log/private` and :http:GET:`/app/log/public`, which retrieve the log message with the ``id`` given as a query parameter (for example ``/app/log/private?id=42``), as written by a previous ``POST`` call.
+
+- :http:DELETE:`/app/log/private` and :http:DELETE:`/app/log/public`, which remove the log message with the ``id`` given as a query parameter.
+
+- :http:GET:`/app/log/private/count` and :http:GET:`/app/log/public/count`, which return the number of messages currently stored in each map.
+
+Most of these endpoints also accept an optional ``scope`` query parameter, which stores and reads messages in a separate map (for example ``records-<scope>``) instead of the default one.
+
+The application also contains further endpoints which demonstrate other CCF features, such as historical queries, receipts, indexing, custom authentication policies, and COSE signed statements.
+These are described in the sections below, and the full API is listed in :doc:`example_rpc_api`.
+
+.. toctree::
+   :hidden:
+
+   example_rpc_api
+
+Application Interface
+~~~~~~~~~~~~~~~~~~~~~
 
 A C++ application exposes itself to CCF by implementing:
 
@@ -19,7 +61,7 @@ The Logging example application simply has:
 
 .. note::
 
-    :cpp:type:`kv::Map` tables are the only interface between CCF and the replicated application, and the sole mechanism for it to have distributed state.
+    :cpp:type:`ccf::kv::Map` tables are the only interface between CCF and the replicated application, and the sole mechanism for it to have distributed state.
 
     The Logging application keeps its state in a pair of tables, one containing private encrypted logs and the other containing public unencrypted logs. Their type is defined as:
 
@@ -46,7 +88,7 @@ The Logging example application simply has:
 Application Endpoints
 ~~~~~~~~~~~~~~~~~~~~~
 
-The implementation of :cpp:func:`ccfapp::make_user_endpoints()` should return a subclass of :cpp:class:`ccf::endpoints::EndpointRegistry`, containing the endpoints that constitute the app.
+The implementation of :cpp:func:`ccf::make_user_endpoints()` should return a subclass of :cpp:class:`ccf::endpoints::EndpointRegistry`, containing the endpoints that constitute the app.
 
 .. literalinclude:: ../../samples/apps/logging/logging.cpp
     :language: cpp
@@ -54,7 +96,7 @@ The implementation of :cpp:func:`ccfapp::make_user_endpoints()` should return a 
     :lines: 1
     :dedent:
 
-The logging app defines :cpp:class:`ccfapp::LoggerHandlers`, which creates and installs handler functions or lambdas for several different HTTP endpoints. Each of these functions takes as input the details of the current request (such as the URI which was called, the query string, the request body), interacts with the KV tables using the given :cpp:class:`kv::Tx` object, and returns a result:
+The logging app defines :cpp:class:`ccf::LoggerHandlers`, which creates and installs handler functions or lambdas for several different HTTP endpoints. Each of these functions takes as input the details of the current request (such as the URI which was called, the query string, the request body), interacts with the KV tables using the given :cpp:class:`ccf::kv::Tx` object, and returns a result:
 
 .. literalinclude:: ../../samples/apps/logging/logging.cpp
     :language: cpp
@@ -130,9 +172,17 @@ This produces validation error messages with a low performance overhead, and ens
 Authentication
 ~~~~~~~~~~~~~~
 
-Each endpoint must provide a list of associated authentication policies in the call to ``make_endpoint``. Inside the handler, the caller identity that was constructed by the accepting policy check can be retrieved with ``get_caller`` or ``try_get_caller`` - the latter should be used when multiple policies are present, to detect which policy accepted the request.
+Each endpoint must provide a list of associated authentication policies in the call to ``make_endpoint``.
+Inside the handler, the caller identity that was constructed by the accepting policy check can be retrieved with ``get_caller`` or ``try_get_caller``.
+The latter should be used when multiple policies are present, to detect which policy accepted the request.
+When multiple policies are listed, they are tested in-order, essentially saying that `any` of policy A `or` policy B `or` ... is acceptable.
+To instead form a `conjunction` of policies, such that `all` policies must pass, you may combine them with the ``ccf::AllOfAuthnPolicy`` built-in policy.
 
-For example in the ``/log/private`` endpoint above there is a single policy stating that requests must come from a known user cert, over mutually authenticated TLS. This is one of several built-in policies provided by CCF. These built-in policies will check that the caller's TLS cert is a known user or member identity, or that the request is HTTP signed by a known user or member identity, or that the request contains a JWT signed by a known issuer. Additionally, there is an empty policy which accepts all requests, which should be used as the final policy to declare that the endpoint is optionally authenticated (either an earlier-listed policy passes providing a real caller identity, or the empty policy passes and the endpoint is invoked with no caller identity). To declare that an endpoint has no authentication requirements and should be accessible by any caller, use the special value ``no_auth_required``.
+For example in the ``/log/private`` endpoint above there is a single policy stating that requests must come from a known user cert, over mutually authenticated TLS.
+This is one of several built-in policies provided by CCF.
+These built-in policies will check that the caller's TLS cert is a known user or member identity, or that the request is HTTP signed by a known user or member identity, or that the request contains a JWT signed by a known issuer.
+Additionally, there is an empty policy which accepts all requests, which should be used as the final policy to declare that the endpoint is optionally authenticated (either an earlier-listed policy passes providing a real caller identity, or the empty policy passes and the endpoint is invoked with no caller identity). 
+To declare that an endpoint has no authentication requirements and should be accessible by any caller, use the special value ``no_auth_required``.
 
 Applications can extend this system by writing their own authentication policies. There is an example of this in the C++ logging app. First it defines a type describing the identity details it aims to find in an acceptable request:
 
@@ -182,7 +232,7 @@ This app can then define its own endpoints from a blank slate. If it wants to pr
 Historical Queries
 ~~~~~~~~~~~~~~~~~~
 
-This sample demonstrates how to define a historical query endpoint with the help of :cpp:func:`ccf::historical::adapter_v3`.
+This sample demonstrates how to define a historical query endpoint with the help of :cpp:func:`ccf::historical::read_only_adapter_v4`.
 Most endpoints operate over the `current` state of the KV, but these historical queries operate over `old` state, specifically over the writes made by a previous transaction.
 The adapter handles extracting the target :term:`Transaction ID` from the user's request, and interacting with the :ref:`Historical Queries API <build_apps/api:Historical Queries>` to asynchronously fetch this entry from the ledger.
 The deserialised and verified transaction is then presented to the handler code below, which performs reads and constructs a response like any other handler.
@@ -207,13 +257,23 @@ When this historical query comes in, rather than fetching every transaction - to
 If the response format is known, the index could even pre-construct the response itself.
 
 In CCF, this is achieved by implementing an indexing :cpp:type:`ccf::indexing::Strategy`.
-This is constructed on each node, in-enclave, by processing every committed transaction in-order in the implementation of :cpp:func:`ccf::indexing::Strategy::handle_committed_transaction`.
+This is constructed on each node, inside its TEE, by processing every committed transaction in-order in the implementation of :cpp:func:`ccf::indexing::Strategy::handle_committed_transaction`.
 The strategy can then return its aggregated results to the calling endpoint in whatever format is appropriate.
 A :cpp:type:`ccf::indexing::Strategy` may offload partial results to disk to avoid infinite memory growth, via the automatically encrypted LFS (Large File Storage) system.
-Since the indexing system and all the strategies it manages exist entirely within the enclave, this has the same trust guarantees as any other in-enclave code - users can trust that the results are accurate and complete, and the query may process private data.
+Since the indexing system and all the strategies it manages run entirely inside the node's TEE, this has the same trust guarantees as any other code running in the node - users can trust that the results are accurate and complete, and the query may process private data.
 
 An example :cpp:type:`ccf::indexing::Strategy` is included in the logging app, to accelerate historical range queries.
-This :cpp:type:`strategy <ccf::indexing::strategies::SeqnosByKey_Bucketed_Untyped>` stores the list of seqnos where every key is written to, offloading completed ranges to disk to cap the total memory useage.
+This :cpp:type:`strategy <ccf::indexing::strategies::SeqnosByKey_Bucketed_Untyped>` records writes to keys in public tables and offloads completed non-empty buckets to authenticated disk storage.
+Late first writes and gaps between writes do not create empty bucket files.
+
+When using this strategy:
+
+- Memory still grows with the number of distinct keys: each retains a current bucket and bucket manifest metadata, including up to 2 KiB of bucket numbers.
+- Disk storage includes one manifest page per 256 completed non-empty buckets; queries for empty ranges may need additional metadata reads.
+- Queries use inclusive ranges, limited by ``max_requestable_range()``.
+  Retry ``nullopt`` results: fetching is asynchronous, and missing or corrupt required files trigger rebuilding rather than partial answers.
+- Each node builds its own index and rebuilds it after restart.
+
 In the endpoint handler, rather than requesting every transaction in the requested range, the node relies on its index to fetch only the `interesting` transactions; those which write to the target key:
 
 .. literalinclude:: ../../samples/apps/logging/logging.cpp
@@ -222,7 +282,7 @@ In the endpoint handler, rather than requesting every transaction in the request
     :end-before: SNIPPET_END: indexing_strategy_use
     :dedent:
 
-See the sample app for full details of how this strategy is installed and used.
+See the sample app for full details of how this strategy is installed and used, and :doc:`/architecture/indexing` for a description of the indexing system and the built-in strategies.
 
 Receipts
 ~~~~~~~~
@@ -249,13 +309,9 @@ This is conceptually equivalent to getting a signature from the service for clai
 
 CCF will record this transaction as a leaf in the Merkle tree constructed from the combined digest of the write set, this ``claims_digest``, and the :term:`Commit Evidence`.
 
-This ``claims_digest`` will be exposed in receipts under ``leaf_components``. It can then be revealed externally,
-or by the endpoint directly if it has been stored in the ledger. The receipt object deliberately makes the ``claims_digest`` optional,
-to allow the endpoint to remove it when the claims themselves are revealed.
+This ``claims_digest`` will be exposed in receipts under ``leaf_components``. It can then be revealed externally, or by the endpoint directly if it has been stored in the ledger. The receipt object deliberately makes the ``claims_digest`` optional, to allow the endpoint to remove it when the claims themselves are revealed.
 
-Receipt verification can then only succeed if the revealed claims are digested and their digest combined into a
-``leaf`` that correctly combines with the ``proof`` to form the ``root`` that the signature covers. Receipt verification
-therefore establishes the authenticity of the claims.
+Receipt verification can then only succeed if the revealed claims are digested and their digest combined into a ``leaf`` that correctly combines with the ``proof`` to form the ``root`` that the signature covers. Receipt verification therefore establishes the authenticity of the claims.
 
 .. literalinclude:: ../../samples/apps/logging/logging.cpp
     :language: cpp
@@ -263,8 +319,7 @@ therefore establishes the authenticity of the claims.
     :end-before: SNIPPET_END: claims_digest_in_receipt
     :dedent:
 
-A client consuming the output of this endpoint must digest the claims themselves, combine the digest with the other leaf components
-(``write_set_digest`` and ``hash(commit_evidence)``) to obtain the equivalent ``leaf``. See :ref:`use_apps/verify_tx:Receipt Verification` for the full set of steps.
+A client consuming the output of this endpoint must digest the claims themselves, combine the digest with the other leaf components (``write_set_digest`` and ``hash(commit_evidence)``) to obtain the equivalent ``leaf``. See :ref:`use_apps/verify_tx:Receipt Verification` for the full set of steps.
 
 As an example, a logging application may register the contents being logged as a claim:
 
@@ -308,3 +363,114 @@ Receipts from this endpoint will then look like:
                  'signature': 'MGUCMHYBgZ3gySdkJ+STUL13EURVBd8354ULC11l/kjx20IwpXrg/aDYLWYf7tsGwqUxPwIxAMH2wJDd9wpwbQrULpaAx5XEifpUfOriKtYo7XiFr05J+BV10U39xa9GBS49OK47QA=='}}
                  
 Note that the ``claims_digest`` is deliberately omitted from ``leaf_components``, and must be re-computed by digesting the ``msg``.
+
+Client-side Concurrency Control
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Clients of a CCF application submit transactions concurrently.
+Single transactions are always handled atomically by the service, transparently for clients and for application writers. But some clients may wish to submit sequences of multiple, dependent transactions. For example:
+
+1. Client reads value at key ``K``
+2. Performs some client-side processing
+3. Writes a new value at key ``K``, but only if the server-side value has not changed
+
+Implementing `If-Match` and `If-None-Match` HTTP headers in endpoint logic is a common pattern for this use case. The following endpoints of the C++ logging app demonstrate this:
+
+POST /app/log/public
+~~~~~~~~~~~~~~~~~~~~
+
+.. literalinclude:: ../../samples/apps/logging/logging.cpp
+    :language: cpp
+    :start-after: SNIPPET_START: public_table_post_match
+    :end-before: SNIPPET_END: public_table_post_match
+    :dedent:
+
+And before returning ``200 OK``:
+
+.. literalinclude:: ../../samples/apps/logging/logging.cpp
+    :language: cpp
+    :start-after: SNIPPET_START: public_table_post_etag
+    :end-before: SNIPPET_END: public_table_post_etag
+    :dedent:
+
+GET /app/log/public/{idx}
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. literalinclude:: ../../samples/apps/logging/logging.cpp
+    :language: cpp
+    :start-after: SNIPPET_START: public_table_get_match
+    :end-before: SNIPPET_END: public_table_get_match
+    :dedent:
+
+DELETE /app/log/public/{idx}
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. literalinclude:: ../../samples/apps/logging/logging.cpp
+    :language: cpp
+    :start-after: SNIPPET_START: public_table_delete_match
+    :end-before: SNIPPET_END: public_table_delete_match
+    :dedent:
+
+The framework provides a :cpp:class:`ccf::http::Matcher` class, which can be used to evaluate these conditions.
+
+Deferring Response Until Commit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, CCF sends the HTTP response as soon as a transaction is locally committed (assigned a :term:`Transaction ID`), without waiting for it to be globally committed by consensus. This means a successful response indicates the transaction has been `accepted` but not yet `durably replicated` across the network. Clients that need stronger guarantees — for example, to know a write is durable before proceeding — can poll the ``/commit`` endpoint or the transaction status API.
+
+CCF also supports deferring the HTTP response until the transaction reaches a terminal consensus state: either globally committed, or invalidated (e.g. due to a view change).
+This is controlled per-request from within the endpoint handler by calling ``set_consensus_committed_function()`` on the RPC context, passing a callback that will be invoked once the transaction's fate is known.
+Uncommitted transactions lost in an election are reported as invalid once the node observes a commit in a later view, even if that commit's sequence number is lower than the lost transaction's.
+A local rollback alone is not sufficient to establish invalidation.
+
+The simplest use is to unconditionally block:
+
+.. literalinclude:: ../../samples/apps/logging/logging.cpp
+    :language: cpp
+    :start-after: SNIPPET_START: blocking_record
+    :end-before: SNIPPET_END: blocking_record
+    :dedent:
+
+The ``default_respond_on_commit`` callback used here is defined in the sample apps (``samples/apps/common/default_on_commit.h``), not in the CCF public API. It simply returns the original response on commit, or replaces it with an error if the transaction was invalidated. The same file also contains ``make_respond_with_receipt_on_commit``, which constructs an inline COSE receipt at commit time. Applications should use these as reference implementations and write their own callbacks to suit their needs.
+
+Because this is a runtime decision made inside the handler, the `same` endpoint can conditionally block based on query parameters, headers, or other request state. This is useful for APIs where some callers want the convenience of fire-and-forget while others need commit confirmation:
+
+.. literalinclude:: ../../samples/apps/logging/logging.cpp
+    :language: cpp
+    :start-after: SNIPPET_START: optional_commit
+    :end-before: SNIPPET_END: optional_commit
+    :dedent:
+
+The callback receives a ``CommittedTxInfo`` struct containing the ``TxID``, ``FinalTxStatus`` (``Committed`` or ``Invalid``), and — for write transactions — the ``write_set_digest``, ``commit_evidence``, and ``claims_digest`` needed to construct a receipt.
+
+.. note::
+
+    This feature is currently supported on HTTP/1.1 connections only. HTTP/2 sessions send responses immediately regardless of whether a consensus-committed callback is set.
+
+    Read-only endpoints may also use this mechanism to confirm that their response reflects committed state. However, attempting to construct a receipt for a read-only transaction will fail with a ``500 Internal Server Error``, since read-only transactions do not produce the write set digest or commit evidence required for receipt construction.
+
+Building
+~~~~~~~~
+
+.. note:: Before building a CCF application, make sure that CCF is installed (see :doc:`/build_apps/install_bin`).
+
+Native applications are built into executables using the ``add_ccf_app`` function provided by CCF's ``cmake/ccf_app.cmake``; Rust applications use ``add_ccf_rust_app``, described in :doc:`example_rust`.
+
+For example, for the ``js_generic`` JavaScript application:
+
+.. literalinclude:: ../../CMakeLists.txt
+    :language: cmake
+    :start-after: SNIPPET_START: JS generic application
+    :end-before: SNIPPET_END: JS generic application
+
+A minimal standalone project which builds a C++ application against an installed CCF package is available in :ccf_repo:`tests/ccfapp/CMakeLists.txt`.
+The `ccf-app-template <https://github.com/microsoft/ccf-app-template>`__ repository also contains a C++ sample app in its `cpp/ <https://github.com/microsoft/ccf-app-template/tree/main/cpp>`__ directory, with instructions to `build <https://github.com/microsoft/ccf-app-template#build-c-app>`__ and `run <https://github.com/microsoft/ccf-app-template#run-c-app>`__ it.
+
+The resulting executable can be run in a local sandbox as described in :doc:`run_app`.
+Unlike JavaScript applications, deploying a new version of a C++ application requires a :doc:`code upgrade </operations/code_upgrade>` of the nodes running it.
+
+Packaging
+~~~~~~~~~
+
+To create distributable packages for your CCF application, create a ``cpack.cmake`` file that includes CCF's packaging configuration and add it to your ``CMakeLists.txt``.
+See :ccf_repo:`tests/ccfapp/CMakeLists.txt` and :ccf_repo:`tests/ccfapp/cpack.cmake` for a complete working example.

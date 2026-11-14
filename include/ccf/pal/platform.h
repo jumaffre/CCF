@@ -3,10 +3,11 @@
 #pragma once
 
 #include "ccf/ds/json.h"
+#include "ccf/pal/snp_ioctl.h"
 
 namespace ccf::pal
 {
-  enum class Platform
+  enum class Platform : uint8_t
   {
     SGX = 0,
     SNP = 1,
@@ -20,15 +21,24 @@ namespace ccf::pal
      {Platform::Virtual, "Virtual"},
      {Platform::Unknown, "Unknown"}});
 
-  constexpr static auto platform =
-#if defined(PLATFORM_SGX)
-    Platform::SGX
-#elif defined(PLATFORM_SNP)
-    Platform::SNP
-#elif defined(PLATFORM_VIRTUAL)
-    Platform::Virtual
-#else
-    Platform::Unknown
-#endif
-    ;
+  static Platform _detect_platform()
+  {
+    // NOLINTNEXTLINE(concurrency-mt-unsafe)
+    auto* env_var = std::getenv("CCF_PLATFORM_OVERRIDE");
+    if (env_var != nullptr)
+    {
+      return nlohmann::json(env_var).get<Platform>();
+    }
+
+    if (ccf::pal::snp::supports_sev_snp())
+    {
+      return Platform::SNP;
+    }
+
+    return Platform::Virtual;
+  }
+
+  // Default inits to Unknown.
+  // Set this early from CLI, or explicitly for unit tests.
+  static auto platform = _detect_platform();
 }

@@ -2,12 +2,13 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ds/ccf_exception.h"
-#include "enclave/forwarder_types.h"
-#include "enclave/rpc_map.h"
-#include "http/http_rpc_context.h"
 #include "kv/kv_types.h"
 #include "node/node_to_node.h"
+#include "node/rpc/forwarder_types.h"
+#include "node/rpc/http_rpc_context.h"
+#include "node/rpc/rpc_map.h"
+#include "tasks/basic_task.h"
+#include "tasks/task_system.h"
 
 namespace ccf
 {
@@ -16,7 +17,7 @@ namespace ccf
   class ForwardedRpcHandler
   {
   public:
-    virtual ~ForwardedRpcHandler() {}
+    virtual ~ForwardedRpcHandler() = default;
 
     virtual void process_forwarded(
       std::shared_ptr<ccf::RpcContextImpl> fwd_ctx) = 0;
@@ -29,62 +30,14 @@ namespace ccf
     std::weak_ptr<ccf::AbstractRPCResponder> rpcresponder;
     std::shared_ptr<ChannelProxy> n2n_channels;
     std::weak_ptr<ccf::RPCMap> rpc_map;
-    NodeId self;
 
     using ForwardedCommandId = ForwardedHeader_v2::ForwardedCommandId;
     ForwardedCommandId next_command_id = 0;
 
-    struct TimeoutTask
-    {
-      threading::TaskQueue::TimerEntry timer_entry;
-      uint16_t thread_id;
-    };
-
-    std::unordered_map<ForwardedCommandId, TimeoutTask> timeout_tasks;
-    ccf::pal::Mutex timeout_tasks_lock;
+    std::unordered_map<ForwardedCommandId, ccf::tasks::Task> timeout_tasks;
+    ccf::ds::Mutex timeout_tasks_lock;
 
     using IsCallerCertForwarded = bool;
-
-    struct SendTimeoutErrorMsg
-    {
-      SendTimeoutErrorMsg(
-        Forwarder<ChannelProxy>* forwarder_,
-        const ccf::NodeId& to_,
-        size_t client_session_id_,
-        const std::chrono::milliseconds& timeout_) :
-        forwarder(forwarder_),
-        to(to_),
-        client_session_id(client_session_id_),
-        timeout(timeout_)
-      {}
-
-      Forwarder<ChannelProxy>* forwarder;
-      ccf::NodeId to;
-      size_t client_session_id;
-      std::chrono::milliseconds timeout;
-    };
-
-    struct CancelTimerMsg
-    {
-      threading::TaskQueue::TimerEntry timer_entry;
-    };
-
-    std::unique_ptr<threading::Tmsg<SendTimeoutErrorMsg>>
-    create_timeout_error_task(
-      const ccf::NodeId& to,
-      size_t client_session_id,
-      const std::chrono::milliseconds& timeout)
-    {
-      return std::make_unique<threading::Tmsg<SendTimeoutErrorMsg>>(
-        [](std::unique_ptr<threading::Tmsg<SendTimeoutErrorMsg>> msg) {
-          msg->data.forwarder->send_timeout_error_response(
-            msg->data.to, msg->data.client_session_id, msg->data.timeout);
-        },
-        this,
-        to,
-        client_session_id,
-        timeout);
-    }
 
     void send_timeout_error_response(
       NodeId to,
@@ -94,30 +47,18 @@ namespace ccf
       auto rpc_responder_shared = rpcresponder.lock();
       if (rpc_responder_shared)
       {
-        auto response = http::Response(HTTP_STATUS_GATEWAY_TIMEOUT);
-        auto body = fmt::format(
-          "Request was forwarded to node {}, but no response was received "
-          "after {}ms",
-          to,
-          timeout.count());
-        response.set_body(body);
-        response.set_header(
-          http::headers::CONTENT_TYPE, http::headervalues::contenttype::TEXT);
         rpc_responder_shared->reply_async(
-          client_session_id, false, response.build_response());
+          client_session_id,
+          false,
+          ::http::error(
+            HTTP_STATUS_GATEWAY_TIMEOUT,
+            ccf::errors::ForwardingTimeout,
+            fmt::format(
+              "Request was forwarded to node {}, but no response was received "
+              "after {}ms",
+              to,
+              timeout.count())));
       }
-    }
-
-    static void cancel_forwarding_task_cb(
-      std::unique_ptr<threading::Tmsg<CancelTimerMsg>> msg)
-    {
-      cancel_forwarding_task(msg->data.timer_entry);
-    }
-
-    static void cancel_forwarding_task(
-      threading::TaskQueue::TimerEntry timer_entry)
-    {
-      threading::ThreadMessaging::instance().cancel_timer_task(timer_entry);
     }
 
   public:
@@ -125,15 +66,10 @@ namespace ccf
       std::weak_ptr<ccf::AbstractRPCResponder> rpcresponder,
       std::shared_ptr<ChannelProxy> n2n_channels,
       std::weak_ptr<ccf::RPCMap> rpc_map_) :
-      rpcresponder(rpcresponder),
-      n2n_channels(n2n_channels),
-      rpc_map(rpc_map_)
+      rpcresponder(std::move(rpcresponder)),
+      n2n_channels(std::move(n2n_channels)),
+      rpc_map(std::move(rpc_map_))
     {}
-
-    void initialize(const NodeId& self_)
-    {
-      self = self_;
-    }
 
     bool forward_command(
       std::shared_ptr<ccf::RpcContextImpl> rpc_ctx,
@@ -144,7 +80,6 @@ namespace ccf
       auto session_ctx = rpc_ctx->get_session_context();
 
       IsCallerCertForwarded include_caller = false;
-      const auto method = rpc_ctx->get_method();
       const auto& raw_request = rpc_ctx->get_serialised_request();
       auto client_session_id = session_ctx->client_session_id;
       size_t size = sizeof(client_session_id) + sizeof(IsCallerCertForwarded) +
@@ -156,7 +91,7 @@ namespace ccf
       }
 
       std::vector<uint8_t> plain(size);
-      auto data_ = plain.data();
+      auto* data_ = plain.data();
       auto size_ = plain.size();
       serialized::write(data_, size_, client_session_id);
       serialized::write(data_, size_, include_caller);
@@ -167,14 +102,16 @@ namespace ccf
       }
       serialized::write(data_, size_, raw_request.data(), raw_request.size());
 
-      ForwardedCommandId command_id;
+      ForwardedCommandId command_id = 0;
       {
-        std::lock_guard<ccf::pal::Mutex> guard(timeout_tasks_lock);
+        std::lock_guard<ccf::ds::Mutex> guard(timeout_tasks_lock);
         command_id = next_command_id++;
-        timeout_tasks[command_id] = {
-          threading::ThreadMessaging::instance().add_task_after(
-            create_timeout_error_task(to, client_session_id, timeout), timeout),
-          threading::get_current_thread_id()};
+        auto task =
+          ccf::tasks::make_basic_task([this, to, client_session_id, timeout]() {
+            this->send_timeout_error_response(to, client_session_id, timeout);
+          });
+        timeout_tasks[command_id] = task;
+        ccf::tasks::add_delayed_task(task, timeout);
       }
 
       const auto view_opt = session_ctx->active_view;
@@ -190,7 +127,7 @@ namespace ccf
     }
 
     template <typename TFwdHdr>
-    std::shared_ptr<http::HttpRpcContext> recv_forwarded_command(
+    std::shared_ptr<::http::HttpRpcContext> recv_forwarded_command(
       const NodeId& from, const uint8_t* data, size_t size)
     {
       std::pair<TFwdHdr, std::vector<uint8_t>> r;
@@ -218,6 +155,7 @@ namespace ccf
       if (includes_caller)
       {
         auto caller_size = serialized::read<size_t>(data_, size_);
+        // NOLINTNEXTLINE(readability-suspicious-call-argument)
         caller_cert = serialized::read(data_, size_, caller_size);
       }
       std::vector<uint8_t> raw_request = serialized::read(data_, size_, size_);
@@ -237,6 +175,11 @@ namespace ccf
         return ccf::make_fwd_rpc_context(
           session, raw_request, r.first.frame_format);
       }
+      catch (const ::http::RequestTooLargeException& rexc)
+      {
+        LOG_FAIL_FMT("Forwarded request exceeded limit: {}", rexc.what());
+        return nullptr;
+      }
       catch (const std::exception& err)
       {
         LOG_FAIL_FMT("Invalid forwarded request");
@@ -253,7 +196,7 @@ namespace ccf
       const std::vector<uint8_t>& data)
     {
       std::vector<uint8_t> plain(sizeof(client_session_id) + data.size());
-      auto data_ = plain.data();
+      auto* data_ = plain.data();
       auto size_ = plain.size();
       serialized::write(data_, size_, client_session_id);
       serialized::write(data_, size_, data.data(), data.size());
@@ -267,7 +210,7 @@ namespace ccf
 
     struct ForwardedResponseResult
     {
-      size_t client_session_id;
+      size_t client_session_id{};
       std::vector<uint8_t> response_body;
       bool should_terminate_session = false;
     };
@@ -307,7 +250,7 @@ namespace ccf
     }
 
     std::shared_ptr<ForwardedRpcHandler> get_forwarder_handler(
-      std::shared_ptr<http::HttpRpcContext>& ctx)
+      std::shared_ptr<::http::HttpRpcContext>& ctx)
     {
       if (ctx == nullptr)
       {
@@ -323,7 +266,7 @@ namespace ccf
       }
 
       std::shared_ptr<ccf::RpcHandler> search =
-        http::fetch_rpc_handler(ctx, rpc_map_shared);
+        ::http::fetch_rpc_handler(ctx, rpc_map_shared);
 
       auto fwd_handler = std::dynamic_pointer_cast<ForwardedRpcHandler>(search);
       if (!fwd_handler)
@@ -350,65 +293,6 @@ namespace ccf
 
         switch (forwarded_msg)
         {
-          case ForwardedMsg::forwarded_cmd_v1:
-          {
-            auto ctx =
-              recv_forwarded_command<ForwardedHeader_v1>(from, data, size);
-
-            auto fwd_handler = get_forwarder_handler(ctx);
-            if (fwd_handler == nullptr)
-            {
-              return;
-            }
-
-            // frame_format is deliberately unset, the forwarder ignores it
-            // and expects the same format they forwarded.
-            ForwardedHeader_v1 response_header{
-              ForwardedMsg::forwarded_response_v1};
-
-            LOG_DEBUG_FMT("Sending forwarded response to {}", from);
-            fwd_handler->process_forwarded(ctx);
-
-            send_forwarded_response(
-              ctx->get_session_context()->client_session_id,
-              from,
-              response_header,
-              ctx->serialise_response());
-            break;
-          }
-
-          case ForwardedMsg::forwarded_cmd_v2:
-          {
-            auto ctx =
-              recv_forwarded_command<ForwardedHeader_v2>(from, data, size);
-
-            auto fwd_handler = get_forwarder_handler(ctx);
-            if (fwd_handler == nullptr)
-            {
-              return;
-            }
-
-            const auto forwarded_hdr_v2 =
-              serialized::peek<ForwardedHeader_v2>(data, size);
-            const auto cmd_id = forwarded_hdr_v2.id;
-
-            fwd_handler->process_forwarded(ctx);
-
-            // frame_format is deliberately unset, the forwarder ignores it
-            // and expects the same format they forwarded.
-            ForwardedHeader_v2 response_header{
-              {ForwardedMsg::forwarded_response_v2, {}}, cmd_id};
-
-            LOG_DEBUG_FMT("Sending forwarded response to {}", from);
-
-            send_forwarded_response(
-              ctx->get_session_context()->client_session_id,
-              from,
-              response_header,
-              ctx->serialise_response());
-            break;
-          }
-
           case ForwardedMsg::forwarded_cmd_v3:
           {
             auto ctx = recv_forwarded_command<ForwardedCommandHeader_v3>(
@@ -442,7 +326,6 @@ namespace ccf
           }
 
           case ForwardedMsg::forwarded_response_v3:
-          case ForwardedMsg::forwarded_response_v2:
           {
             const auto forwarded_hdr_v2 =
               serialized::peek<ForwardedHeader_v2>(data, size);
@@ -450,23 +333,11 @@ namespace ccf
 
             // Cancel and delete the corresponding timeout task, so it will no
             // longer trigger a timeout error
-            std::lock_guard<ccf::pal::Mutex> guard(timeout_tasks_lock);
+            std::lock_guard<ccf::ds::Mutex> guard(timeout_tasks_lock);
             auto it = timeout_tasks.find(cmd_id);
             if (it != timeout_tasks.end())
             {
-              if (threading::get_current_thread_id() != it->second.thread_id)
-              {
-                auto msg = std::make_unique<threading::Tmsg<CancelTimerMsg>>(
-                  &cancel_forwarding_task_cb);
-                msg->data.timer_entry = it->second.timer_entry;
-
-                threading::ThreadMessaging::instance().add_task(
-                  it->second.thread_id, std::move(msg));
-              }
-              else
-              {
-                cancel_forwarding_task(it->second.timer_entry);
-              }
+              it->second->cancel_task();
               it = timeout_tasks.erase(it);
             }
             else
@@ -477,27 +348,9 @@ namespace ccf
                 cmd_id);
               return;
             }
-            // Deliberate fall-through
-          }
 
-          case ForwardedMsg::forwarded_response_v1:
-          {
-            std::optional<ForwardedResponseResult> rep;
-            if (forwarded_msg == ForwardedMsg::forwarded_response_v3)
-            {
-              rep = recv_forwarded_response<ForwardedResponseHeader_v3>(
-                from, data, size);
-            }
-            else if (forwarded_msg == ForwardedMsg::forwarded_response_v2)
-            {
-              rep =
-                recv_forwarded_response<ForwardedHeader_v2>(from, data, size);
-            }
-            else
-            {
-              rep =
-                recv_forwarded_response<ForwardedHeader_v1>(from, data, size);
-            }
+            auto rep = recv_forwarded_response<ForwardedResponseHeader_v3>(
+              from, data, size);
 
             if (!rep.has_value())
             {
@@ -522,6 +375,18 @@ namespace ccf
             break;
           }
 
+          case ForwardedMsg::forwarded_cmd_v1:
+          case ForwardedMsg::forwarded_response_v1:
+          case ForwardedMsg::forwarded_cmd_v2:
+          case ForwardedMsg::forwarded_response_v2:
+          {
+            LOG_FAIL_FMT(
+              "Forwarded msg type {} is no longer supported on receive, "
+              "dropping message",
+              (size_t)forwarded_msg);
+            break;
+          }
+
           default:
           {
             LOG_FAIL_FMT("Unknown frontend msg type: {}", forwarded_msg);
@@ -531,7 +396,8 @@ namespace ccf
       }
       catch (const std::exception& e)
       {
-        LOG_FAIL_EXC(e.what());
+        LOG_FAIL_FMT("Exception in {}", __PRETTY_FUNCTION__);
+        LOG_DEBUG_FMT("Error: {}", e.what());
         return;
       }
     }

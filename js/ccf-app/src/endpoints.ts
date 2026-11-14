@@ -8,7 +8,7 @@
  * @module
  */
 
-import { JsonCompatible, ccf } from "./global.js";
+import { type JsonCompatible, ccf } from "./global.js";
 
 /**
  * The body of a request.
@@ -107,16 +107,28 @@ export interface AuthnIdentityCommon {
   /**
    * A string indicating which policy accepted this request,
    * for use when multiple policies are listed in the endpoint
-   * configuration of ``app.json``.
+   * configuration of ``app.json``, or list-of-strings to identify
+   * an all_of policy.
    */
-  policy: string;
+  policy: string | string[];
 }
 
 export interface EmptyAuthnIdentity extends AuthnIdentityCommon {
   policy: "no_auth";
 }
 
-interface UserMemberAuthnIdentityCommon extends AuthnIdentityCommon {
+interface CertAuthnIdentityCommon extends AuthnIdentityCommon {
+  /**
+   * PEM-encoded certificate.
+   */
+  cert: string;
+}
+
+export interface AnyCertAuthnIdentity extends CertAuthnIdentityCommon {
+  policy: "any_cert";
+}
+
+interface UserMemberAuthnIdentityCommon extends CertAuthnIdentityCommon {
   /**
    * User/member ID.
    */
@@ -126,11 +138,6 @@ interface UserMemberAuthnIdentityCommon extends AuthnIdentityCommon {
    * User/member data object.
    */
   data: any;
-
-  /**
-   * PEM-encoded user/member certificate.
-   */
-  cert: string;
 }
 
 export interface UserCertAuthnIdentity extends UserMemberAuthnIdentityCommon {
@@ -151,14 +158,12 @@ interface UserMemberCOSEAuthIdentityCommon {
 }
 
 export interface MemberCOSESign1AuthnIdentity
-  extends UserMemberAuthnIdentityCommon,
-    UserMemberCOSEAuthIdentityCommon {
+  extends UserMemberAuthnIdentityCommon, UserMemberCOSEAuthIdentityCommon {
   policy: "member_cose_sign1";
 }
 
 export interface UserCOSESign1AuthnIdentity
-  extends UserMemberAuthnIdentityCommon,
-    UserMemberCOSEAuthIdentityCommon {
+  extends UserMemberAuthnIdentityCommon, UserMemberCOSEAuthIdentityCommon {
   policy: "user_cose_sign1";
 }
 
@@ -187,6 +192,17 @@ export interface JwtAuthnIdentity extends AuthnIdentityCommon {
   };
 }
 
+export interface AllOfAuthnIdentity extends AuthnIdentityCommon {
+  policy: string[];
+
+  user_cert?: UserCertAuthnIdentity;
+  member_cert?: MemberCertAuthnIdentity;
+  any_cert?: AnyCertAuthnIdentity;
+  user_cose_sign1?: UserCOSESign1AuthnIdentity;
+  member_cose_sign1?: MemberCOSESign1AuthnIdentity;
+  jwt?: JwtAuthnIdentity;
+}
+
 /**
  * Authentication identities supported by CCF.
  * Each identity corresponds to a matching {@linkcode AuthnIdentityCommon.policy | policy}.
@@ -196,9 +212,11 @@ export type AuthnIdentity =
   | EmptyAuthnIdentity
   | UserCertAuthnIdentity
   | MemberCertAuthnIdentity
+  | AnyCertAuthnIdentity
   | JwtAuthnIdentity
   | MemberCOSESign1AuthnIdentity
-  | UserCOSESign1AuthnIdentity;
+  | UserCOSESign1AuthnIdentity
+  | AllOfAuthnIdentity;
 
 /** See {@linkcode Response.body}. */
 export type ResponseBodyType<T> = string | ArrayBuffer | JsonCompatible<T>;

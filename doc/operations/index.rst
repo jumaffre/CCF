@@ -3,101 +3,60 @@ Operations
 
 This section describes how :term:`Operators` manage the different nodes constituting a CCF network.
 
-.. panels::
+.. grid:: 1 2 2 2
+    :gutter: 3
 
-    :fa:`laptop-code` :doc:`run_setup`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    .. grid-item-card:: :fas:`laptop-code` :doc:`Install CCF </build_apps/install_bin>`
 
-    Set up a VM or a container to run a CCF application node.
+        Install CCF on a VM or a container to run a CCF application node.
 
-    ---
+    .. grid-item-card:: :fas:`play-circle` :doc:`start_network`
 
-    :fa:`play-circle` :doc:`start_network`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        Start a new instance of a CCF service, and add an initial set of execution nodes.
 
-    Start a new instance of a CCF service, and add an initial set of execution nodes.
+    .. grid-item-card:: :fas:`cogs` :doc:`configuration`
 
-    ---
+        Configure CCF nodes using a JSON configuration file and command-line options.
 
-    :fa:`cogs` :doc:`configuration`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    .. grid-item-card:: :fas:`upload` :doc:`ledger_snapshot`
 
-    Configure CCF nodes from JSON configuration file.
+        Back up ledger files and provision new nodes from a state snapshot.
 
-    ---
+    .. grid-item-card:: :fas:`database` :doc:`data_persistence`
 
-    :fa:`upload` :doc:`ledger_snapshot`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        Understand durability and best practices for ledger and snapshot files.
 
-    Understand how to backup ledger files and provision new nodes from a state snapshot.
+    .. grid-item-card:: :fas:`sync-alt` :doc:`code_upgrade`
 
-    ---
+        Upgrade a live service with minimal downtime.
 
-    :fa:`database` :doc:`data_persistence`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    .. grid-item-card:: :fas:`stamp` :doc:`certificates`
 
-    Best practices and durability guarantees for ledger and snapshot files.
+        Set and renew node and service X.509 certificates.
 
-    ---
+    .. grid-item-card:: :fas:`helicopter` :doc:`recovery`
 
-    :fa:`sync-alt` :doc:`code_upgrade`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        Recover a service instance from a catastrophic failure, using one or more ledger copies.
 
-    Upgrade a live service with minimal downtime.
+    .. grid-item-card:: :fas:`microchip` :doc:`platforms/index`
 
-    ---
+        Explore platforms and trusted execution environments supported by CCF.
 
-    :fa:`stamp` :doc:`certificates`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    .. grid-item-card:: :fas:`wrench` :doc:`troubleshooting`
 
-    Set and renew nodes and service x509 certificates.
+        Troubleshoot unexpected events.
 
-    ---
+    .. grid-item-card:: :fas:`tachometer-alt` :doc:`resource_usage`
 
-    :fa:`helicopter` :doc:`recovery`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        Monitor node resource consumption.
 
-    Recover a service instance from a catastrophic failure, using one or more ledger copies.
+    .. grid-item-card:: :fas:`terminal` :doc:`operator_rpc_api`
 
-    ---
-
-    :fa:`network-wired` :doc:`network`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-    Configure a network to deploy a CCF service.
-
-    ---
-
-    :fa:`microchip` :doc:`platforms/index`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-    Platforms and trusted execution environments supported by CCF.
-
-    ---
-
-    :fa:`wrench` :doc:`troubleshooting`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-    Troubleshooting tips for unexpected events.
-
-    ---
-
-    :fa:`tachometer-alt` :doc:`resource_usage`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-    Monitor node resource consumption.
-
-    ---
-
-    :fa:`terminal` :doc:`operator_rpc_api`
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-    Node API reference.
+        Consult the node API reference.
 
 .. toctree::
     :hidden:
 
-    run_setup
     start_network
     configuration
     ledger_snapshot
@@ -105,7 +64,6 @@ This section describes how :term:`Operators` manage the different nodes constitu
     code_upgrade
     certificates
     recovery
-    network
     platforms/index
     troubleshooting
     resource_usage

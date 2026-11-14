@@ -2,23 +2,29 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
+#include "ccf/crypto/ec_public_key.h"
 #include "ccf/crypto/jwk.h"
-#include "ccf/crypto/key_pair.h"
+#include "ccf/crypto/mldsa_public_key.h"
 #include "ccf/crypto/pem.h"
-#include "ccf/crypto/public_key.h"
+#include "ccf/crypto/rsa_public_key.h"
+#include "ccf/ds/nonstd.h"
 
 #include <chrono>
 
-namespace crypto
+namespace ccf::crypto
 {
   class Verifier
   {
   protected:
-    std::shared_ptr<PublicKey> public_key;
+    std::variant<
+      ccf::crypto::RSAPublicKeyPtr,
+      ccf::crypto::ECPublicKeyPtr,
+      ccf::crypto::MLDSAPublicKeyPtr>
+      public_key;
 
   public:
-    Verifier() : public_key(nullptr) {}
-    virtual ~Verifier() {}
+    Verifier() = default;
+    virtual ~Verifier() = default;
 
     virtual std::vector<uint8_t> cert_der() = 0;
     virtual Pem cert_pem() = 0;
@@ -28,19 +34,15 @@ namespace crypto
      * @param contents_size Size of @p contents
      * @param sig Signature
      * @param sig_size Size of @p sig
-     * @param md_type Hash algorithm
+     * @param md_type Hash algorithm. Pure ML-DSA accepts only MDType::NONE
      * @return Boolean indicating success
      */
-    virtual bool verify(
+    [[nodiscard]] virtual bool verify(
       const uint8_t* contents,
       size_t contents_size,
       const uint8_t* sig,
       size_t sig_size,
-      MDType md_type = MDType::NONE) const
-    {
-      return public_key->verify(
-        contents, contents_size, sig, sig_size, md_type);
-    }
+      MDType md_type = MDType::NONE) const;
 
     /** Verify a signature
      * @param contents Contents over which the signature was generated
@@ -48,7 +50,7 @@ namespace crypto
      * @param md_type Hash algorithm
      * @return Boolean indicating success
      */
-    virtual bool verify(
+    [[nodiscard]] virtual bool verify(
       std::span<const uint8_t> contents,
       std::span<const uint8_t> sig,
       MDType md_type = MDType::NONE) const
@@ -59,32 +61,11 @@ namespace crypto
 
     /** Verify a signature
      * @param contents Contents over which the signature was generated
-     * @param contents_size Size of @p contents
-     * @param sig Signature
-     * @param sig_size Size of @p sig
-     * @param md_type Hash algorithm
-     * @param hash_bytes Output buffer for the hash
-     * @return Boolean indicating success
-     */
-    virtual bool verify(
-      const uint8_t* contents,
-      size_t contents_size,
-      const uint8_t* sig,
-      size_t sig_size,
-      MDType md_type,
-      HashBytes& hash_bytes) const
-    {
-      return public_key->verify(
-        contents, contents_size, sig, sig_size, md_type, hash_bytes);
-    }
-
-    /** Verify a signature
-     * @param contents Contents over which the signature was generated
      * @param signature Signature
      * @param md_type Hash algorithm
      * @return Boolean indicating success
      */
-    virtual bool verify(
+    [[nodiscard]] virtual bool verify(
       const std::vector<uint8_t>& contents,
       const std::vector<uint8_t>& signature,
       MDType md_type = MDType::NONE) const
@@ -97,28 +78,6 @@ namespace crypto
         md_type);
     }
 
-    /** Verify a signature
-     * @param contents Contents over which the signature was generated
-     * @param signature Signature
-     * @param md_type Hash algorithm
-     * @param hash_bytes Output buffer for the hash
-     * @return Boolean indicating success
-     */
-    virtual bool verify(
-      const std::vector<uint8_t>& contents,
-      const std::vector<uint8_t>& signature,
-      MDType md_type,
-      HashBytes& hash_bytes) const
-    {
-      return verify(
-        contents.data(),
-        contents.size(),
-        signature.data(),
-        signature.size(),
-        md_type,
-        hash_bytes);
-    }
-
     /** Verify a signature over a hash
      * @param hash Hash over which the signature was generated
      * @param hash_size Size of @p hash
@@ -126,16 +85,14 @@ namespace crypto
      * @param sig_size Size of @p sig
      * @param md_type Hash algorithm
      * @return Boolean indicating success
+     * @throws std::logic_error for pure ML-DSA (no pre-hashed input support)
      */
     virtual bool verify_hash(
       const uint8_t* hash,
       size_t hash_size,
       const uint8_t* sig,
       size_t sig_size,
-      MDType md_type = MDType::NONE)
-    {
-      return public_key->verify_hash(hash, hash_size, sig, sig_size, md_type);
-    }
+      MDType md_type = MDType::NONE);
 
     /** Verify a signature over a hash
      * @param hash Hash over which the signature was generated
@@ -171,18 +128,12 @@ namespace crypto
     /** Extract the public key of the certificate in PEM format
      * @return PEM encoded public key
      */
-    virtual Pem public_key_pem() const
-    {
-      return public_key->public_key_pem();
-    }
+    [[nodiscard]] virtual Pem public_key_pem() const;
 
     /** Extract the public key of the certificate in DER format
      * @return DER encoded public key
      */
-    virtual std::vector<uint8_t> public_key_der() const
-    {
-      return public_key->public_key_der();
-    }
+    [[nodiscard]] virtual std::vector<uint8_t> public_key_der() const;
 
     /** Verify the certificate (held internally)
      * @param trusted_certs Vector of trusted certificates
@@ -191,38 +142,37 @@ namespace crypto
      * @param ignore_time Flag to disable certificate expiry checks
      * @return true if the verification is successful
      */
-    virtual bool verify_certificate(
+    [[nodiscard]] virtual bool verify_certificate(
       const std::vector<const Pem*>& trusted_certs,
       const std::vector<const Pem*>& chain = {},
       bool ignore_time = false) = 0;
 
     /** Indicates whether the certificate (held intenally) is self-signed */
-    virtual bool is_self_signed() const = 0;
+    [[nodiscard]] virtual bool is_self_signed() const = 0;
 
     /** The serial number of the certificate */
-    virtual std::string serial_number() const = 0;
+    [[nodiscard]] virtual std::string serial_number() const = 0;
 
     /** The validity period of the certificate */
-    virtual std::pair<std::string, std::string> validity_period() const = 0;
+    [[nodiscard]] virtual std::pair<std::string, std::string> validity_period()
+      const = 0;
 
-    /** The number of seconds of the validity period of the
-     * certificate remaining */
-    virtual size_t remaining_seconds(
-      const std::chrono::system_clock::time_point& now) const = 0;
+    /** The number of seconds of the validity period of the certificate
+     * remaining at @p now. Both ends of the period are included, so this is
+     * the whole period before it starts, and 0 once it has expired */
+    [[nodiscard]] virtual size_t remaining_seconds(
+      const ccf::nonstd::SystemClock::time_point& now) const = 0;
 
-    /** The percentage of the validity period of the certificate remaining */
-    virtual double remaining_percentage(
-      const std::chrono::system_clock::time_point& now) const = 0;
+    /** The fraction, from 0.0 to 1.0, of the validity period of the
+     * certificate remaining at @p now */
+    [[nodiscard]] virtual double remaining_percentage(
+      const ccf::nonstd::SystemClock::time_point& now) const = 0;
 
     /** The subject name of the certificate */
-    virtual std::string subject() const = 0;
+    [[nodiscard]] virtual std::string subject() const = 0;
 
-    /** */
-    virtual JsonWebKeyECPublic public_key_jwk(
-      const std::optional<std::string>& kid = std::nullopt) const
-    {
-      return public_key->public_key_jwk(kid);
-    }
+    /** The DER-encoded subject name of the certificate */
+    [[nodiscard]] virtual std::vector<uint8_t> subject_der() const = 0;
   };
 
   using VerifierPtr = std::shared_ptr<Verifier>;
@@ -252,11 +202,24 @@ namespace crypto
    */
   VerifierPtr make_verifier(const Pem& pem);
 
-  crypto::Pem cert_der_to_pem(const std::vector<uint8_t>& der);
+  /**
+   * Convert a DER-encoded certificate to PEM.
+   * Accepts certificates with any public key type.
+   * @throws std::invalid_argument if the input is not a DER-encoded certificate
+   */
+  ccf::crypto::Pem cert_der_to_pem(const std::vector<uint8_t>& der);
+
+  /**
+   * Convert a PEM-encoded certificate to DER.
+   * Accepts certificates with any public key type.
+   * @throws std::invalid_argument if the input is not a PEM-encoded certificate
+   */
   std::vector<uint8_t> cert_pem_to_der(const Pem& pem);
 
   std::vector<uint8_t> public_key_der_from_cert(
     const std::vector<uint8_t>& der);
 
-  crypto::Pem public_key_pem_from_cert(const std::vector<uint8_t>& der);
+  ccf::crypto::Pem public_key_pem_from_cert(const std::vector<uint8_t>& der);
+
+  std::string get_subject_name(const Pem& cert);
 }

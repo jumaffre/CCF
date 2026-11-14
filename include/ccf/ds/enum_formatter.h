@@ -4,12 +4,14 @@
 
 #define FMT_HEADER_ONLY
 #include <fmt/format.h>
+#include <utility>
 
 /**
  * Generic formatter for scoped enums.
  * Newer version of fmt does not include it by default.
  */
 FMT_BEGIN_NAMESPACE
+
 template <typename E>
 struct formatter<E, std::enable_if_t<std::is_enum_v<E>, char>>
 {
@@ -22,8 +24,12 @@ struct formatter<E, std::enable_if_t<std::is_enum_v<E>, char>>
   template <typename FormatContext>
   auto format(const E& value, FormatContext& ctx) const
   {
-    return fmt::format_to(
-      ctx.out(), "{}", static_cast<std::underlying_type_t<E>>(value));
+    return fmt::format_to(ctx.out(), "{}", std::to_underlying(value));
   }
 };
+
 FMT_END_NAMESPACE
+
+// ci-checks exception - defines a struct in the fmt namespace
+namespace ccf
+{}

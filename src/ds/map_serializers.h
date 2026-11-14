@@ -2,7 +2,7 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ccf_assert.h"
+#include "ds/ccf_assert.h"
 #include "ds/serialized.h"
 
 #include <span>
@@ -61,7 +61,7 @@ namespace map
   template <class T>
   inline T deserialize(const uint8_t*& data, size_t& size)
   {
-    size_t result = serialized::read<size_t>(data, size);
+    auto result = serialized::read<size_t>(data, size);
     (void)result;
     CCF_ASSERT_FMT(
       result == sizeof(T), "result:{} == sizeof(T):{}", result, sizeof(T));

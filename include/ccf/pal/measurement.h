@@ -12,7 +12,7 @@
 
 namespace ccf::pal
 {
-  template <size_t N>
+  template <size_t N, typename Tag = void>
   struct AttestationMeasurement
   {
     std::array<uint8_t, N> measurement;
@@ -22,16 +22,18 @@ namespace ccf::pal
       return N;
     }
 
-    std::string hex_str() const
+    [[nodiscard]] std::string hex_str() const
     {
       return ds::to_hex(measurement);
     }
 
     AttestationMeasurement() = default;
+
     AttestationMeasurement(const std::string& hex_str)
     {
       ds::from_hex(hex_str, measurement);
     }
+
     AttestationMeasurement(std::span<const uint8_t> data)
     {
       if (data.size() != size())
@@ -51,20 +53,21 @@ namespace ccf::pal
   struct is_attestation_measurement : std::false_type
   {};
 
-  template <size_t N>
-  struct is_attestation_measurement<AttestationMeasurement<N>> : std::true_type
+  template <size_t N, typename Tag>
+  struct is_attestation_measurement<AttestationMeasurement<N, Tag>>
+    : std::true_type
   {};
 
-  template <size_t N>
+  template <size_t N, typename Tag = void>
   inline void to_json(
-    nlohmann::json& j, const AttestationMeasurement<N>& measurement)
+    nlohmann::json& j, const AttestationMeasurement<N, Tag>& measurement)
   {
     j = measurement.hex_str();
   }
 
-  template <size_t N>
+  template <size_t N, typename Tag = void>
   inline void from_json(
-    const nlohmann::json& j, AttestationMeasurement<N>& measurement)
+    const nlohmann::json& j, AttestationMeasurement<N, Tag>& measurement)
   {
     if (j.is_string())
     {
@@ -72,14 +75,15 @@ namespace ccf::pal
     }
     else
     {
-      throw JsonParseError(fmt::format(
+      throw ccf::JsonParseError(fmt::format(
         "Attestation measurement should be hex-encoded string: {}", j.dump()));
     }
   }
 
-  template <size_t N>
+  template <size_t N, typename Tag = void>
   inline void fill_json_schema(
-    nlohmann::json& schema, const AttestationMeasurement<N>*)
+    nlohmann::json& schema,
+    [[maybe_unused]] const AttestationMeasurement<N, Tag>* measurement_type)
   {
     schema["type"] = "string";
 
@@ -88,15 +92,19 @@ namespace ccf::pal
     // https://swagger.io/docs/specification/data-models/data-types/#format
     schema["format"] = "hex";
     schema["pattern"] =
-      fmt::format("^[a-f0-9]{}$", AttestationMeasurement<N>::size() * 2);
+      fmt::format("^[a-f0-9]{}$", AttestationMeasurement<N, Tag>::size() * 2);
   }
+
+  // Virtual
+  using VirtualAttestationMeasurement = std::string;
 
   // SGX
   static constexpr size_t sgx_attestation_measurement_size = 32;
   using SgxAttestationMeasurement =
     AttestationMeasurement<sgx_attestation_measurement_size>;
 
-  inline std::string schema_name(const SgxAttestationMeasurement*)
+  inline std::string schema_name(
+    [[maybe_unused]] const SgxAttestationMeasurement* sgx_measurement_type)
   {
     return "SgxAttestationMeasurement";
   }
@@ -106,7 +114,8 @@ namespace ccf::pal
   using SnpAttestationMeasurement =
     AttestationMeasurement<snp_attestation_measurement_size>;
 
-  inline std::string schema_name(const SnpAttestationMeasurement*)
+  inline std::string schema_name(
+    [[maybe_unused]] const SnpAttestationMeasurement* snp_measurement_type)
   {
     return "SnpAttestationMeasurement";
   }
@@ -120,16 +129,16 @@ namespace ccf::pal
     PlatformAttestationMeasurement(const PlatformAttestationMeasurement&) =
       default;
 
-    template <size_t N>
+    template <size_t N, typename Tag>
     PlatformAttestationMeasurement(
-      const AttestationMeasurement<N>& measurement) :
+      const AttestationMeasurement<N, Tag>& measurement) :
       data(measurement.measurement.begin(), measurement.measurement.end())
     {}
 
     PlatformAttestationMeasurement& operator=(
       const PlatformAttestationMeasurement&) = default;
 
-    std::string hex_str() const
+    [[nodiscard]] std::string hex_str() const
     {
       return ds::to_hex(data);
     }
@@ -139,27 +148,28 @@ namespace ccf::pal
       return data;
     }
   };
+
   DECLARE_JSON_TYPE(PlatformAttestationMeasurement);
   DECLARE_JSON_REQUIRED_FIELDS(PlatformAttestationMeasurement, data);
 }
 
-namespace kv::serialisers
+namespace ccf::kv::serialisers
 {
-  template <size_t N>
-  struct BlitSerialiser<ccf::pal::AttestationMeasurement<N>>
+  template <size_t N, typename Tag>
+  struct BlitSerialiser<ccf::pal::AttestationMeasurement<N, Tag>>
   {
     static SerialisedEntry to_serialised(
-      const ccf::pal::AttestationMeasurement<N>& measurement)
+      const ccf::pal::AttestationMeasurement<N, Tag>& measurement)
     {
       auto hex_str = measurement.hex_str();
       return SerialisedEntry(hex_str.begin(), hex_str.end());
     }
 
-    static ccf::pal::AttestationMeasurement<N> from_serialised(
+    static ccf::pal::AttestationMeasurement<N, Tag> from_serialised(
       const SerialisedEntry& data)
     {
-      ccf::pal::AttestationMeasurement<N> ret;
-      ds::from_hex(std::string(data.data(), data.end()), ret.measurement);
+      ccf::pal::AttestationMeasurement<N, Tag> ret{};
+      ccf::ds::from_hex(std::string(data.data(), data.end()), ret.measurement);
       return ret;
     }
   };

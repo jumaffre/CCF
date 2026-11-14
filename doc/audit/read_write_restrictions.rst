@@ -39,7 +39,7 @@ There are multiple possible contexts in which developer-specified code may execu
 
 .. note::
 
-    Since the constitution (and JS application) are written in JavaScript, there is also technically a global module evaluation context when the code is first ingested. It is expected that this only defines and exports the necessary functions. It has no access to the KV, and will result in errors if it attempts to access any KV table.
+    Since the constitution (and JS application) are written in JavaScript, there is also technically a global module evaluation context when the code is first ingested. Module top-level code runs in the same context, with the same KV read/write permissions, and under the same runtime limits as the function that is about to be invoked (the pre-approval governance context for ballots and the constitution's ``validate`` and ``resolve``, the post-approval context for ``apply``, or the application context for endpoint handlers). This is well-defined in the default fresh-interpreter mode, where each request creates a new interpreter and re-evaluates the module against the current transaction. It is expected that module top-level code only defines and exports the necessary functions.
 
 Restricted Permissions
 ----------------------
@@ -49,12 +49,16 @@ CCF ensures that governance audit is possible offline from a ledger, by consider
 - Governance code must never read from private tables. Doing so might make decisions which could not be reproduced from the ledger by an auditor (ie. without access to ledger secrets).
 - Governance code must never read from application tables. Doing so might produce dependencies on data which was not signed by a member.
 - Governance code running pre-approval must only have read access to tables, and never write.
-- Governance code should not write to application tables, which could be modified further outside of governance.
 - Application code must not modify governance tables, as it could do so without constitution approval.
 
 .. note:: 
 
     An important exemption here is that application code may still `read` from governance tables. This allows authentication, authorization, and metadata to be configured and controlled by governance, but affect the execution of application endpoints.
+
+..
+    A link to this page is included in the CCF source code, and returned in error messages.
+    If this table is moved, make sure the source is updated in-sync.
+    (Ctrl+Shift+F: read_write_restrictions)
 
 The possible access permissions are elaborated in the table below:
 
@@ -70,9 +74,9 @@ The possible access permissions are elaborated in the table below:
     +==========================+============+============+============+============+============+============+
     | Pre-approval governance  | Read-only  | None       | Read-only  | None       | None       | None       |
     +--------------------------+------------+------------+------------+------------+------------+------------+
-    | Post-approval governance | Read-only  | None       | Writeable  | None       | None       | None       |
+    | Post-approval governance | Read-only  | None       | Read/Write | None       | Write-Only | None       |
     +--------------------------+------------+------------+------------+------------+------------+------------+
-    | Application              | Read-only  | None       | Read-only  | None       | Writeable  | Writeable  |
+    | Application              | Read-only  | None       | Read-only  | None       | Read/Write | Read/Write |
     +--------------------------+------------+------------+------------+------------+------------+------------+
 
 Any violation of these restrictions (eg - calling ``set`` on a `Read-only` table, or ``has`` on a `None` table) results in an exception being thrown.

@@ -2,13 +2,13 @@
 // Licensed under the Apache 2.0 License.
 #include "ccf/ds/openapi.h"
 
-#include "ccf/ds/logger.h"
 #include "ccf/http_consts.h"
+#include "ds/internal_logger.h"
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-using namespace ds;
+using namespace ccf::ds;
 
 #define REQUIRE_ELEMENT(j, name, type_fn) \
   { \
@@ -43,14 +43,14 @@ TEST_CASE("Manual construction")
   auto& foo_post = openapi::path_operation(foo, HTTP_POST);
   auto& foo_post_request = openapi::request_body(foo_post);
   auto& foo_post_request_json = openapi::media_type(
-    foo_post_request, http::headervalues::contenttype::JSON);
+    foo_post_request, ccf::http::headervalues::contenttype::JSON);
   auto& foo_post_request_json_schema = openapi::schema(foo_post_request_json);
   foo_post_request_json_schema = string_schema;
 
   auto& foo_post_response_ok = openapi::response(
     foo_post, HTTP_STATUS_OK, "Indicates that everything went ok");
   auto& foo_post_response_ok_json = openapi::media_type(
-    foo_post_response_ok, http::headervalues::contenttype::JSON);
+    foo_post_response_ok, ccf::http::headervalues::contenttype::JSON);
   auto& foo_post_response_ok_json_schema =
     openapi::schema(foo_post_response_ok_json);
   foo_post_response_ok_json_schema = string_schema;
@@ -74,6 +74,7 @@ struct Foo
   size_t n;
   std::string s;
 };
+
 DECLARE_JSON_TYPE(Foo);
 DECLARE_JSON_REQUIRED_FIELDS(Foo, n, s);
 
@@ -99,6 +100,7 @@ struct Bar
   std::string name;
   double f;
 };
+
 DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(Bar);
 DECLARE_JSON_REQUIRED_FIELDS(Bar, name);
 DECLARE_JSON_OPTIONAL_FIELDS(Bar, f);
@@ -123,15 +125,29 @@ struct Baz : public Bar
   double y;
   Vehicle v;
 };
+
 DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(Baz, Bar);
 DECLARE_JSON_REQUIRED_FIELDS(Baz, n, v);
 DECLARE_JSON_OPTIONAL_FIELDS(Baz, x, y);
+
+namespace std
+{
+  template <>
+  struct hash<Baz>
+  {
+    size_t operator()(const Baz& b) const
+    {
+      return std::hash<uint16_t>()(b.n);
+    }
+  };
+}
 
 struct Buzz : public Baz
 {
   Foo required_and_only_in_c;
   uint16_t optional_and_only_in_c;
 };
+
 DECLARE_JSON_TYPE_WITH_BASE_AND_OPTIONAL_FIELDS(Buzz, Baz);
 DECLARE_JSON_REQUIRED_FIELDS_WITH_RENAMES(
   Buzz, required_and_only_in_c, "RequiredJsonField");
@@ -159,6 +175,8 @@ TEST_CASE("Complex custom types")
   openapi::add_request_body_schema<std::optional<Bar>>(
     doc, "/app/complex", HTTP_POST);
   openapi::add_response_schema<std::map<Baz, std::vector<Buzz>>>(
+    doc, "/app/complex", HTTP_POST, HTTP_STATUS_OK);
+  openapi::add_response_schema<std::unordered_set<Baz>>(
     doc, "/app/complex", HTTP_POST, HTTP_STATUS_OK);
 
   required_doc_elements(doc);
@@ -211,6 +229,7 @@ namespace bbb
     aaa::FriendlyName name;
     size_t age;
   };
+
   DECLARE_JSON_TYPE(Person);
   DECLARE_JSON_REQUIRED_FIELDS(Person, name, age);
 }
@@ -258,9 +277,74 @@ TEST_CASE("Manual function definitions")
   }
 }
 
+struct WithRequiredOptionalField
+{
+  std::optional<Foo> maybe_foo;
+};
+
+DECLARE_JSON_TYPE(WithRequiredOptionalField);
+DECLARE_JSON_REQUIRED_FIELDS(WithRequiredOptionalField, maybe_foo);
+
+TEST_CASE(
+  "Required optional field produces nullable component schema, not "
+  "generated output")
+{
+  // Regression test: a std::optional<T> field which is JSON-required (always
+  // present, but may hold a null value - e.g.
+  // ccf::kv::ConsensusDetails::primary_id while no primary is known) must
+  // produce a schema that permits null, in addition to the ref/inline schema
+  // for T. See https://github.com/microsoft/CCF/issues/8323.
+  auto doc = openapi::create_document(
+    "Test generated API",
+    "Some longer description enhanced with **Markdown**",
+    "0.1.42");
+
+  openapi::server(doc, server_url);
+
+  openapi::add_response_schema<WithRequiredOptionalField>(
+    doc, "/app/required_optional", HTTP_GET, HTTP_STATUS_OK);
+
+  const auto& components_schemas = doc["components"]["schemas"];
+  const auto it = components_schemas.find("WithRequiredOptionalField");
+  REQUIRE(it != components_schemas.end());
+
+  const auto& schema = *it;
+  REQUIRE(schema.contains("required"));
+  const auto& required = schema["required"];
+  bool found_required = false;
+  for (const auto& field : required)
+  {
+    if (field == "maybe_foo")
+    {
+      found_required = true;
+    }
+  }
+  REQUIRE(found_required);
+
+  const auto& properties = schema["properties"];
+  const auto prop_it = properties.find("maybe_foo");
+  REQUIRE(prop_it != properties.end());
+  const auto& maybe_foo_schema = *prop_it;
+
+  // OpenAPI 3.0 does not support "type": "null", nor a $ref with sibling
+  // keys. Express this as the referenced type or a branch constrained to
+  // null. The enum is necessary so this branch does not accept arbitrary
+  // values as well as null.
+  REQUIRE(maybe_foo_schema.contains("anyOf"));
+  const auto& any_of = maybe_foo_schema["anyOf"];
+  REQUIRE(any_of.is_array());
+  REQUIRE(any_of.size() == 2);
+  CHECK(any_of[0]["$ref"] == "#/components/schemas/Foo");
+  CHECK(any_of[1]["type"] == "object");
+  CHECK(any_of[1]["nullable"] == true);
+  REQUIRE(any_of[1]["enum"].is_array());
+  REQUIRE(any_of[1]["enum"].size() == 1);
+  CHECK(any_of[1]["enum"][0].is_null());
+}
+
 TEST_CASE("sanitise_components_key")
 {
-  using namespace ds::openapi;
+  using namespace ccf::ds::openapi;
 
   CHECK(sanitise_components_key("User") == "User");
   CHECK(sanitise_components_key("User_1") == "User_1");

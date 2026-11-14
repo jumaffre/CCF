@@ -7,15 +7,17 @@
 #include "ccf/crypto/symmetric_key.h"
 #include "ds/serialized.h"
 
+#include <algorithm>
+
 #define FMT_HEADER_ONLY
 #include <fmt/format.h>
 
-namespace crypto
+namespace ccf::crypto
 {
   /// GcmHeader implementation
-  GcmHeader::GcmHeader(size_t iv_size)
+  GcmHeader::GcmHeader(size_t iv_size_)
   {
-    iv.resize(iv_size);
+    iv.resize(iv_size_);
   }
 
   void GcmHeader::set_iv(const uint8_t* data, size_t size)
@@ -39,21 +41,29 @@ namespace crypto
     return sizeof(tag) + iv.size();
   }
 
-  std::vector<uint8_t> GcmHeader::serialise()
+  std::vector<uint8_t> GcmHeader::serialise() const
   {
-    auto space = serialised_size();
-    std::vector<uint8_t> serial_hdr(space);
+    std::vector<uint8_t> serial_hdr(serialised_size());
+    serialise(serial_hdr);
+    return serial_hdr;
+  }
 
-    auto data_ = serial_hdr.data();
+  void GcmHeader::serialise(std::span<uint8_t> output) const
+  {
+    if (output.size() != serialised_size())
+    {
+      throw std::logic_error("Incorrect GCM header output size");
+    }
+
+    auto* data_ = output.data();
+    auto space = output.size();
     serialized::write(data_, space, tag, sizeof(tag));
     serialized::write(data_, space, iv.data(), iv.size());
-
-    return serial_hdr;
   }
 
   void GcmHeader::deserialise(const std::vector<uint8_t>& ser)
   {
-    auto data = ser.data();
+    const auto* data = ser.data();
     auto size = ser.size();
 
     deserialise(data, size);
@@ -62,8 +72,81 @@ namespace crypto
   void GcmHeader::deserialise(const uint8_t*& data, size_t& size)
   {
     memcpy(
-      tag, serialized::read(data, size, GCM_SIZE_TAG).data(), GCM_SIZE_TAG);
+      static_cast<uint8_t*>(tag),
+      serialized::read(data, size, GCM_SIZE_TAG).data(),
+      GCM_SIZE_TAG);
     iv = serialized::read(data, size, iv.size());
+  }
+
+  void KeyAesGcm::Context::encrypt(
+    std::span<const uint8_t> iv,
+    std::span<const uint8_t> plain,
+    std::span<const uint8_t> aad,
+    std::span<uint8_t> cipher,
+    uint8_t tag[GCM_SIZE_TAG])
+  {
+    if (cipher.size() != plain.size())
+    {
+      throw std::logic_error("Incorrect AES-GCM output size");
+    }
+    std::vector<uint8_t> output;
+    encrypt(iv, plain, aad, output, tag);
+    if (output.size() != cipher.size())
+    {
+      throw std::logic_error("Unexpected AES-GCM ciphertext size");
+    }
+    if (!output.empty())
+    {
+      std::copy(output.begin(), output.end(), cipher.begin());
+    }
+  }
+
+  void KeyAesGcm::encrypt(
+    std::span<const uint8_t> iv,
+    std::span<const uint8_t> plain,
+    std::span<const uint8_t> aad,
+    std::span<uint8_t> cipher,
+    uint8_t tag[GCM_SIZE_TAG]) const
+  {
+    if (cipher.size() != plain.size())
+    {
+      throw std::logic_error("Incorrect AES-GCM output size");
+    }
+    std::vector<uint8_t> output;
+    encrypt(iv, plain, aad, output, tag);
+    if (output.size() != cipher.size())
+    {
+      throw std::logic_error("Unexpected AES-GCM ciphertext size");
+    }
+    if (!output.empty())
+    {
+      std::copy(output.begin(), output.end(), cipher.begin());
+    }
+  }
+
+  bool KeyAesGcm::decrypt(
+    std::span<const uint8_t> iv,
+    const uint8_t tag[GCM_SIZE_TAG],
+    std::span<const uint8_t> cipher,
+    std::span<const uint8_t> aad,
+    std::span<uint8_t> plain) const
+  {
+    if (cipher.size() != plain.size())
+    {
+      throw std::logic_error("Incorrect AES-GCM output size");
+    }
+    std::vector<uint8_t> output;
+    if (!decrypt(iv, tag, cipher, aad, output))
+    {
+      std::fill(plain.begin(), plain.end(), 0);
+      return false;
+    }
+    if (output.size() != plain.size())
+    {
+      throw std::logic_error("Unexpected AES-GCM plaintext size");
+    }
+    std::copy(output.begin(), output.end(), plain.begin());
+    return true;
   }
 
   /// GcmCipher implementation
@@ -74,11 +157,12 @@ namespace crypto
   std::vector<uint8_t> GcmCipher::serialise()
   {
     std::vector<uint8_t> serial;
-    auto space = hdr.serialised_size() + cipher.size();
+    auto space = StandardGcmHeader::serialised_size() + cipher.size();
     serial.resize(space);
 
-    auto data_ = serial.data();
-    serialized::write(data_, space, hdr.tag, sizeof(hdr.tag));
+    auto* data_ = serial.data();
+    serialized::write(
+      data_, space, static_cast<uint8_t*>(hdr.tag), sizeof(hdr.tag));
     serialized::write(data_, space, hdr.iv.data(), hdr.iv.size());
     serialized::write(data_, space, cipher.data(), cipher.size());
 
@@ -87,54 +171,15 @@ namespace crypto
 
   void GcmCipher::deserialise(const std::vector<uint8_t>& serial)
   {
-    auto data = serial.data();
+    const auto* data = serial.data();
     auto size = serial.size();
     hdr.deserialise(data, size);
     cipher = serialized::read(data, size, size);
   }
 
   /// Free function implementation
-  std::unique_ptr<KeyAesGcm> make_key_aes_gcm(std::span<const uint8_t> rawKey)
+  std::unique_ptr<KeyAesGcm> make_key_aes_gcm(std::span<const uint8_t> raw_key)
   {
-    return std::make_unique<KeyAesGcm_OpenSSL>(rawKey);
-  }
-
-  std::vector<uint8_t> aes_gcm_encrypt(
-    const std::vector<uint8_t>& key,
-    std::vector<uint8_t>& plaintext,
-    const std::vector<uint8_t>& iv,
-    const std::vector<uint8_t>& aad)
-  {
-    check_supported_aes_key_size(key.size() * 8);
-
-    std::vector<uint8_t> r;
-    std::vector<uint8_t> tag(GCM_SIZE_TAG);
-    auto k = make_key_aes_gcm(key);
-    k->encrypt(iv, plaintext, aad, r, tag.data());
-    r.insert(r.end(), tag.begin(), tag.end());
-    return r;
-  }
-
-  std::vector<uint8_t> aes_gcm_decrypt(
-    const std::vector<uint8_t>& key,
-    std::vector<uint8_t>& ciphertext,
-    const std::vector<uint8_t>& iv,
-    const std::vector<uint8_t>& aad)
-  {
-    check_supported_aes_key_size(key.size() * 8);
-
-    if (ciphertext.size() <= GCM_SIZE_TAG)
-      throw std::runtime_error("Not enough ciphertext");
-
-    size_t ciphertext_length = ciphertext.size() - GCM_SIZE_TAG;
-    std::vector<uint8_t> r;
-    auto k = make_key_aes_gcm(key);
-    k->decrypt(
-      iv,
-      ciphertext.data() + ciphertext_length,
-      std::span<const uint8_t>(ciphertext.data(), ciphertext_length),
-      aad,
-      r);
-    return r;
+    return std::make_unique<KeyAesGcm_OpenSSL>(raw_key);
   }
 }

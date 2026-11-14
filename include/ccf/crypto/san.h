@@ -9,7 +9,7 @@
 #include <fmt/format.h>
 #include <string>
 
-namespace crypto
+namespace ccf::crypto
 {
   static const std::string IP_ADDRESS_PREFIX = "iPAddress:";
   static const std::string DNS_NAME_PREFIX = "dNSName:";
@@ -22,6 +22,7 @@ namespace crypto
     bool operator==(const SubjectAltName& other) const = default;
     bool operator!=(const SubjectAltName& other) const = default;
   };
+
   DECLARE_JSON_TYPE(SubjectAltName);
   DECLARE_JSON_REQUIRED_FIELDS(SubjectAltName, san, is_ip);
 
@@ -31,21 +32,21 @@ namespace crypto
     {
       return {str.substr(IP_ADDRESS_PREFIX.size()), true};
     }
-    else if (str.starts_with(DNS_NAME_PREFIX))
+
+    if (str.starts_with(DNS_NAME_PREFIX))
     {
       return {str.substr(DNS_NAME_PREFIX.size()), false};
     }
-    else
-    {
-      throw std::logic_error(fmt::format(
-        "SAN could not be parsed: {}, must be (iPAddress|dNSName):VALUE", str));
-    }
+
+    throw std::logic_error(fmt::format(
+      "SAN could not be parsed: {}, must be (iPAddress|dNSName):VALUE", str));
   }
 
   static std::vector<SubjectAltName> sans_from_string_list(
     const std::vector<std::string>& list)
   {
     std::vector<SubjectAltName> sans = {};
+    sans.reserve(list.size());
     for (const auto& l : list)
     {
       sans.push_back(san_from_string(l));
@@ -55,8 +56,9 @@ namespace crypto
 }
 
 FMT_BEGIN_NAMESPACE
+
 template <>
-struct formatter<crypto::SubjectAltName>
+struct formatter<ccf::crypto::SubjectAltName>
 {
   template <typename ParseContext>
   constexpr auto parse(ParseContext& ctx)
@@ -65,7 +67,7 @@ struct formatter<crypto::SubjectAltName>
   }
 
   template <typename FormatContext>
-  auto format(const crypto::SubjectAltName& san, FormatContext& ctx) const
+  auto format(const ccf::crypto::SubjectAltName& san, FormatContext& ctx) const
     -> decltype(ctx.out())
   {
     std::string prefix;
@@ -80,4 +82,5 @@ struct formatter<crypto::SubjectAltName>
     return format_to(ctx.out(), "{}:{}", prefix, san.san);
   }
 };
+
 FMT_END_NAMESPACE

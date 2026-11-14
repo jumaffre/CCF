@@ -4,7 +4,7 @@
 
 #include <string>
 
-namespace kv
+namespace ccf::kv
 {
   struct GetName
   {
@@ -12,10 +12,11 @@ namespace kv
     std::string name;
 
   public:
-    GetName(const std::string& s) : name(s) {}
+    GetName(std::string s) : name(std::move(s)) {}
+
     virtual ~GetName() = default;
 
-    const std::string& get_name() const
+    [[nodiscard]] const std::string& get_name() const
     {
       return name;
     }

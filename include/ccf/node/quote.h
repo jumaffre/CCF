@@ -2,18 +2,20 @@
 // Licensed under the Apache 2.0 License.
 #pragma once
 
-#include "ccf/ccf_deprecated.h"
 #include "ccf/ds/quote_info.h"
+#include "ccf/network_identity_interface.h"
+#include "ccf/pal/attestation_sev_snp.h"
 #include "ccf/pal/measurement.h"
 #include "ccf/service/tables/host_data.h"
 #include "ccf/tx.h"
 
+#include <memory>
 #include <optional>
 #include <vector>
 
 namespace ccf
 {
-  enum class QuoteVerificationResult
+  enum class QuoteVerificationResult : uint8_t
   {
     Verified = 0,
     Failed,
@@ -22,6 +24,8 @@ namespace ccf
     FailedInvalidHostData,
     FailedInvalidQuotedPublicKey,
     FailedUVMEndorsementsNotFound,
+    FailedInvalidCPUID,
+    FailedInvalidTcbVersion
   };
 
   class AttestationProvider
@@ -35,13 +39,27 @@ namespace ccf
 
     static std::optional<HostData> get_host_data(const QuoteInfo& quote_info);
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    [[deprecated("Use get_snp_attestation_report")]]
+    static std::optional<pal::snp::Attestation> get_snp_attestation(
+      const QuoteInfo& quote_info);
+#pragma GCC diagnostic pop
+
+    static std::optional<pal::snp::AttestationReport>
+    get_snp_attestation_report(const QuoteInfo& quote_info);
+
     static QuoteVerificationResult verify_quote_against_store(
-      kv::ReadOnlyTx& tx,
+      ccf::kv::ReadOnlyTx& tx,
       const QuoteInfo& quote_info,
       const std::vector<uint8_t>& expected_node_public_key_der,
-      pal::PlatformAttestationMeasurement& measurement);
+      pal::PlatformAttestationMeasurement& measurement,
+      const std::optional<std::vector<uint8_t>>& code_transparent_statement,
+      std::shared_ptr<NetworkIdentitySubsystemInterface>
+        network_identity_subsystem = nullptr);
   };
 
-  using EnclaveAttestationProvider CCF_DEPRECATED("Will be removed in 4.x") =
-    AttestationProvider;
+  QuoteVerificationResult verify_tcb_version_against_store(
+    ccf::kv::ReadOnlyTx& tx, const QuoteInfo& quote_info);
+
 }

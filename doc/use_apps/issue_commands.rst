@@ -3,7 +3,7 @@ Issuing Commands
 
 Clients communicate with CCF using HTTP requests, over TLS.
 
-For example, to record a message at a specific id with the :doc:`C++ sample logging application </build_apps/example>` using curl:
+For example, to record a message at a specific id with the :doc:`C++ sample logging application </build_apps/example_cpp>` using curl:
 
 .. code-block:: bash
 
@@ -30,20 +30,19 @@ The response body (the JSON value ``true``) indicates that the request was execu
 Signing
 -------
 
-In some situations CCF requires signed requests, for example for member votes. Only one signing scheme is supported as of 4.x:
+In some situations CCF requires signed requests, for example for member votes. CCF supports one signing scheme:
 
 COSE Sign1
 ~~~~~~~~~~
 
-CCF accepts signed requests in `COSE Sign1 <https://www.rfc-editor.org/rfc/rfc8152#section-4.2>`_ format.
+CCF accepts signed requests in `COSE Sign1 <https://www.rfc-editor.org/rfc/rfc8152.html#section-4.2>`_ format.
 
 CCF identifies the signing identity for a request via the SHA-256 digest of its certificate, represented as a hex string.
-That value must be set in the ``kid`` protected header. Additional protected headers may be necessary, for example governance endpoints
-require setting ``ccf.gov.msg.type``, ``ccf.gov.msg.created_at``, and optionally ``ccf.gov.msg.proposal_id`` on the message types where it applies.
+That value must be set in the ``kid`` protected header. Additional protected headers may be necessary, for example governance endpoints require setting ``ccf.gov.msg.type``, ``ccf.gov.msg.created_at``, and optionally ``ccf.gov.msg.proposal_id`` on the message types where it applies.
 
 A signing script (``ccf_cose_sign1``) is provided as part of the `ccf Python package <https://pypi.org/project/ccf/>`_. The output can be piped directly into curl, or any other HTTP client.
 
-Commands can also be signed using the `pycose <https://github.com/TimothyClaeys/pycose>`_ library, and sent with any standard HTTP library such as `Python HTTPX <https://www.python-httpx.org/>`_.
+Commands can also be signed using the `python-cwt <https://github.com/dajiaji/python-cwt/>`_ library, and sent with any standard HTTP library such as `Python HTTPX <https://www.python-httpx.org/>`_.
 
 Idempotence
 ^^^^^^^^^^^
@@ -53,8 +52,6 @@ To make governance commands idempotent, and to prevent potential replay attacks 
 A fixed-sized window of proposal request digests is kept by CCF, and newly submitted proposal requests must not collide with existing entries nor be older than the median proposal request in the window. The size of the window is defined in :ref:`audit/builtin_maps:``service.config```.
 
 The timestamp must be submitted as a integer number of seconds since Unix epoch (Thursday 1 January 1970 00:00:00 UT).
-
-.. warning:: HTTP request signing could be used in previous versions of CCF, but has been removed as of 4.0, in favour of COSE Sign1.
 
 COSE Schemas
 ^^^^^^^^^^^^
@@ -70,7 +67,7 @@ Creating a new proposal:
    :align: left
 
    * - Operation
-     - ``POST /gov/members/proposals``
+     - ``POST /gov/members/proposals:create``
    * - Protected headers
      - | ``ccf.gov.msg.type = proposal``
        | ``ccf.gov.msg.created_at = <creation timestamp>``
@@ -135,7 +132,7 @@ Acking state digest:
        | ``ccf.gov.msg.created_at = <creation timestamp>``
    * - Content
      - | { "stateDigest": "<hex digest>" }
-       | This should be the object returned by a previous call to ``GET /gov/members/state-digests/{memberId}``
+       | This should be the object returned by a previous call to ``POST /gov/members/state-digests/{memberId}:update``. Subsequent calls to ``GET /gov/members/state-digests/{memberId}`` return the same object until it is updated again.
 
 Recovery
 """"""""
@@ -146,9 +143,9 @@ Submitting recovery share:
    :align: left
 
    * - Operation
-     - ``POST /gov/members/members/{memberId}:recover``
+     - ``POST /gov/recovery/members/{memberId}:recover``
    * - Protected headers
-     - | ``ccf.gov.msg.type = encrypted_recovery_share``
+     - | ``ccf.gov.msg.type = recovery_share``
        | ``ccf.gov.msg.created_at = <creation timestamp>``
    * - Content
      - { "share": "<base64-encoded decrypted share>" }

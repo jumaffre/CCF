@@ -10,14 +10,47 @@
 #include "ccf/http_query.h"
 #include "ccf/json_handler.h"
 #include "ccf/node_context.h"
+#include "ccf/receipt.h"
 #include "ccf/service/tables/code_id.h"
 #include "ccf/service/tables/host_data.h"
 #include "ccf/service/tables/snp_measurements.h"
-#include "node/rpc/call_types.h"
-#include "node/rpc/serialization.h"
+#include "ccf/tx_id.h"
+#include "ccf/tx_status.h"
 
 namespace ccf
 {
+  struct GetCommit
+  {
+    using In = void;
+
+    struct Out
+    {
+      ccf::TxID transaction_id;
+      std::vector<ccf::TxID> view_history;
+    };
+  };
+
+  struct GetTxStatus
+  {
+    struct Out
+    {
+      ccf::TxID transaction_id;
+      TxStatus status{};
+    };
+  };
+
+  struct GetAPI
+  {
+    using Out = nlohmann::json;
+  };
+
+  DECLARE_JSON_TYPE_WITH_OPTIONAL_FIELDS(GetCommit::Out);
+  DECLARE_JSON_REQUIRED_FIELDS(GetCommit::Out, transaction_id);
+  DECLARE_JSON_OPTIONAL_FIELDS(GetCommit::Out, view_history);
+
+  DECLARE_JSON_TYPE(GetTxStatus::Out);
+  DECLARE_JSON_REQUIRED_FIELDS(GetTxStatus::Out, transaction_id, status);
+
   static constexpr auto tx_id_param_key = "transaction_id";
   static constexpr auto view_history_param_key = "view_history";
   static constexpr auto view_history_since_param_key = "view_history_since";
@@ -62,7 +95,7 @@ namespace ccf
   }
 
   CommonEndpointRegistry::CommonEndpointRegistry(
-    const std::string& method_prefix_, ccfapp::AbstractNodeContext& context_) :
+    const std::string& method_prefix_, ccf::AbstractNodeContext& context_) :
     BaseEndpointRegistry(method_prefix_, context_)
   {}
 
@@ -71,8 +104,8 @@ namespace ccf
     BaseEndpointRegistry::init_handlers();
 
     auto get_commit = [this](auto& ctx, nlohmann::json&&) {
-      ccf::View view;
-      ccf::SeqNo seqno;
+      ccf::View view = 0;
+      ccf::SeqNo seqno = 0;
       auto result = get_last_committed_txid_v1(view, seqno);
       if (result != ccf::ApiResult::OK)
       {
@@ -98,7 +131,7 @@ namespace ccf
       // validated
       if (view_history_since.has_value())
       {
-        if (error_reason != "")
+        if (!error_reason.empty())
         {
           return make_error(
             HTTP_STATUS_BAD_REQUEST,
@@ -107,6 +140,7 @@ namespace ccf
         }
         std::vector<ccf::TxID> history;
         result = get_view_history_v1(history, view_history_since.value());
+
         if (result == ccf::ApiResult::InvalidArgs)
         {
           return make_error(
@@ -116,7 +150,8 @@ namespace ccf
               "Invalid value for {}, must be in range [1, current_term]",
               view_history_since_param_key));
         }
-        else if (result == ccf::ApiResult::NotFound)
+
+        if (result == ccf::ApiResult::NotFound)
         {
           return make_error(
             HTTP_STATUS_NOT_FOUND,
@@ -125,7 +160,8 @@ namespace ccf
               "Invalid value for {}, must be in range [1, current_term]",
               view_history_since_param_key));
         }
-        else if (result != ccf::ApiResult::OK)
+
+        if (result != ccf::ApiResult::OK)
         {
           return make_error(
             HTTP_STATUS_INTERNAL_SERVER_ERROR,
@@ -142,7 +178,7 @@ namespace ccf
       // if view_history was given then we can validate the value
       if (view_history.has_value())
       {
-        if (error_reason != "")
+        if (!error_reason.empty())
         {
           return make_error(
             HTTP_STATUS_BAD_REQUEST,
@@ -172,7 +208,8 @@ namespace ccf
             HTTP_STATUS_BAD_REQUEST,
             ccf::errors::InvalidQueryParameterValue,
             fmt::format(
-              "Invalid value for {}, must be one of [true, false] when present",
+              "Invalid value for {}, must be one of [true, false] when "
+              "present",
               view_history_param_key));
         }
       }
@@ -204,7 +241,7 @@ namespace ccf
         return make_error(
           HTTP_STATUS_BAD_REQUEST,
           ccf::errors::InvalidQueryParameterValue,
-          std::move(error_reason));
+          error_reason);
       }
 
       const auto tx_id = ccf::TxID::from_str(tx_id_str);
@@ -228,13 +265,10 @@ namespace ccf
         out.transaction_id = tx_id.value();
         return make_success(out);
       }
-      else
-      {
-        return make_error(
-          HTTP_STATUS_INTERNAL_SERVER_ERROR,
-          ccf::errors::InternalError,
-          fmt::format("Error code: {}", ccf::api_result_to_str(result)));
-      }
+      return make_error(
+        HTTP_STATUS_INTERNAL_SERVER_ERROR,
+        ccf::errors::InternalError,
+        fmt::format("Error code: {}", ccf::api_result_to_str(result)));
     };
     make_command_endpoint(
       "/tx", HTTP_GET, json_command_adapter(get_tx_status), no_auth_required)
@@ -246,111 +280,117 @@ namespace ccf
         "Invalid.")
       .install();
 
-    auto get_code = [](auto& ctx, nlohmann::json&&) {
-      GetCode::Out out;
-
-      auto codes_ids = ctx.tx.template ro<CodeIDs>(Tables::NODE_CODE_IDS);
-      codes_ids->foreach(
-        [&out](
-          const ccf::pal::SgxAttestationMeasurement& measurement,
-          const ccf::CodeStatus& status) {
-          auto digest = measurement.hex_str();
-          out.versions.push_back({digest, status});
-          return true;
-        });
-
-      return make_success(out);
-    };
-    make_read_only_endpoint(
-      "/code", HTTP_GET, json_read_only_adapter(get_code), no_auth_required)
-      .set_auto_schema<void, GetCode::Out>()
-      .set_openapi_summary(
-        "This endpoint is deprecated. It is replaced by /gov/kv/nodes/code_ids "
-        "endpoint")
-      .set_openapi_deprecated(true)
-      .set_openapi_description("Permitted SGX code identities")
-      .install();
-
-    auto openapi = [this](auto& ctx, nlohmann::json&&) {
-      nlohmann::json document;
-      const auto result = generate_openapi_document_v1(
-        ctx.tx,
-        openapi_info.title,
-        openapi_info.description,
-        openapi_info.document_version,
-        document);
-
-      if (result == ccf::ApiResult::OK)
-      {
-        return make_success(document);
-      }
-      else
-      {
-        return make_error(
-          HTTP_STATUS_INTERNAL_SERVER_ERROR,
-          ccf::errors::InternalError,
-          fmt::format("Error code: {}", ccf::api_result_to_str(result)));
-      }
-    };
-    make_read_only_endpoint(
-      "/api", HTTP_GET, json_read_only_adapter(openapi), no_auth_required)
+    auto openapi = [this](auto& ctx) { this->api_endpoint(ctx); };
+    make_read_only_endpoint("/api", HTTP_GET, openapi, no_auth_required)
       .set_auto_schema<void, GetAPI::Out>()
       .set_openapi_summary("OpenAPI schema")
       .install();
 
-    auto endpoint_metrics_fn = [this](auto&, nlohmann::json&&) {
-      EndpointMetrics out;
-      const auto result = get_metrics_v1(out);
-      if (result == ccf::ApiResult::OK)
-      {
-        return make_success(out);
-      }
-      else
-      {
-        return make_error(
-          HTTP_STATUS_INTERNAL_SERVER_ERROR,
-          ccf::errors::InternalError,
-          fmt::format("Error code: {}", ccf::api_result_to_str(result)));
-      }
-    };
-    make_command_endpoint(
-      "/api/metrics",
-      HTTP_GET,
-      json_command_adapter(endpoint_metrics_fn),
-      no_auth_required)
-      .set_auto_schema<void, EndpointMetrics>()
-      .set_openapi_summary("Usage metrics for endpoints")
-      .install();
-
     auto is_tx_committed =
       [this](ccf::View view, ccf::SeqNo seqno, std::string& error_reason) {
+        auto* current_consensus = get_consensus();
         return ccf::historical::is_tx_committed_v2(
-          consensus, view, seqno, error_reason);
+          current_consensus, view, seqno, error_reason);
       };
 
     auto get_receipt =
-      [](auto& ctx, ccf::historical::StatePtr historical_state) {
-        const auto [pack, params] =
-          ccf::jsonhandler::get_json_params(ctx.rpc_ctx);
+      [](
+        auto& ctx,
+        ccf::historical::StatePtr
+          historical_state) { // NOLINT(performance-unnecessary-value-param)
+        const auto params = ccf::jsonhandler::get_json_params(ctx.rpc_ctx);
 
         assert(historical_state->receipt);
         auto out = ccf::describe_receipt_v1(*historical_state->receipt);
         ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
-        ccf::jsonhandler::set_response(out, ctx.rpc_ctx, pack);
+        ccf::jsonhandler::set_response(out, ctx.rpc_ctx);
       };
 
     make_read_only_endpoint(
       "/receipt",
       HTTP_GET,
-      ccf::historical::read_only_adapter_v3(
+      ccf::historical::read_only_adapter_v4(
         get_receipt, context, is_tx_committed, txid_from_query_string),
       no_auth_required)
       .set_auto_schema<void, nlohmann::json>()
+      .add_openapi_response<std::string>(
+        HTTP_STATUS_ACCEPTED,
+        "The transaction is not yet available. The response describes why "
+        "and the Retry-After header indicates when to retry.")
       .add_query_parameter<ccf::TxID>(tx_id_param_key)
       .set_openapi_summary("Receipt for a transaction")
       .set_openapi_description(
         "A signed statement from the service over a transaction entry in the "
         "ledger")
       .install();
+
+    auto get_cose_receipt =
+      [](
+        auto& ctx,
+        ccf::historical::StatePtr
+          historical_state) { // NOLINT(performance-unnecessary-value-param)
+        assert(historical_state->receipt);
+        auto cose_receipt =
+          ccf::describe_cose_receipt_v1(*historical_state->receipt);
+        if (!cose_receipt.has_value())
+        {
+          ctx.rpc_ctx->set_error(
+            HTTP_STATUS_NOT_FOUND,
+            ccf::errors::ResourceNotFound,
+            "No COSE receipt available for this transaction.");
+          return;
+        }
+
+        ctx.rpc_ctx->set_response_status(HTTP_STATUS_OK);
+        ctx.rpc_ctx->set_response_header(
+          ccf::http::headers::CONTENT_TYPE,
+          ccf::http::headervalues::contenttype::COSE);
+        ctx.rpc_ctx->set_response_body(*cose_receipt);
+      };
+
+    make_read_only_endpoint(
+      "/receipt/cose",
+      HTTP_GET,
+      ccf::historical::read_only_adapter_v4(
+        get_cose_receipt, context, is_tx_committed, txid_from_query_string),
+      no_auth_required)
+      .set_auto_schema<void, ds::openapi::Cose>()
+      .add_openapi_response<std::string>(
+        HTTP_STATUS_ACCEPTED,
+        "The transaction is not yet available. The response describes why "
+        "and the Retry-After header indicates when to retry.")
+      .add_query_parameter<ccf::TxID>(tx_id_param_key)
+      .set_openapi_summary("COSE receipt for a transaction")
+      .set_openapi_description(
+        "A COSE Sign1 envelope containing a signed statement from the "
+        "service over a transaction entry in the ledger, with a Merkle "
+        "proof in the unprotected header. See "
+        "https://datatracker.ietf.org/doc/draft-ietf-scitt-receipts-ccf-"
+        "profile/ for a complete description.")
+      .install();
+  }
+
+  void CommonEndpointRegistry::api_endpoint(
+    ccf::endpoints::ReadOnlyEndpointContext& ctx)
+  {
+    nlohmann::json document;
+    const auto result = generate_openapi_document_v1(
+      ctx.tx,
+      openapi_info.title,
+      openapi_info.description,
+      openapi_info.document_version,
+      document);
+
+    if (result == ccf::ApiResult::OK)
+    {
+      ctx.rpc_ctx->set_response_json(document, HTTP_STATUS_OK);
+    }
+    else
+    {
+      ctx.rpc_ctx->set_error(
+        HTTP_STATUS_INTERNAL_SERVER_ERROR,
+        ccf::errors::InternalError,
+        fmt::format("Error code: {}", ccf::api_result_to_str(result)));
+    }
   }
 }

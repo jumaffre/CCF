@@ -1,74 +1,212 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
 
-# Unit test wrapper
+# DETECT_DEADLOCKS opts a test out of the repository-wide TSAN suppressions and
+# turns on TSAN's deadlock detector, which is off by default. TSAN_SUPPRESSIONS
+# may select a narrower suppression file for that test.
+function(add_san_test_properties name)
+  cmake_parse_arguments(
+    PARSE_ARGV 1
+    PARSED_ARGS
+    "DETECT_DEADLOCKS"
+    "TSAN_SUPPRESSIONS"
+    ""
+  )
+
+  if(SAN)
+    set_property(
+      TEST ${name}
+      APPEND
+      PROPERTY ENVIRONMENT "ASAN_SYMBOLIZER_PATH=${LLVM_SYMBOLIZER}"
+    )
+  endif()
+
+  if(TSAN)
+    if(PARSED_ARGS_DETECT_DEADLOCKS)
+      set(
+        TSAN_OPTIONS
+        "detect_deadlocks=1:halt_on_error=1:second_deadlock_stack=1"
+      )
+      if(PARSED_ARGS_TSAN_SUPPRESSIONS)
+        string(
+          APPEND TSAN_OPTIONS
+          ":suppressions=${PARSED_ARGS_TSAN_SUPPRESSIONS}"
+        )
+      endif()
+      set_property(
+        TEST ${name}
+        APPEND
+        PROPERTY ENVIRONMENT "TSAN_OPTIONS=${TSAN_OPTIONS}"
+      )
+    else()
+      set_property(
+        TEST ${name}
+        APPEND
+        PROPERTY
+          ENVIRONMENT
+            "TSAN_OPTIONS=suppressions=${CCF_DIR}/tsan_env_suppressions"
+      )
+    endif()
+
+    set_property(
+      TEST ${name}
+      APPEND
+      PROPERTY ENVIRONMENT "TSAN_SYMBOLIZER_PATH=${LLVM_SYMBOLIZER}"
+    )
+  endif()
+endfunction()
+
+# Every test name is also a build target which builds everything that test
+# launches at run time (e.g. `ninja code_update_test`). Tests whose command is
+# their own executable already satisfy this; tests driven by scripts declare
+# their dependencies via add_test_target.
+function(add_test_target name)
+  if(TARGET ${name})
+    message(
+      FATAL_ERROR
+      "Cannot create build target for test '${name}': target already exists"
+    )
+  endif()
+
+  foreach(DEPENDENCY IN LISTS ARGN)
+    if(NOT TARGET ${DEPENDENCY})
+      message(
+        FATAL_ERROR
+        "Unknown build dependency '${DEPENDENCY}' for test '${name}'"
+      )
+    endif()
+  endforeach()
+
+  add_custom_target(${name})
+  if(ARGN)
+    add_dependencies(${name} ${ARGN})
+  endif()
+endfunction()
+
+# Attach CTest labels to a test and mirror each label as an aggregate build
+# target depending on the test's own target, so that `ninja <label>` builds
+# exactly what `ctest -L <label>` needs (e.g. `ninja bucket_c`). Always use
+# this rather than setting the LABELS property directly, otherwise the two
+# views diverge. The test must already have a same-named build target.
+function(add_test_label test)
+  if(NOT TARGET ${test})
+    message(
+      FATAL_ERROR
+      "Test '${test}' has no build target of the same name; use add_test_target or BUILD_DEPENDS"
+    )
+  endif()
+
+  foreach(LABEL IN LISTS ARGN)
+    set_property(TEST ${test} APPEND PROPERTY LABELS ${LABEL})
+    # A label equal to the test name needs no aggregate: the test's own
+    # target already builds exactly that label's requirements.
+    if("${LABEL}" STREQUAL "${test}")
+      continue()
+    endif()
+
+    get_property(LABEL_TARGETS GLOBAL PROPERTY CCF_TEST_LABEL_TARGETS)
+    if(NOT TARGET ${LABEL})
+      add_custom_target(${LABEL})
+      set_property(GLOBAL APPEND PROPERTY CCF_TEST_LABEL_TARGETS ${LABEL})
+    elseif(NOT LABEL IN_LIST LABEL_TARGETS)
+      message(
+        FATAL_ERROR
+        "Test label '${LABEL}' collides with an existing build target"
+      )
+    endif()
+    add_dependencies(${LABEL} ${test})
+  endforeach()
+endfunction()
+
+# Unit test wrapper. The test is always labelled `unit`; LABELS adds further
+# labels.
 function(add_unit_test name)
-  add_executable(${name} ${CCF_DIR}/src/enclave/thread_local.cpp ${ARGN})
-  target_compile_options(${name} PRIVATE ${COMPILE_LIBCXX})
+  cmake_parse_arguments(PARSE_ARGV 1 PARSED_ARGS "DETECT_DEADLOCKS" "" "LABELS")
+
+  add_executable(${name} ${PARSED_ARGS_UNPARSED_ARGUMENTS})
   target_include_directories(
-    ${name} PRIVATE src ${CCFCRYPTO_INC} ${CCF_DIR}/3rdparty/test
+    ${name}
+    PRIVATE src ${CCFCRYPTO_INC} ${CCF_DIR}/3rdparty/test
   )
   enable_coverage(${name})
-  target_link_libraries(${name} PRIVATE ${LINK_LIBCXX} ccfcrypto.host -pthread)
-  link_openenclave_host(${name})
+  target_link_libraries(${name} PRIVATE ccfcrypto -pthread)
   add_san(${name})
+  add_warning_checks(${name})
 
   add_test(NAME ${name} COMMAND ${name})
-  set_property(
-    TEST ${name}
-    APPEND
-    PROPERTY LABELS unit_test
-  )
+  add_test_label(${name} unit ${PARSED_ARGS_LABELS})
 
-  set_property(
-    TEST ${name}
-    APPEND
-    PROPERTY ENVIRONMENT
-             "TSAN_OPTIONS=suppressions=${CCF_DIR}/tsan_env_suppressions"
-  )
+  if(COVERAGE)
+    set_property(
+      TEST ${name}
+      APPEND
+      PROPERTY ENVIRONMENT "LLVM_PROFILE_FILE=${name}-%p.profraw"
+    )
+  endif()
 
-  # https://github.com/microsoft/CCF/issues/5198
-  set_property(
-    TEST ${name}
-    APPEND
-    PROPERTY ENVIRONMENT "ASAN_OPTIONS=alloc_dealloc_mismatch=0"
-  )
+  set(SAN_TEST_ARGS "")
+  if(PARSED_ARGS_DETECT_DEADLOCKS)
+    set(SAN_TEST_ARGS DETECT_DEADLOCKS)
+  endif()
+  add_san_test_properties(${name} ${SAN_TEST_ARGS})
+endfunction()
 
+# Fuzz test wrapper (requires -DFUZZING=ON)
+function(add_fuzz_test name)
+  add_executable(${name} ${ARGN})
+  target_compile_options(${name} PRIVATE -fsanitize=fuzzer)
+  target_link_options(${name} PRIVATE -fsanitize=fuzzer)
+  target_include_directories(${name} PRIVATE src ${CCFCRYPTO_INC})
+  target_link_libraries(${name} PRIVATE -pthread)
+  add_warning_checks(${name})
+  add_san(${name})
+  # UBSan's vptr check fires inside libstdc++'s
+  # std::_Sp_counted_ptr_inplace<T,A,_Lp>::_Sp_counted_ptr_inplace ctor
+  # (used by std::make_shared) when the inplace control block is being
+  # constructed: that ctor reinterpret_casts uninitialised memory to T*
+  # in order to call std::allocator_traits<T>::construct, and UBSan reads
+  # whatever bytes happen to be there as a vptr. The same false positive
+  # is documented and explicitly excluded by CFI in
+  # compiler-rt/lib/cfi/cfi_ignorelist.txt
+  # (entry: "fun:_ZNSt23_Sp_counted_ptr_inplace*"); UBSan has no
+  # equivalent ignorelist for vptr. See LLVM issue #48337 for context.
+  # The diagnostic is reliably reproducible when libclang_rt.fuzzer is
+  # linked in, because libfuzzer's allocator activity leaves non-zero
+  # bytes in the freshly returned heap slot.
+  # Fuzz binaries don't exercise vtable correctness, so disabling vptr
+  # is the simplest workaround.
+  target_compile_options(${name} PRIVATE -fno-sanitize=vptr)
+  target_link_options(${name} PRIVATE -fno-sanitize=vptr)
 endfunction()
 
 # Test binary wrapper
 function(add_test_bin name)
-  add_executable(${name} ${CCF_DIR}/src/enclave/thread_local.cpp ${ARGN})
-  target_compile_options(${name} PRIVATE ${COMPILE_LIBCXX})
-  target_include_directories(${name} PRIVATE src ${CCFCRYPTO_INC})
+  add_executable(${name} ${ARGN})
+  target_include_directories(
+    ${name}
+    PRIVATE src ${CCFCRYPTO_INC} ${CCF_DIR}/3rdparty/test
+  )
   enable_coverage(${name})
-  target_link_libraries(${name} PRIVATE ${LINK_LIBCXX} ccfcrypto.host)
+  target_link_libraries(${name} PRIVATE ccfcrypto)
+  add_warning_checks(${name})
   add_san(${name})
 endfunction()
 
-# Helper for building clients inheriting from perf_client
-function(add_client_exe name)
-
-  cmake_parse_arguments(
-    PARSE_ARGV 1 PARSED_ARGS "" "" "SRCS;INCLUDE_DIRS;LINK_LIBS"
-  )
-
-  add_executable(${name} ${PARSED_ARGS_SRCS})
-
-  target_link_libraries(
-    ${name} PRIVATE ${CMAKE_THREAD_LIBS_INIT} ccfcrypto.host
-  )
-  target_include_directories(
-    ${name} PRIVATE ${CCF_DIR}/src/clients/perf ${PARSED_ARGS_INCLUDE_DIRS}
-  )
-
-endfunction()
-
-# Helper for building end-to-end function tests using the python infrastructure
+# Helper for building end-to-end function tests using the python infrastructure.
+#
+# BUCKET assigns the test to one of the CI runner buckets (bucket_a, bucket_b,
+# bucket_c) so that .github/workflows/ci.yml can select the per-runner test set
+# with `ctest -L bucket_X` and build it with `ninja bucket_X`. BUILD_DEPENDS
+# lists the CMake targets the test may launch at run time. Every PR-CI e2e test
+# must be in exactly one bucket; scripts/test-buckets-checks.sh flags
+# unbucketed tests in `no_bucket:`.
 function(add_e2e_test)
   cmake_parse_arguments(
-    PARSE_ARGV 0 PARSED_ARGS "" "NAME;PYTHON_SCRIPT;LABEL;CURL_CLIENT;"
-    "CONSTITUTION;ADDITIONAL_ARGS;CONFIGURATIONS;CONTAINER_NODES"
+    PARSE_ARGV 0
+    PARSED_ARGS
+    "DETECT_DEADLOCKS"
+    "NAME;PYTHON_SCRIPT;LABEL;CURL_CLIENT;BUCKET;TSAN_SUPPRESSIONS"
+    "CONSTITUTION;ADDITIONAL_ARGS;BUILD_DEPENDS;CONFIGURATIONS"
   )
 
   if(NOT PARSED_ARGS_CONSTITUTION)
@@ -76,20 +214,7 @@ function(add_e2e_test)
   endif()
 
   if(BUILD_END_TO_END_TESTS)
-    if(PROFILE_TESTS)
-      set(PYTHON_WRAPPER
-          py-spy
-          record
-          --format
-          speedscope
-          -o
-          ${PARSED_ARGS_NAME}.trace
-          --
-          python3
-      )
-    else()
-      set(PYTHON_WRAPPER ${PYTHON})
-    endif()
+    set(PYTHON_WRAPPER ${PYTHON})
 
     # For fast e2e runs, tick node faster than default value (except for
     # instrumented builds which may process ticks slower).
@@ -97,6 +222,10 @@ function(add_e2e_test)
       set(NODE_TICK_MS 10)
     else()
       set(NODE_TICK_MS 1)
+    endif()
+
+    if(NOT PARSED_ARGS_PERF_LABEL)
+      set(PARSED_ARGS_PERF_LABEL ${PARSED_ARGS_NAME})
     endif()
 
     add_test(
@@ -107,12 +236,22 @@ function(add_e2e_test)
         ${PARSED_ARGS_ADDITIONAL_ARGS} --tick-ms ${NODE_TICK_MS}
       CONFIGURATIONS ${PARSED_ARGS_CONFIGURATIONS}
     )
+    if(NOT PARSED_ARGS_BUILD_DEPENDS)
+      message(
+        FATAL_ERROR
+        "End-to-end test '${PARSED_ARGS_NAME}' must specify BUILD_DEPENDS"
+      )
+    endif()
+    add_test_target(${PARSED_ARGS_NAME} ${PARSED_ARGS_BUILD_DEPENDS})
 
     # Make python test client framework importable
     set_property(
       TEST ${PARSED_ARGS_NAME}
       APPEND
-      PROPERTY ENVIRONMENT "PYTHONPATH=${CCF_DIR}/tests:$ENV{PYTHONPATH}"
+      PROPERTY
+        ENVIRONMENT
+          "PYTHONPATH=${CCF_DIR}/tests:$ENV{PYTHONPATH}"
+          "CCF_CTEST_NAME=${PARSED_ARGS_NAME}"
     )
 
     if(SHUFFLE_SUITE)
@@ -120,6 +259,14 @@ function(add_e2e_test)
         TEST ${PARSED_ARGS_NAME}
         APPEND
         PROPERTY ENVIRONMENT "SHUFFLE_SUITE=1"
+      )
+    endif()
+
+    if(GLIBCXX_DEBUG)
+      set_property(
+        TEST ${PARSED_ARGS_NAME}
+        APPEND
+        PROPERTY ENVIRONMENT "CCF_GLIBCXX_DEBUG=1"
       )
     endif()
 
@@ -131,22 +278,34 @@ function(add_e2e_test)
       )
     endif()
 
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT
-               "TSAN_OPTIONS=suppressions=${CCF_DIR}/tsan_env_suppressions"
-    )
+    set(SAN_TEST_ARGS "")
+    if(PARSED_ARGS_DETECT_DEADLOCKS)
+      set(SAN_TEST_ARGS DETECT_DEADLOCKS)
+    endif()
+    if(PARSED_ARGS_TSAN_SUPPRESSIONS)
+      list(
+        APPEND SAN_TEST_ARGS
+        TSAN_SUPPRESSIONS
+        ${PARSED_ARGS_TSAN_SUPPRESSIONS}
+      )
+    endif()
+    add_san_test_properties(${PARSED_ARGS_NAME} ${SAN_TEST_ARGS})
 
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY LABELS e2e
-    )
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY LABELS ${PARSED_ARGS_LABEL}
+    if(COVERAGE)
+      set_property(
+        TEST ${PARSED_ARGS_NAME}
+        APPEND
+        PROPERTY
+          ENVIRONMENT
+            "LLVM_PROFILE_FILE=${CMAKE_BINARY_DIR}/${PARSED_ARGS_NAME}-%p.profraw"
+      )
+    endif()
+
+    add_test_label(
+      ${PARSED_ARGS_NAME}
+      e2e
+      ${PARSED_ARGS_LABEL}
+      ${PARSED_ARGS_BUCKET}
     )
 
     if(${PARSED_ARGS_CURL_CLIENT})
@@ -156,199 +315,17 @@ function(add_e2e_test)
         PROPERTY ENVIRONMENT "CURL_CLIENT=ON"
       )
     endif()
-    if((${PARSED_ARGS_CONTAINER_NODES}) AND (LONG_TESTS))
-      # Containerised nodes are only enabled with long tests
-      set_property(
-        TEST ${PARSED_ARGS_NAME}
-        APPEND
-        PROPERTY ENVIRONMENT "CONTAINER_NODES=ON"
-      )
-    endif()
-
-    if(DEFINED DEFAULT_ENCLAVE_TYPE)
-      set_property(
-        TEST ${PARSED_ARGS_NAME}
-        APPEND
-        PROPERTY ENVIRONMENT "DEFAULT_ENCLAVE_TYPE=${DEFAULT_ENCLAVE_TYPE}"
-      )
-    endif()
-
-    set_property(
-      TEST ${PARSED_ARGS_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT "DEFAULT_ENCLAVE_PLATFORM=${COMPILE_TARGET}"
-    )
   endif()
-endfunction()
-
-# Helper for building end-to-end perf tests using the python infrastucture
-function(add_perf_test)
-
-  cmake_parse_arguments(
-    PARSE_ARGV 0 PARSED_ARGS ""
-    "NAME;PYTHON_SCRIPT;CONSTITUTION;CLIENT_BIN;VERIFICATION_FILE;LABEL"
-    "ADDITIONAL_ARGS"
-  )
-
-  if(NOT PARSED_ARGS_CONSTITUTION)
-    set(PARSED_ARGS_CONSTITUTION ${CCF_NETWORK_TEST_DEFAULT_CONSTITUTION})
-  endif()
-
-  if(PARSED_ARGS_VERIFICATION_FILE)
-    set(VERIFICATION_ARG "--verify ${PARSED_ARGS_VERIFICATION_FILE}")
-  else()
-    unset(VERIFICATION_ARG)
-  endif()
-
-  set(TESTS_SUFFIX "")
-  set(ENCLAVE_TYPE "")
-  set(ENCLAVE_PLATFORM "${COMPILE_TARGET}")
-  if("sgx" STREQUAL COMPILE_TARGET)
-    set(TESTS_SUFFIX "${TESTS_SUFFIX}_sgx")
-    set(ENCLAVE_TYPE "release")
-  elseif("virtual" STREQUAL COMPILE_TARGET)
-    set(TESTS_SUFFIX "${TESTS_SUFFIX}_virtual")
-    set(ENCLAVE_TYPE "virtual")
-  endif()
-
-  set(TESTS_SUFFIX "${TESTS_SUFFIX}_cft")
-
-  set(TEST_NAME "${PARSED_ARGS_NAME}${TESTS_SUFFIX}")
-
-  set(LABEL_ARG "${TEST_NAME}^")
-
-  add_test(
-    NAME "${PARSED_ARGS_NAME}${TESTS_SUFFIX}"
-    COMMAND
-      ${PYTHON} ${PARSED_ARGS_PYTHON_SCRIPT} -b . -c ${PARSED_ARGS_CLIENT_BIN}
-      ${CCF_NETWORK_TEST_ARGS} ${PARSED_ARGS_CONSTITUTION} --write-tx-times
-      ${VERIFICATION_ARG} --label ${LABEL_ARG} --snapshot-tx-interval 10000
-      ${PARSED_ARGS_ADDITIONAL_ARGS} -e ${ENCLAVE_TYPE} -t ${ENCLAVE_PLATFORM}
-      ${NODES}
-  )
-
-  # Make python test client framework importable
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY ENVIRONMENT "PYTHONPATH=${CCF_DIR}/tests:$ENV{PYTHONPATH}"
-  )
-  if(DEFINED DEFAULT_ENCLAVE_TYPE)
-    set_property(
-      TEST ${TEST_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT "DEFAULT_ENCLAVE_TYPE=${DEFAULT_ENCLAVE_TYPE}"
-    )
-  endif()
-  if(DEFINED DEFAULT_ENCLAVE_PLATFORM)
-    set_property(
-      TEST ${TEST_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT
-               "DEFAULT_ENCLAVE_PLATFORM=${DEFAULT_ENCLAVE_PLATFORM}"
-    )
-  endif()
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY LABELS perf
-  )
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY LABELS cft
-  )
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY ENVIRONMENT
-             "TSAN_OPTIONS=suppressions=${CCF_DIR}/tsan_env_suppressions"
-  )
-endfunction()
-
-# Helper for building end-to-end perf tests using the python infrastucture
-function(add_piccolo_test)
-
-  cmake_parse_arguments(
-    PARSE_ARGV 0 PARSED_ARGS ""
-    "NAME;PYTHON_SCRIPT;CONSTITUTION;CLIENT_BIN;VERIFICATION_FILE;LABEL"
-    "ADDITIONAL_ARGS"
-  )
-
-  if(NOT PARSED_ARGS_CONSTITUTION)
-    set(PARSED_ARGS_CONSTITUTION ${CCF_NETWORK_TEST_DEFAULT_CONSTITUTION})
-  endif()
-
-  set(TESTS_SUFFIX "")
-  set(ENCLAVE_TYPE "")
-  set(ENCLAVE_PLATFORM "${COMPILE_TARGET}")
-  if("sgx" STREQUAL COMPILE_TARGET)
-    set(TESTS_SUFFIX "${TESTS_SUFFIX}_sgx")
-    set(ENCLAVE_TYPE "release")
-  elseif("virtual" STREQUAL COMPILE_TARGET)
-    set(TESTS_SUFFIX "${TESTS_SUFFIX}_virtual")
-    set(ENCLAVE_TYPE "virtual")
-  endif()
-
-  set(TESTS_SUFFIX "${TESTS_SUFFIX}_cft")
-
-  set(TEST_NAME "${PARSED_ARGS_NAME}${TESTS_SUFFIX}")
-
-  set(LABEL_ARG "${TEST_NAME}^")
-
-  add_test(
-    NAME "${PARSED_ARGS_NAME}${TESTS_SUFFIX}"
-    COMMAND
-      ${PYTHON} ${PARSED_ARGS_PYTHON_SCRIPT} -b . -c ${PARSED_ARGS_CLIENT_BIN}
-      ${CCF_NETWORK_TEST_ARGS} ${PARSED_ARGS_CONSTITUTION} ${VERIFICATION_ARG}
-      --label ${LABEL_ARG} --snapshot-tx-interval 10000
-      ${PARSED_ARGS_ADDITIONAL_ARGS} -e ${ENCLAVE_TYPE} -t ${ENCLAVE_PLATFORM}
-      ${NODES}
-  )
-
-  # Make python test client framework importable
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY ENVIRONMENT "PYTHONPATH=${CCF_DIR}/tests:$ENV{PYTHONPATH}"
-  )
-  if(DEFINED DEFAULT_ENCLAVE_TYPE)
-    set_property(
-      TEST ${TEST_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT "DEFAULT_ENCLAVE_TYPE=${DEFAULT_ENCLAVE_TYPE}"
-    )
-  endif()
-  if(DEFINED DEFAULT_ENCLAVE_PLATFORM)
-    set_property(
-      TEST ${TEST_NAME}
-      APPEND
-      PROPERTY ENVIRONMENT
-               "DEFAULT_ENCLAVE_PLATFORM=${DEFAULT_ENCLAVE_PLATFORM}"
-    )
-  endif()
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY LABELS perf
-  )
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY LABELS cft
-  )
-  set_property(
-    TEST ${TEST_NAME}
-    APPEND
-    PROPERTY ENVIRONMENT
-             "TSAN_OPTIONS=suppressions=${CCF_DIR}/tsan_env_suppressions"
-  )
 endfunction()
 
 # Picobench wrapper
 function(add_picobench name)
   cmake_parse_arguments(
-    PARSE_ARGV 1 PARSED_ARGS "" "" "SRCS;INCLUDE_DIRS;LINK_LIBS"
+    PARSE_ARGV 1
+    PARSED_ARGS
+    ""
+    ""
+    "SRCS;INCLUDE_DIRS;LINK_LIBS"
   )
 
   add_executable(${name} ${PARSED_ARGS_SRCS})
@@ -356,11 +333,16 @@ function(add_picobench name)
   target_include_directories(${name} PRIVATE src ${PARSED_ARGS_INCLUDE_DIRS})
 
   target_link_libraries(
-    ${name} PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${PARSED_ARGS_LINK_LIBS}
-                    ccfcrypto.host
+    ${name}
+    PRIVATE ${CMAKE_THREAD_LIBS_INIT} ${PARSED_ARGS_LINK_LIBS} ccfcrypto
   )
 
   add_san(${name})
+  add_warning_checks(${name})
+  target_compile_options(
+    ${name}
+    PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang>:-Wno-vla-cxx-extension>
+  )
 
   # -Wall -Werror catches a number of warnings in picobench
   target_include_directories(${name} SYSTEM PRIVATE 3rdparty/test)
@@ -369,15 +351,9 @@ function(add_picobench name)
     NAME ${name}
     COMMAND
       bash -c
-      "$<TARGET_FILE:${name}> --samples=1000 --out-fmt=csv --output=${name}.csv && cat ${name}.csv"
+      "$<TARGET_FILE:${name}> --samples=10 --out-fmt=csv --output=${name}.csv && cat ${name}.csv"
   )
+  add_test_label(${name} benchmark)
 
-  set_property(TEST ${name} PROPERTY LABELS benchmark)
-
-  set_property(
-    TEST ${name}
-    APPEND
-    PROPERTY ENVIRONMENT
-             "TSAN_OPTIONS=suppressions=${CCF_DIR}/tsan_env_suppressions"
-  )
+  add_san_test_properties(${name})
 endfunction()

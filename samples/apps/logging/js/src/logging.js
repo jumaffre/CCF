@@ -1,9 +1,71 @@
+function decode_query_component(s) {
+  // Decodes '%XX' escapes and '+' (to a space), matching decode_query_component
+  // in include/ccf/http_query.h. Unlike a single decodeURIComponent() over the
+  // whole string, malformed or truncated percent-escapes are passed through
+  // literally instead of causing earlier, valid escapes to be left undecoded
+  // (e.g. "%41%zz" decodes to "A%zz").
+  //
+  // Note: valid '%XX' escapes are collected into maximal runs and decoded
+  // together with decodeURIComponent, rather than one byte at a time. This is
+  // deliberate and should NOT be "simplified" to decoding each %XX on its own
+  // with String.fromCharCode: JS strings are UTF-16, so a multi-byte UTF-8
+  // sequence such as "%C3%A9" must be decoded as a unit to produce a single
+  // code point (U+00E9). Decoding it byte-by-byte would instead produce two
+  // code points (U+00C3 U+00A9), which re-encode via ccf.strToBuf to the wrong
+  // bytes. The byte-wise fallback below only runs when a syntactically-valid
+  // run is not valid UTF-8 (e.g. a lone continuation byte), so decoding still
+  // makes progress instead of throwing.
+  let decoded = "";
+  let i = 0;
+  const isValidEscape = (j) =>
+    s[j] === "%" &&
+    j + 2 < s.length &&
+    /^[0-9A-Fa-f]{2}$/.test(s.substr(j + 1, 2));
+  while (i < s.length) {
+    if (isValidEscape(i)) {
+      // Consume a maximal run of valid '%XX' escapes and decode them together,
+      // so that multi-byte UTF-8 sequences are reassembled correctly.
+      let run = "";
+      while (isValidEscape(i)) {
+        run += s.substr(i, 3);
+        i += 3;
+      }
+      try {
+        decoded += decodeURIComponent(run);
+      } catch (e) {
+        // A run of syntactically-valid '%XX' escapes can still be invalid UTF-8
+        // (e.g. a lone continuation byte). Fall back to decoding byte-by-byte so
+        // we still make progress rather than throwing.
+        for (let j = 0; j < run.length; j += 3) {
+          decoded += String.fromCharCode(parseInt(run.substr(j + 1, 2), 16));
+        }
+      }
+    } else if (s[i] === "+") {
+      decoded += " ";
+      i += 1;
+    } else {
+      decoded += s[i];
+      i += 1;
+    }
+  }
+  return decoded;
+}
+
 function parse_request_query(request) {
+  // request.query is the raw, still-escaped query string - each key and
+  // value must be decoded individually, after splitting, so that escaped
+  // '&' and '=' characters within a key or value are not mistaken for
+  // separators
   const elements = request.query.split("&");
   const obj = {};
   for (const kv of elements) {
-    const [k, v] = kv.split("=");
-    obj[k] = v;
+    // Split on the first '=' only: any further '=' characters are part of the
+    // value, matching split_1(param, "=") in include/ccf/http_query.h.
+    const eq = kv.indexOf("=");
+    const k = eq === -1 ? kv : kv.slice(0, eq);
+    const v = eq === -1 ? undefined : kv.slice(eq + 1);
+    obj[decode_query_component(k)] =
+      v === undefined ? v : decode_query_component(v);
   }
   return obj;
 }
@@ -28,20 +90,20 @@ function private_records(store, scope) {
 function get_record(map, id) {
   const msg = map.get(id);
   if (msg === undefined) {
-    return { body: { error: "No such key" } };
+    return { statusCode: 404, body: { error: { code: "ResourceNotFound" } } };
   }
   return { body: { msg: ccf.bufToStr(msg) } };
 }
 
 function delete_record(map, id) {
   if (!map.has(id)) {
-    return { body: { error: "No such key" } };
+    return { statusCode: 404, body: { error: { code: "ResourceNotFound" } } };
   }
   map.delete(id);
   return { body: true };
 }
 
-export function get_private(request, scope) {
+export function get_private(request) {
   const parsedQuery = parse_request_query(request);
   const id = get_id_from_query(parsedQuery);
   return get_record(private_records(ccf.kv, parsedQuery.scope), id);
@@ -92,7 +154,12 @@ function get_historical_range_impl(request, isPrivate, nextLinkPrefix) {
   if (from_seqno !== undefined) {
     from_seqno = parseInt(from_seqno);
     if (isNaN(from_seqno)) {
-      throw new Error("from_seqno is not an integer");
+      return {
+        statusCode: 400,
+        body: {
+          error: { code: "InvalidInput", msg: "from_seqno is not an integer" },
+        },
+      };
     }
   } else {
     // If no from_seqno is specified, defaults to very first transaction
@@ -121,7 +188,12 @@ function get_historical_range_impl(request, isPrivate, nextLinkPrefix) {
 
   // Range must be in order
   if (to_seqno < from_seqno) {
-    throw new Error("to_seqno must be >= from_seqno");
+    return {
+      statusCode: 400,
+      body: {
+        error: { code: "InvalidInput", msg: "to_seqno must be >= from_seqno" },
+      },
+    };
   }
 
   // End of range must be committed
@@ -132,12 +204,19 @@ function get_historical_range_impl(request, isPrivate, nextLinkPrefix) {
     isCommitted = txStatus === "Committed";
   }
   if (!isCommitted) {
-    throw new Error("End of range must be committed");
+    return {
+      statusCode: 400,
+      body: {
+        error: { code: "InvalidInput", msg: "End of range must be committed" },
+      },
+    };
   }
 
-  const max_seqno_per_page = 2000;
+  // Historical range setup is synchronous, so keep pages small enough to
+  // avoid delaying consensus processing.
+  const max_seqnos_per_page = 500;
   const range_begin = from_seqno;
-  const range_end = Math.min(to_seqno, range_begin + max_seqno_per_page);
+  const range_end = Math.min(to_seqno, range_begin + max_seqnos_per_page - 1);
 
   // Compute a deterministic handle for the range request.
   // Note: Instead of ccf.digest, an equivalent of std::hash should be used.
@@ -195,7 +274,7 @@ function get_historical_range_impl(request, isPrivate, nextLinkPrefix) {
     const next_page_start = range_end + 1;
     const next_page_end = Math.min(
       to_seqno,
-      next_page_start + max_seqno_per_page,
+      next_page_start + max_seqnos_per_page - 1,
     );
     const next_page_handle = makeHandle(
       next_page_start,
@@ -206,6 +285,7 @@ function get_historical_range_impl(request, isPrivate, nextLinkPrefix) {
       next_page_handle,
       next_page_start,
       next_page_end,
+      expiry_seconds,
     );
 
     // NB: This path tells the caller to continue to ask until the end of
@@ -407,45 +487,82 @@ export function custom_auth(request) {
   }
 }
 
+function describe_user_cert_ident(lines, obj) {
+  lines.push("User TLS cert");
+  lines.push(`The caller is a user with ID: ${obj.id}`);
+  lines.push(`The caller's user data is: ${JSON.stringify(obj.data, null, 2)}`);
+  lines.push(`The caller's cert is:\n${obj.cert}`);
+}
+
+function describe_member_cert_ident(lines, obj) {
+  lines.push("Member TLS cert");
+  lines.push(`The caller is a member with ID: ${obj.id}`);
+  lines.push(`The caller's user data is: ${JSON.stringify(obj.data, null, 2)}`);
+  lines.push(`The caller's cert is:\n${obj.cert}`);
+}
+
+function describe_any_cert_ident(lines, obj) {
+  lines.push("Any TLS cert");
+  lines.push(`The caller's cert is:\n${obj.cert}`);
+}
+
+function describe_jwt_ident(lines, obj) {
+  lines.push("JWT");
+  lines.push(
+    `The caller is identified by a JWT issued by: ${obj.jwt.keyIssuer}`,
+  );
+  lines.push(`The JWT header is:\n${JSON.stringify(obj.jwt.header, null, 2)}`);
+  lines.push(
+    `The JWT payload is:\n${JSON.stringify(obj.jwt.payload, null, 2)}`,
+  );
+}
+
+function describe_cose_ident(lines, obj) {
+  lines.push("User COSE Sign1");
+  lines.push(
+    `The caller is identified by a COSE Sign1 signed by kid: ${obj.id}`,
+  );
+  lines.push(
+    `The caller is identified by a COSE Sign1 with content of size: ${obj.cose.content.byteLength}`,
+  );
+}
+
+function describe_noauth_ident(lines, obj) {
+  lines.push("Unauthenticated");
+  lines.push("The caller did not provide any authenticated identity");
+}
+
 export function multi_auth(request) {
   var lines = [];
 
-  if (request.caller.policy === "user_cert") {
-    lines.push("User TLS cert");
-    lines.push(`The caller is a user with ID: ${request.caller.id}`);
-    lines.push(
-      `The caller's user data is: ${JSON.stringify(request.caller.data)}`,
-    );
-    lines.push(`The caller's cert is:\n${request.caller.cert}`);
-  } else if (request.caller.policy === "member_cert") {
-    lines.push("Member TLS cert");
-    lines.push(`The caller is a member with ID: ${request.caller.id}`);
-    lines.push(
-      `The caller's user data is: ${JSON.stringify(request.caller.data)}`,
-    );
-    lines.push(`The caller's cert is:\n${request.caller.cert}`);
-  } else if (request.caller.policy === "jwt") {
-    lines.push("JWT");
-    lines.push(
-      `The caller is identified by a JWT issued by: ${request.caller.jwt.keyIssuer}`,
-    );
-    lines.push(
-      `The JWT header is:\n${JSON.stringify(request.caller.jwt.header)}`,
-    );
-    lines.push(
-      `The JWT payload is:\n${JSON.stringify(request.caller.jwt.payload)}`,
-    );
-  } else if (request.caller.policy === "user_cose_sign1") {
-    lines.push("User COSE Sign1");
-    lines.push(
-      `The caller is identified by a COSE Sign1 signed by kid:\n${request.caller.cose.user_id}`,
-    );
-    lines.push(
-      `The caller is identified by a COSE Sign1 with content of size:\n${request.caller.cose.content.byteLength}`,
-    );
-  } else if (request.caller.policy === "no_auth") {
-    lines.push("Unauthenticated");
-    lines.push("The caller did not provide any authenticated identity");
+  const describers = {
+    user_cert: describe_user_cert_ident,
+    member_cert: describe_member_cert_ident,
+    any_cert: describe_any_cert_ident,
+    jwt: describe_jwt_ident,
+    user_cose_sign1: describe_cose_ident,
+    no_auth: describe_noauth_ident,
+  };
+
+  const describe = (name, obj) => {
+    const describer = describers[name];
+    if (describer === undefined) {
+      throw new Error(`Unhandled auth policy: ${name}`);
+    }
+    describer(lines, obj);
+  };
+
+  if (typeof request.caller.policy === "string") {
+    describe(request.caller.policy, request.caller);
+  } else if (Array.isArray(request.caller.policy)) {
+    lines.push(`Conjoined auth policy: ${request.caller.policy}`);
+    for (const [i, name] of request.caller.policy.entries()) {
+      lines.push("");
+      lines.push(`${name}:`);
+      describe(name, request.caller[name]);
+    }
+  } else {
+    throw new Error(`Unhandled auth policy: ${request.caller.policy}`);
   }
 
   let s = lines.join("\n");

@@ -3,8 +3,8 @@
 #pragma once
 
 #include "ccf/byte_vector.h"
+#include "ccf/ds/locking.h"
 #include "ccf/indexing/strategy.h"
-#include "ccf/pal/locking.h"
 
 namespace ccf::indexing::strategies
 {
@@ -17,7 +17,7 @@ namespace ccf::indexing::strategies
     std::string map_name;
 
     // Protect access to current_txid
-    ccf::pal::Mutex current_txid_lock;
+    ccf::ds::Mutex current_txid_lock;
 
     ccf::TxID current_txid = {};
 
@@ -31,10 +31,10 @@ namespace ccf::indexing::strategies
       const std::string& map_name_,
       const std::string& strategy_prefix = "VisitEachEntryIn");
 
-    virtual ~VisitEachEntryInMap() = default;
+    ~VisitEachEntryInMap() override = default;
 
     void handle_committed_transaction(
-      const ccf::TxID& tx_id, const kv::ReadOnlyStorePtr& store) override;
+      const ccf::TxID& tx_id, const ccf::kv::ReadOnlyStorePtr& store) override;
     std::optional<ccf::SeqNo> next_requested() override;
 
     nlohmann::json describe() override;

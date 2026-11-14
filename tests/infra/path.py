@@ -1,48 +1,43 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the Apache 2.0 License.
+import hashlib
 import os
 from contextlib import contextmanager
 from shutil import copy2, rmtree
-import hashlib
 
 from loguru import logger as LOG
+from packaging.version import Version  # type: ignore
+
+import infra.node
+import infra.platform_detection
 
 
-def mk(name, contents):
-    LOG.info('echo "<{} bytes>" > {}'.format(len(contents), name))
-    with open(name, "w", encoding="utf-8") as dst:
-        dst.write(contents)
+def build_lib_path(lib_name, library_dir=".", version=None):
+    if not lib_name.startswith("lib"):
+        lib_name = f"lib{lib_name}"
 
+    if version is None or Version(infra.node.strip_version(version)).major >= 7:
+        ext = ".so"
+    else:
+        if infra.platform_detection.is_virtual():
+            ext = ".virtual.so"
+        elif infra.platform_detection.is_snp():
+            ext = ".snp.so"
 
-def mk_new(name, contents):
-    if not os.path.isfile(name):
-        LOG.debug('Creating file at "{}" containing "{}"'.format(name, contents))
-        mk(name, contents)
-
-
-def build_lib_path(
-    lib_name, enclave_type=None, enclave_platform="sgx", library_dir="."
-):
-    if enclave_platform == "virtual" or enclave_type == "virtual":
-        ext = ".virtual.so"
+    if infra.platform_detection.is_virtual():
         mode = "Virtual mode"
-    elif enclave_platform == "sgx":
-        if enclave_type == "debug":
-            ext = ".enclave.so.debuggable"
-            mode = "Debuggable SGX enclave"
-        elif enclave_type == "release":
-            ext = ".enclave.so.signed"
-            mode = "Release SGX enclave"
-        else:
-            raise ValueError(f"Invalid enclave_type {enclave_type} for SGX enclave")
-    elif enclave_platform == "snp":
-        ext = ".snp.so"
+    elif infra.platform_detection.is_snp():
         mode = "SNP enclave"
     else:
-        raise ValueError(f"Invalid enclave_platform passed {enclave_platform}")
+        raise ValueError(
+            f"Unexpected platform: {infra.platform_detection.get_platform()}"
+        )
+
     if os.path.isfile(lib_name):
         if ext not in lib_name:
-            raise ValueError(f"{mode} requires {ext} enclave image")
+            raise ValueError(
+                f"{mode} requires {ext} enclave image (could not find {lib_name})"
+            )
         return lib_name
     else:
         # Make sure relative paths include current directory. Absolute paths will be unaffected
@@ -51,32 +46,6 @@ def build_lib_path(
 
 def build_bin_path(bin_name, binary_dir="."):
     return os.path.join(binary_dir, os.path.normpath(bin_name))
-
-
-def cert_bytes(cert_file_name):
-    """
-    Parses a pem certificate file into raw bytes and appends null character.
-    """
-    with open(cert_file_name, "rb") as pem:
-        chars = []
-        for c in pem.read():
-            if c:
-                chars.append(c)
-            else:
-                break
-        # null-terminated certs, for compatibility
-        return chars + [0]
-
-
-def quote_bytes(quote_file_name):
-    """
-    Parses a binary quote file into raw bytes.
-    """
-    with open(quote_file_name, "rb") as quote:
-        chars = []
-        for c in quote.read():
-            chars.append(c)
-        return chars
 
 
 def create_dir(dir_path):
@@ -101,7 +70,7 @@ def compute_file_checksum(file_name):
 @contextmanager
 def working_dir(path):
     cwd = os.getcwd()
-    LOG.info("cd {}".format(path))
+    LOG.info(f"cd {path}")
     os.chdir(path)
     try:
         yield
